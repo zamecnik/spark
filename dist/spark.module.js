@@ -10207,6 +10207,16 @@ const _SparkRenderer = class _SparkRenderer extends THREE.Mesh {
         this.sortedDir.copy(dir);
         this.setDirty();
       }
+      if (this.enableDriveLod) {
+        this.current.viewToWorld.copy(camera.matrixWorld);
+        const visibleGenerators2 = [];
+        scene.traverseVisible((obj) => {
+          if (obj instanceof SplatGenerator) {
+            visibleGenerators2.push(obj);
+          }
+        });
+        this.driveLod({ visibleGenerators: visibleGenerators2, camera, scene });
+      }
       return;
     }
     const next = this.accumulators.pop();
@@ -10720,10 +10730,18 @@ const _SparkRenderer = class _SparkRenderer extends THREE.Mesh {
             THREE.RGBAIntegerFormat,
             THREE.UnsignedIntType
           );
-          texture2.internalFormat = "RGBA32UI";
+          if (!this.webgpuBackend) {
+            texture2.internalFormat = "RGBA32UI";
+          }
           texture2.needsUpdate = true;
           instance = { lodId, numSplats, indices, texture: texture2 };
           this.lodInstances.set(mesh, instance);
+        } else if (this.webgpuBackend) {
+          instance.numSplats = numSplats;
+          instance.indices.set(
+            indices.subarray(0, instance.indices.length)
+          );
+          instance.texture.needsUpdate = true;
         } else {
           instance.numSplats = numSplats;
           const renderer = this.renderer;
@@ -11100,6 +11118,9 @@ _SparkRenderer.emptyOrdering = (() => {
 _SparkRenderer.cubeRender = null;
 _SparkRenderer.pmrem = null;
 let SparkRenderer = _SparkRenderer;
+function isWebGPURenderer(renderer) {
+  return renderer.isWebGPURenderer === true;
+}
 class PagedSplats {
   constructor(options) {
     var _a2;
@@ -11324,10 +11345,16 @@ class PagedSplats {
         THREE.RGBAIntegerFormat,
         THREE.UnsignedIntType
       );
-      indicesTexture.internalFormat = "RGBA32UI";
+      if (!isWebGPURenderer(renderer)) {
+        indicesTexture.internalFormat = "RGBA32UI";
+      }
       indicesTexture.needsUpdate = true;
       renderer.initTexture(indicesTexture);
       this.dynoIndices.value = indicesTexture;
+    } else if (isWebGPURenderer(renderer)) {
+      const textureIndices = indicesTexture.image.data;
+      textureIndices.set(indices.subarray(0, textureIndices.length));
+      indicesTexture.needsUpdate = true;
     } else {
       const textureIndices = indicesTexture.image.data;
       textureIndices.set(indices.subarray(0, numSplats));
@@ -11916,7 +11943,9 @@ const _SplatPager = class _SplatPager {
     const texture2 = new THREE.DataArrayTexture(data, width, height, depth);
     texture2.format = format;
     texture2.type = type;
-    texture2.internalFormat = internalFormat;
+    if (!isWebGPURenderer(this.renderer)) {
+      texture2.internalFormat = internalFormat;
+    }
     texture2.needsUpdate = true;
     this.renderer.initTexture(texture2);
     return texture2;

@@ -1,5 +1,5 @@
 import * as TSL from "three/tsl";
-import { uint, float, vec2, max, select, normalize, vec3, vec4, ivec3, int, exp, textureLoad, uniform, varyingProperty, Fn, bool, instanceIndex, round, clamp, If, min, pow, cameraProjectionMatrix, positionGeometry, mat3, transpose, sqrt, dot, Discard, mix, instancedArray, workgroupArray, workgroupId, invocationLocalIndex, workgroupBarrier, atomicStore, atomicAdd, atomicLoad, atomicOr, Return } from "three/tsl";
+import { uint, float, vec2, max, select, normalize, vec3, vec4, ivec3, int, exp, textureLoad, uniform, varyingProperty, Fn, bool, instanceIndex, ivec2, round, clamp, If, min, pow, cameraProjectionMatrix, positionGeometry, mat3, transpose, sqrt, dot, Discard, mix, instancedArray, workgroupArray, workgroupId, invocationLocalIndex, workgroupBarrier, atomicStore, atomicAdd, atomicLoad, atomicOr, Return } from "three/tsl";
 import { MeshBasicNodeMaterial, Vector2, Vector4, Vector3, DoubleSide, CustomBlending, AddEquation, OneFactor, OneMinusSrcAlphaFactor, Matrix4, Quaternion } from "three/webgpu";
 const unpackHalf2x16$1 = TSL.unpackHalf2x16;
 const SPLAT_TEX_WIDTH_BITS = 11;
@@ -236,6 +236,7 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
     const {
       packedTexture,
       orderNode,
+      cutIndicesTexture,
       sh1Texture,
       sh2Texture,
       sh3Texture,
@@ -245,6 +246,7 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
       parityQuantize = true
     } = options;
     stripWebGLInternalFormat(packedTexture);
+    if (cutIndicesTexture) stripWebGLInternalFormat(cutIndicesTexture);
     for (const tex of [sh1Texture, sh2Texture, sh3Texture]) {
       if (tex) stripWebGLInternalFormat(tex);
     }
@@ -257,7 +259,27 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
     this.vertexNode = Fn(() => {
       const rejectPos = vec4(0, 0, 2, 1);
       const rejected = bool(false).toVar();
-      const splatIndex = orderNode.element(instanceIndex);
+      const slot = orderNode.element(instanceIndex);
+      let splatIndex = slot;
+      if (cutIndicesTexture) {
+        const texel = textureLoad(
+          cutIndicesTexture,
+          ivec2(
+            int(slot.shiftRight(uint(2)).bitAnd(uint(4095))),
+            int(slot.shiftRight(uint(14)))
+          )
+        );
+        const comp = slot.bitAnd(uint(3));
+        splatIndex = select(
+          comp.equal(uint(0)),
+          texel.x,
+          select(
+            comp.equal(uint(1)),
+            texel.y,
+            select(comp.equal(uint(2)), texel.z, texel.w)
+          )
+        );
+      }
       const texCoord = paged ? pagedSplatTexCoordTsl(int(splatIndex)) : splatTexCoordTsl(int(splatIndex));
       const packedData = textureLoad(packedTexture, texCoord.xy).depth(
         texCoord.z
@@ -740,6 +762,40 @@ function fromHalf(h) {
   if (e === 31) return f ? Number.NaN : (s ? -1 : 1) * Number.POSITIVE_INFINITY;
   return (s ? -1 : 1) * 2 ** (e - 15) * (1 + f / 1024);
 }
+function scanBounds(words, offsets, count) {
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let minZ = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  let maxZ = Number.NEGATIVE_INFINITY;
+  for (let k = 0; k < count; k++) {
+    const o = offsets();
+    const w1 = words[o + 1];
+    const w2 = words[o + 2];
+    const x = fromHalf(w1 & 65535);
+    const y = fromHalf(w1 >>> 16);
+    const z = fromHalf(w2 & 65535);
+    if (!Number.isFinite(x + y + z)) continue;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    if (z < minZ) minZ = z;
+    if (z > maxZ) maxZ = z;
+  }
+  if (minX > maxX) {
+    minX = minY = minZ = 0;
+    maxX = maxY = maxZ = 1;
+  }
+  const mx = 0.02 * (maxX - minX + 1e-6);
+  const my = 0.02 * (maxY - minY + 1e-6);
+  const mz = 0.02 * (maxZ - minZ + 1e-6);
+  return {
+    min: new Vector3(minX - mx, minY - my, minZ - mz),
+    max: new Vector3(maxX + mx, maxY + my, maxZ + mz)
+  };
+}
 class WebGpuSplatBackend {
   constructor() {
     this.sortRadial = true;
@@ -762,30 +818,38 @@ class WebGpuSplatBackend {
   }) {
     this.frames++;
     const mesh = this.findSplatMesh(scene);
-    if (!mesh || mesh.packedSplats.numSplats === 0) {
+    const src = mesh ? this.resolveSource(spark, mesh) : null;
+    if (!mesh || !src || src.numSplats === 0) {
       spark.activeSplats = 0;
+      spark.geometry.instanceCount = 0;
       return false;
     }
-    const packed = mesh.packedSplats;
-    const texture = packed.getTexture();
     this.sortRadial = spark.sortRadial ?? true;
     let rebuilt = false;
-    if (!this.state || this.state.mesh !== mesh || this.state.numSplats !== packed.numSplats || this.state.packedTexture !== texture) {
-      this.buildState(spark, mesh, packed, texture);
+    const st = this.state;
+    if (!st || st.mesh !== mesh || st.kind !== src.kind || st.packedTexture !== src.packedTexture || st.cutTexture !== src.cutTexture || st.sh1 !== src.sh1 || st.sh2 !== src.sh2 || st.sh3 !== src.sh3 || st.capacity !== src.capacity) {
+      this.buildState(spark, mesh, src);
       rebuilt = true;
     }
     const state = this.state;
+    const cutChanged = src.numSplats !== state.lastNumSplats || src.mappingVersion !== state.lastMappingVersion;
     let didSort = false;
-    if (!this.freezeOrder && (viewChanged || rebuilt || !this.sortedOnce)) {
+    if (!this.freezeOrder && (viewChanged || rebuilt || cutChanged || !this.sortedOnce)) {
+      if (rebuilt || cutChanged) {
+        this.updateBounds(state, src);
+      }
+      state.uNumSplats.value = src.numSplats;
       this.updateKeygenUniforms(state, camera);
       spark.renderer.compute([state.keygen, ...state.radix.steps]);
       this.sortedOnce = true;
       this.sorts++;
       this.lastSortFrame = this.frames;
       didSort = true;
+      state.lastNumSplats = src.numSplats;
+      state.lastMappingVersion = src.mappingVersion;
     }
-    spark.activeSplats = state.numSplats;
-    spark.geometry.instanceCount = state.numSplats;
+    spark.activeSplats = src.numSplats;
+    spark.geometry.instanceCount = src.numSplats;
     return didSort;
   }
   // Called from SparkRenderer.onBeforeRender: per-frame material uniforms.
@@ -803,7 +867,7 @@ class WebGpuSplatBackend {
     mat.falloff.value = spark.falloff;
     mat.clipXY.value = spark.clipXY;
     mat.focalAdjustment.value = spark.focalAdjustment;
-    const enc = state.packedSplats.splatEncoding ?? {};
+    const enc = this.currentEncoding(state.mesh, state.kind);
     mat.rgbMinMaxLnScaleMinMax.value.set(
       enc.rgbMin ?? 0,
       enc.rgbMax ?? 1,
@@ -828,7 +892,10 @@ class WebGpuSplatBackend {
     const s = this.state;
     if (!s) return null;
     return {
-      numSplats: s.numSplats,
+      kind: s.kind,
+      numSplats: s.lastNumSplats,
+      capacity: s.capacity,
+      numShBound: s.sh3 ? 3 : s.sh2 ? 2 : s.sh1 ? 1 : 0,
       material: s.material,
       sortedValues: s.radix.sortedValues,
       keysNode: s.keysNode
@@ -838,44 +905,118 @@ class WebGpuSplatBackend {
     const found = [];
     scene.traverse((obj) => {
       const candidate = obj;
-      if (obj.visible && candidate.packedSplats && typeof candidate.packedSplats.getTexture === "function" && candidate.packedSplats.numSplats > 0) {
+      const isSplatSource = candidate.packedSplats && typeof candidate.packedSplats.getTexture === "function" || candidate.paged && candidate.paged.dynoIndices !== void 0;
+      if (obj.visible && isSplatSource) {
         found.push(obj);
       }
     });
     if (found.length > 1 && !this.warnedMultiMesh) {
       this.warnedMultiMesh = true;
       console.warn(
-        "WebGpuSplatBackend: multiple SplatMeshes found; only the first is rendered on the WebGPU path (P2 scope — composite cuts arrive with the paged path)."
+        "WebGpuSplatBackend: multiple SplatMeshes found; only the first is rendered on the WebGPU path (composite cuts are out of scope)."
       );
     }
     return found[0] ?? null;
   }
-  buildState(spark, mesh, packed, packedTexture) {
-    var _a, _b, _c;
-    const numSplats = packed.numSplats;
-    const arr = packed.packedArray;
-    let minX = Number.POSITIVE_INFINITY;
-    let minY = Number.POSITIVE_INFINITY;
-    let minZ = Number.POSITIVE_INFINITY;
-    let maxX = Number.NEGATIVE_INFINITY;
-    let maxY = Number.NEGATIVE_INFINITY;
-    let maxZ = Number.NEGATIVE_INFINITY;
-    for (let i = 0; i < numSplats; i++) {
-      const w1 = arr[i * 4 + 1];
-      const w2 = arr[i * 4 + 2];
-      const x = fromHalf(w1 & 65535);
-      const y = fromHalf(w1 >>> 16);
-      const z = fromHalf(w2 & 65535);
-      if (!Number.isFinite(x + y + z)) continue;
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
-      if (z < minZ) minZ = z;
-      if (z > maxZ) maxZ = z;
+  currentEncoding(mesh, kind) {
+    var _a, _b, _c, _d;
+    if (kind === "paged") return ((_a = mesh.paged) == null ? void 0 : _a.splatEncoding) ?? {};
+    if (kind === "lodPacked")
+      return ((_c = (_b = mesh.packedSplats) == null ? void 0 : _b.lodSplats) == null ? void 0 : _c.splatEncoding) ?? {};
+    return ((_d = mesh.packedSplats) == null ? void 0 : _d.splatEncoding) ?? {};
+  }
+  resolveSource(spark, mesh) {
+    var _a, _b, _c, _d, _e, _f, _g;
+    const maxShMesh = mesh.maxSh ?? 3;
+    const paged = mesh.paged;
+    if (paged == null ? void 0 : paged.pager) {
+      const cutTexture = paged.dynoIndices.value;
+      if (paged.numSplats === 0 || cutTexture.image.width !== 4096) {
+        return {
+          kind: "paged",
+          packedTexture: paged.pager.packedTexture.value,
+          pagedTiling: true,
+          cutTexture: null,
+          numSplats: 0,
+          capacity: 0,
+          encoding: paged.splatEncoding ?? {},
+          numSh: 0,
+          mappingVersion: mesh.mappingVersion ?? 0
+        };
+      }
+      const numSh2 = Math.min(
+        paged.numSh,
+        paged.maxSh,
+        paged.pager.maxSh,
+        maxShMesh
+      );
+      const shReady = (t) => t.image.width === 256 && t.image.height === 256 ? t : void 0;
+      return {
+        kind: "paged",
+        packedTexture: paged.pager.packedTexture.value,
+        pagedTiling: true,
+        cutTexture,
+        numSplats: paged.numSplats,
+        capacity: cutTexture.image.height * 16384,
+        encoding: paged.splatEncoding ?? {},
+        numSh: numSh2,
+        sh1: numSh2 >= 1 ? shReady(paged.pager.sh1Texture.value) : void 0,
+        sh2: numSh2 >= 2 ? shReady(paged.pager.sh2Texture.value) : void 0,
+        sh3: numSh2 >= 3 ? shReady(paged.pager.sh3Texture.value) : void 0,
+        mappingVersion: mesh.mappingVersion ?? 0
+      };
     }
-    const keysNode = instancedArray(numSplats, "uint");
-    const radix = createRadixSort({ keysNode, count: numSplats, numBits: 16 });
+    const packed = mesh.packedSplats;
+    if (!packed) return null;
+    const lodSplats = packed.lodSplats;
+    const instance = (_a = spark.lodInstances) == null ? void 0 : _a.get(mesh);
+    if (lodSplats && instance) {
+      const numSh2 = Math.min(lodSplats.getNumSh(), maxShMesh);
+      const sh2 = numSh2 > 0 ? lodSplats.ensureShTextures() : {};
+      return {
+        kind: "lodPacked",
+        packedTexture: lodSplats.getTexture(),
+        pagedTiling: false,
+        cutTexture: instance.texture,
+        numSplats: instance.numSplats,
+        capacity: instance.indices.length,
+        encoding: lodSplats.splatEncoding ?? {},
+        numSh: numSh2,
+        sh1: numSh2 >= 1 ? (_b = sh2.sh1Texture) == null ? void 0 : _b.value : void 0,
+        sh2: numSh2 >= 2 ? (_c = sh2.sh2Texture) == null ? void 0 : _c.value : void 0,
+        sh3: numSh2 >= 3 ? (_d = sh2.sh3Texture) == null ? void 0 : _d.value : void 0,
+        mappingVersion: mesh.mappingVersion ?? 0
+      };
+    }
+    if (packed.numSplats === 0) return null;
+    const numSh = Math.min(packed.getNumSh(), maxShMesh);
+    const sh = numSh > 0 ? packed.ensureShTextures() : {};
+    return {
+      kind: "static",
+      packedTexture: packed.getTexture(),
+      pagedTiling: false,
+      cutTexture: null,
+      numSplats: packed.numSplats,
+      capacity: packed.numSplats,
+      encoding: packed.splatEncoding ?? {},
+      numSh,
+      sh1: numSh >= 1 ? (_e = sh.sh1Texture) == null ? void 0 : _e.value : void 0,
+      sh2: numSh >= 2 ? (_f = sh.sh2Texture) == null ? void 0 : _f.value : void 0,
+      sh3: numSh >= 3 ? (_g = sh.sh3Texture) == null ? void 0 : _g.value : void 0,
+      mappingVersion: mesh.mappingVersion ?? 0
+    };
+  }
+  buildState(spark, mesh, src) {
+    const { capacity, cutTexture, packedTexture, pagedTiling } = src;
+    stripWebGLInternalFormat(packedTexture);
+    if (cutTexture) stripWebGLInternalFormat(cutTexture);
+    const keysNode = instancedArray(Math.max(1, capacity), "uint");
+    const radix = createRadixSort({
+      keysNode,
+      count: Math.max(1, capacity),
+      numBits: 16
+    });
+    const uNumSplats = uniform(0);
     const uMeshToWorld = uniform(new Matrix4());
     const uCameraPos = uniform(new Vector3());
     const uCameraDir = uniform(new Vector3(0, 0, -1));
@@ -883,10 +1024,34 @@ class WebGpuSplatBackend {
     const sortRadial = this.sortRadial;
     const keygen = Fn(() => {
       const i = instanceIndex;
-      If(i.greaterThanEqual(uint(numSplats)), () => {
+      If(i.greaterThanEqual(uint(Math.max(1, capacity))), () => {
         Return();
       });
-      const texCoord = splatTexCoordTsl(int(i));
+      If(float(i).greaterThanEqual(uNumSplats), () => {
+        keysNode.element(i).assign(uint(65535));
+        Return();
+      });
+      let splatIndex = i;
+      if (cutTexture) {
+        const texel = textureLoad(
+          cutTexture,
+          ivec2(
+            int(i.shiftRight(uint(2)).bitAnd(uint(4095))),
+            int(i.shiftRight(uint(14)))
+          )
+        );
+        const comp = i.bitAnd(uint(3));
+        splatIndex = select(
+          comp.equal(uint(0)),
+          texel.x,
+          select(
+            comp.equal(uint(1)),
+            texel.y,
+            select(comp.equal(uint(2)), texel.z, texel.w)
+          )
+        );
+      }
+      const texCoord = pagedTiling ? pagedSplatTexCoordTsl(int(splatIndex)) : splatTexCoordTsl(int(splatIndex));
       const t = textureLoad(packedTexture, texCoord.xy).depth(texCoord.z);
       const xy = unpackHalf2x16(t.y);
       const zw = unpackHalf2x16(t.z.bitAnd(uint(65535)));
@@ -902,39 +1067,97 @@ class WebGpuSplatBackend {
         ).mul(65535)
       );
       keysNode.element(i).assign(q);
-    })().compute([Math.ceil(numSplats / 256)], [256]).setName("splatKeygen");
-    const numSh = Math.min(packed.getNumSh(), mesh.maxSh ?? 3);
-    const sh = numSh > 0 ? packed.ensureShTextures() : {};
-    const enc = packed.splatEncoding ?? {};
+    })().compute([Math.ceil(Math.max(1, capacity) / 256)], [256]).setName("splatKeygen");
     const material = new SplatNodeMaterial({
       packedTexture,
       orderNode: radix.sortedValues,
-      sh1Texture: numSh >= 1 ? (_a = sh.sh1Texture) == null ? void 0 : _a.value : void 0,
-      sh2Texture: numSh >= 2 ? (_b = sh.sh2Texture) == null ? void 0 : _b.value : void 0,
-      sh3Texture: numSh >= 3 ? (_c = sh.sh3Texture) == null ? void 0 : _c.value : void 0,
-      lodOpacity: enc.lodOpacity ?? false
+      cutIndicesTexture: cutTexture ?? void 0,
+      sh1Texture: src.sh1,
+      sh2Texture: src.sh2,
+      sh3Texture: src.sh3,
+      lodOpacity: src.encoding.lodOpacity ?? false,
+      paged: pagedTiling
     });
     if (this.state) {
       this.state.material.dispose();
     }
     this.state = {
       mesh,
-      packedSplats: packed,
-      numSplats,
+      kind: src.kind,
       packedTexture,
+      cutTexture,
+      sh1: src.sh1,
+      sh2: src.sh2,
+      sh3: src.sh3,
+      capacity,
       material,
       keysNode,
       keygen,
       radix,
-      boundsMin: new Vector3(minX, minY, minZ),
-      boundsMax: new Vector3(maxX, maxY, maxZ),
+      uNumSplats,
       uMeshToWorld,
       uCameraPos,
       uCameraDir,
-      uDistRange
+      uDistRange,
+      boundsMin: new Vector3(0, 0, 0),
+      boundsMax: new Vector3(1, 1, 1),
+      lastNumSplats: -1,
+      lastMappingVersion: -1
     };
     this.sortedOnce = false;
     spark.material = material;
+  }
+  // (Re)compute object-space bounds for the CURRENT cut/source. Static
+  // sources scan the whole packedArray once; cut sources sample the cut
+  // through the CPU mirrors (cut indices texture image.data → pool/lodSplats
+  // mirror) at each re-cut (≤ ~65k samples, sub-ms).
+  updateBounds(state, src) {
+    var _a, _b, _c, _d, _e, _f, _g;
+    const mesh = state.mesh;
+    let bounds = null;
+    if (src.kind === "static") {
+      const arr = (_a = mesh.packedSplats) == null ? void 0 : _a.packedArray;
+      if (arr) {
+        let i = 0;
+        bounds = scanBounds(arr, () => 4 * i++, src.numSplats);
+      }
+    } else if (src.kind === "lodPacked") {
+      const arr = (_c = (_b = mesh.packedSplats) == null ? void 0 : _b.lodSplats) == null ? void 0 : _c.packedArray;
+      const cut = (_d = state.cutTexture) == null ? void 0 : _d.image.data;
+      if (arr && cut) {
+        const step = Math.max(1, Math.floor(src.numSplats / 65536));
+        let i = 0;
+        bounds = scanBounds(
+          arr,
+          () => {
+            const idx = cut[i];
+            i += step;
+            return 4 * idx;
+          },
+          Math.floor(src.numSplats / step)
+        );
+      }
+    } else {
+      const pool = (_f = (_e = mesh.paged) == null ? void 0 : _e.pager) == null ? void 0 : _f.packedTexture.value.image.data;
+      const cut = (_g = state.cutTexture) == null ? void 0 : _g.image.data;
+      if (pool && cut) {
+        const step = Math.max(1, Math.floor(src.numSplats / 65536));
+        let i = 0;
+        bounds = scanBounds(
+          pool,
+          () => {
+            const idx = cut[i];
+            i += step;
+            return 4 * ((idx >>> 16) * 65536 + (idx & 65535));
+          },
+          Math.floor(src.numSplats / step)
+        );
+      }
+    }
+    if (bounds) {
+      state.boundsMin.copy(bounds.min);
+      state.boundsMax.copy(bounds.max);
+    }
   }
   updateKeygenUniforms(state, camera) {
     state.mesh.updateWorldMatrix(true, false);

@@ -4,6 +4,7 @@ import type * as THREE from "three";
 export type SplatNodeMaterialOptions = {
     packedTexture: THREE.DataArrayTexture;
     orderNode: TslNode;
+    cutIndicesTexture?: THREE.DataTexture;
     sh1Texture?: THREE.DataArrayTexture;
     sh2Texture?: THREE.DataArrayTexture;
     sh3Texture?: THREE.DataArrayTexture;
