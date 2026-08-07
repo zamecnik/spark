@@ -22,6 +22,8 @@ Conventions:
 |---|---|
 | `vite.config.ts` | Rollup externals extended with `three/tsl`, `three/webgpu` (bundling them would duplicate three and break `instanceof` in consumers). Second lib entry `spark-webgpu` → `dist/spark-webgpu.module.js` so the WebGPU module ships as its own self-contained bundle (lazy-load requirement; WebGL2-only consumers never resolve `three/webgpu`). |
 | `package.json` | `./webgpu` subpath export for the second bundle. (planned P5) version suffix `-kroscloud.N` for vendored tarball releases. |
+| `src/shaders.ts` | `ShaderChunk` registration guarded — three.webgpu.js exports no ShaderChunk and module-eval-time callers crashed the whole import for WebGPU consumers. |
+| `src/SparkRenderer.ts` | Additive `webgpuBackend` option (structural `SparkWebGpuBackendLike` interface — core never imports three/webgpu). When set: placeholder node material until the backend installs a per-source `SplatNodeMaterial`, `updateInternal` branches to the backend's keygen→GPU-radix-sort→ordered-draw instead of generate()+driveSort(), `onBeforeRender` syncs material uniforms via `applyPerFrame`, and the frame counter falls back to `info.frame` (WebGPURenderer has no `info.render.frame`). When absent, behavior is byte-identical to upstream (verified: WebGL renders pixel-identical pre/post change, SSIM 1.0/MAD 0). `material` field widened `ShaderMaterial` → `Material`. |
 
 ## Added files (`src/webgpu/`)
 
@@ -32,6 +34,8 @@ Conventions:
 | `SplatNodeMaterial.ts` | Hand-written TSL node material reproducing `shaders/splatVertex.glsl` + `shaders/splatFragment.glsl` for the WebGPU path: verbatim projection math (center rejects, clipXY guard, Jacobian, preBlur/blur, eigen decomposition, maxPixelRadius clamp order), LOD `a>1` opacity chain, premultiplied-alpha fragment. Draw ordering comes from an `order` storage buffer indexed by `instanceIndex` (identity in P1; GPU radix sort producer arrives in P2). Not ported (default-off/dead upstream, unused by our apps): enable2DGS, depth-of-field, the dead `if(false)` falloff branch, encodeLinear, log-depth. |
 | `index.ts` (webgpu) | Module entry for the `./webgpu` subpath. |
 | `alphaReference.ts` | Pure-math mirror of the vertex alpha chain (the ×2-once convention) with WGSL round-half-even semantics; pinned by `test/webgpu/alphaChain.test.ts` hand-computed fixtures and reused by the browser parity probe. |
+| `radixSort.ts` | TSL port of PlayCanvas's portable multipass 4-bit radix sort (MIT; kishimisu "Fast 4-way parallel radix sorting on GPUs" lineage — attribution in the file header). Stable u32 sort producing the index permutation; counts baked per instance. |
+| `WebGpuSplatBackend.ts` | The WebGPU path orchestrator: per-frame TSL keygen (fp16 center → world → radial/z metric → INVERTED 16-bit key over CPU-computed [min,max] so the ascending radix yields back-to-front) + radix sort + order-buffer producer, viewChanged skip optimization, activeSplats publication, per-source material/buffer lifecycle. P2 scope: one non-paged SplatMesh (composite/paged cuts arrive in P3). |
 
 ## Behavioral deviations from upstream (WebGPU path only)
 

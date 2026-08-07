@@ -1,3 +1,4 @@
+// Modified by Kroscloud, 2026 — see FORK-CHANGES.md
 import * as THREE from "three";
 import {
   ExtSplats,
@@ -325,12 +326,42 @@ export interface SparkRendererOptions {
    * @default undefined = false
    */
   depthWrite?: boolean;
+  /**
+   * Kroscloud fork: attach the WebGPU render path. Construct a
+   * WebGpuSplatBackend from the lazy-loaded "@sparkjsdev/spark/webgpu"
+   * module and pass it here together with a THREE.WebGPURenderer. When set,
+   * the WebGL2 accumulate/readback/CPU-sort pipeline is bypassed entirely:
+   * the backend runs a per-frame TSL keygen + GPU radix sort and draws via
+   * SplatNodeMaterial. When absent, behavior is byte-identical to upstream.
+   */
+  webgpuBackend?: SparkWebGpuBackendLike;
+}
+
+/**
+ * Kroscloud fork: structural interface of WebGpuSplatBackend, declared here
+ * so the core bundle never imports three/webgpu (the implementation lives in
+ * the separate spark-webgpu bundle).
+ */
+export interface SparkWebGpuBackendLike {
+  placeholderMaterial: THREE.Material;
+  update(args: {
+    // biome-ignore lint/suspicious/noExplicitAny: avoids a core↔webgpu type cycle
+    spark: any;
+    scene: THREE.Scene;
+    camera: THREE.Camera;
+    viewChanged: boolean;
+  }): boolean;
+  // biome-ignore lint/suspicious/noExplicitAny: avoids a core↔webgpu type cycle
+  applyPerFrame(spark: any, camera: THREE.Camera): void;
 }
 
 export class SparkRenderer extends THREE.Mesh {
   readonly renderer: THREE.WebGLRenderer;
-  readonly material: THREE.ShaderMaterial;
+  material: THREE.Material;
   readonly uniforms: ReturnType<typeof SparkRenderer.makeUniforms>;
+
+  // Kroscloud fork: WebGPU render path (null ⇒ upstream WebGL2 pipeline)
+  readonly webgpuBackend: SparkWebGpuBackendLike | null;
 
   autoUpdate: boolean;
   preUpdate: boolean;
@@ -494,6 +525,16 @@ export class SparkRenderer extends THREE.Mesh {
     super(geometry, material);
     this.material = material;
     this.uniforms = uniforms;
+
+    // Kroscloud fork: WebGPU path. The GLSL ShaderMaterial above cannot
+    // compile under WebGPURenderer — draw nothing until the backend installs
+    // a SplatNodeMaterial for the first splat source.
+    this.webgpuBackend = options.webgpuBackend ?? null;
+    if (this.webgpuBackend) {
+      this.material = this.webgpuBackend.placeholderMaterial;
+      // nothing to draw until the backend publishes activeSplats
+      geometry.instanceCount = 0;
+    }
     // Disable frustum culling because we want to always draw them all
     // and cull Gsplats individually in the shader
     this.frustumCulled = false;
@@ -724,7 +765,12 @@ export class SparkRenderer extends THREE.Mesh {
   ) {
     const spark = SparkRenderer.sparkOverride ?? this;
 
-    const frame = renderer.info.render.frame;
+    // Kroscloud fork: WebGPURenderer's Info has no render.frame (its frame
+    // counter lives at info.frame, managed by NodeFrame) — without the
+    // fallback isNewFrame would be false forever on the WebGPU path.
+    const frame =
+      renderer.info.render.frame ??
+      (renderer.info as unknown as { frame?: number }).frame;
     const isNewFrame = frame !== spark.lastFrame;
     spark.lastFrame = frame;
 
@@ -830,6 +876,12 @@ export class SparkRenderer extends THREE.Mesh {
       }
     }
 
+    // Kroscloud fork: sync SplatNodeMaterial uniforms AFTER updateInternal
+    // ran (it may have swapped in a rebuilt material this frame).
+    if (spark.webgpuBackend) {
+      spark.webgpuBackend.applyPerFrame(spark, camera);
+    }
+
     spark.dirty = false;
   }
 
@@ -892,6 +944,24 @@ export class SparkRenderer extends THREE.Mesh {
     const viewChanged =
       center.distanceTo(this.sortedCenter) > 0.001 ||
       dir.dot(this.sortedDir) < 0.999;
+
+    // Kroscloud fork: the WebGPU branch replaces generate()+driveSort() with
+    // the backend's keygen→GPU-radix-sort→ordered-draw (fork plan §4.2).
+    // driveLod is NOT wired on this branch yet (paged .rad arrives in P3).
+    if (this.webgpuBackend) {
+      const didSort = this.webgpuBackend.update({
+        spark: this,
+        scene,
+        camera,
+        viewChanged,
+      });
+      if (didSort) {
+        this.sortedCenter.copy(center);
+        this.sortedDir.copy(dir);
+        this.setDirty();
+      }
+      return;
+    }
 
     const next = this.accumulators.pop();
     if (!next) {

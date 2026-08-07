@@ -33,5 +33,8 @@ export {
 export {
   type AlphaChainResult,
   referenceAlphaChain,
+  roundEven,
   stockNetAlpha,
 } from "./alphaReference";
+export { type RadixSort, createRadixSort } from "./radixSort";
+export { WebGpuSplatBackend } from "./WebGpuSplatBackend";

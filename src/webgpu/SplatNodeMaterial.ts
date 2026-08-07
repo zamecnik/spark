@@ -130,6 +130,12 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
   renderSize = uniform(new Vector2(1, 1));
   renderToViewQuat = uniform(new Vector4(0, 0, 0, 1));
   renderToViewPos = uniform(new Vector3());
+  // Uniform scale factor of the object→view transform. Stock bakes the mesh
+  // transform (uniform scale only — SplatTransformer) into Pass A at read
+  // time; without Pass A it is applied here: center·s then rotate+translate,
+  // splat scales ·s BEFORE the repack lattice (matching stock's
+  // transform-then-quantize order).
+  renderToViewScale = uniform(1.0);
   // Camera position in splat object space, for SH viewDir (the stock
   // generator's viewOrigin = viewToObject.translate).
   viewOrigin = uniform(new Vector3());
@@ -202,7 +208,7 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
       );
       const center = unpacked.center;
       const quaternion = unpacked.quaternion;
-      const scales = vec3(unpacked.scales).toVar();
+      const scales = vec3(unpacked.scales.mul(this.renderToViewScale)).toVar();
       const rgba = vec4(unpacked.rgba).toVar();
 
       // File u8 ×2 applied EXACTLY ONCE (lodOpacity encoding); see header.
@@ -288,9 +294,10 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
       });
 
       // Compute the view space center of the splat
-      const viewCenter = quatVecTsl(this.renderToViewQuat, center).add(
-        this.renderToViewPos,
-      );
+      const viewCenter = quatVecTsl(
+        this.renderToViewQuat,
+        center.mul(this.renderToViewScale),
+      ).add(this.renderToViewPos);
 
       // Discard splats behind the camera
       rejected.assign(rejected.or(viewCenter.z.greaterThanEqual(0.0)));
