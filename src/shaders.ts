@@ -1,3 +1,4 @@
+// Modified by Kroscloud, 2026 — see FORK-CHANGES.md
 import * as THREE from "three";
 
 import computeUvec4Template from "./shaders/computeUvec4.glsl";
@@ -14,8 +15,12 @@ let shaders: Record<string, string> | null = null;
 
 export function getShaders(): Record<string, string> {
   if (!shaders) {
+    // Kroscloud: guard for WebGPU-build three ('three' → three.webgpu.js has
+    // no ShaderChunk; the registration only serves the WebGLRenderer path).
+    // Module-eval-time callers (SplatAccumulator static fields) would
+    // otherwise crash the whole import for WebGPU consumers.
     // @ts-ignore
-    THREE.ShaderChunk.splatDefines = splatDefines;
+    if (THREE.ShaderChunk) THREE.ShaderChunk.splatDefines = splatDefines;
     shaders = {
       oldSplatVertex,
       oldSplatFragment,
