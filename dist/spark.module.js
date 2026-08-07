@@ -10711,8 +10711,10 @@ const _SparkRenderer = class _SparkRenderer extends THREE.Mesh {
         mesh.paged.update(numSplats, indices);
       } else {
         let instance = this.lodInstances.get(mesh);
+        let prevRows = 0;
         if (instance) {
           if (indices.length > instance.indices.length) {
+            prevRows = instance.texture.image.height;
             instance.texture.dispose();
             instance = void 0;
           }
@@ -10723,10 +10725,22 @@ const _SparkRenderer = class _SparkRenderer extends THREE.Mesh {
           if (indices.length !== capacity) {
             throw new Error("Indices length != capacity");
           }
+          let texRows = rows;
+          let texData = indices;
+          if (this.webgpuBackend) {
+            texRows = Math.min(
+              Math.max(rows, prevRows * 2, 128),
+              Math.max(rows, 512)
+            );
+            if (texRows !== rows) {
+              texData = new Uint32Array(texRows * 16384);
+              texData.set(indices);
+            }
+          }
           const texture2 = new THREE.DataTexture(
-            indices,
+            texData,
             4096,
-            rows,
+            texRows,
             THREE.RGBAIntegerFormat,
             THREE.UnsignedIntType
           );
@@ -10734,7 +10748,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE.Mesh {
             texture2.internalFormat = "RGBA32UI";
           }
           texture2.needsUpdate = true;
-          instance = { lodId, numSplats, indices, texture: texture2 };
+          instance = { lodId, numSplats, indices: texData, texture: texture2 };
           this.lodInstances.set(mesh, instance);
         } else if (this.webgpuBackend) {
           instance.numSplats = numSplats;
@@ -11333,15 +11347,29 @@ class PagedSplats {
     this.dynoNumSplats.value = this.numSplats;
     const rows = Math.ceil(numSplats / 16384);
     let indicesTexture = this.dynoIndices.value === SplatPager.emptyIndicesTexture ? void 0 : this.dynoIndices.value;
+    let prevRows = 0;
     if (indicesTexture && rows > indicesTexture.image.height) {
+      prevRows = indicesTexture.image.height;
       indicesTexture.dispose();
       indicesTexture = void 0;
     }
     if (!indicesTexture) {
+      let texRows = rows;
+      let texData = indices;
+      if (isWebGPURenderer(renderer)) {
+        texRows = Math.min(
+          Math.max(rows, prevRows * 2, 128),
+          Math.max(rows, 512)
+        );
+        if (texRows !== rows) {
+          texData = new Uint32Array(texRows * 16384);
+          texData.set(indices);
+        }
+      }
       indicesTexture = new THREE.DataTexture(
-        indices,
+        texData,
         4096,
-        rows,
+        texRows,
         THREE.RGBAIntegerFormat,
         THREE.UnsignedIntType
       );

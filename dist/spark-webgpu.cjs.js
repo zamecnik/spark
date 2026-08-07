@@ -821,6 +821,7 @@ class WebGpuSplatBackend {
     this.frames = 0;
     this.sorts = 0;
     this.lastSortFrame = -1;
+    this.rebuilds = 0;
     this.state = null;
     this.sortedOnce = false;
     this.warnedMultiMesh = false;
@@ -848,6 +849,7 @@ class WebGpuSplatBackend {
     if (!st || st.mesh !== mesh || st.kind !== src.kind || st.packedTexture !== src.packedTexture || st.cutTexture !== src.cutTexture || st.sh1 !== src.sh1 || st.sh2 !== src.sh2 || st.sh3 !== src.sh3 || st.capacity !== src.capacity) {
       this.buildState(spark, mesh, src);
       rebuilt = true;
+      this.rebuilds++;
     }
     const state = this.state;
     const cutChanged = src.numSplats !== state.lastNumSplats || src.mappingVersion !== state.lastMappingVersion;

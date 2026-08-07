@@ -32,6 +32,7 @@ export declare class WebGpuSplatBackend {
     frames: number;
     sorts: number;
     lastSortFrame: number;
+    rebuilds: number;
     private state;
     private sortedOnce;
     private warnedMultiMesh;
