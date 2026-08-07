@@ -1,6 +1,19 @@
+// Modified by Kroscloud, 2026 — see FORK-CHANGES.md
 import * as THREE from "three";
 
 import init_wasm, { decode_rad_header } from "spark-rs";
+
+// Kroscloud fork: WebGPU path detection. Two r185 WebGPU facts drive the
+// branches below (P0/S1): (a) a WebGL internalFormat string SILENTLY
+// disables the WebGPU texture upload (all-zero reads, no errors), so it must
+// never be set there; (b) raw gl.texSubImage2D has no WebGPU equivalent —
+// the cut-index re-upload uses the standard needsUpdate path instead
+// (~6.5 ms per lodDirty @ 8.4 MB, traverse-cadence-bounded).
+function isWebGPURenderer(renderer: unknown): boolean {
+  return (
+    (renderer as { isWebGPURenderer?: boolean }).isWebGPURenderer === true
+  );
+}
 import { LN_SCALE_MAX, LN_SCALE_MIN, dyno } from ".";
 import { evaluateExtSH } from "./ExtSplats";
 import { evaluatePackedSH } from "./PackedSplats";
@@ -332,10 +345,19 @@ export class PagedSplats implements SplatSource {
         THREE.RGBAIntegerFormat,
         THREE.UnsignedIntType,
       );
-      indicesTexture.internalFormat = "RGBA32UI";
+      if (!isWebGPURenderer(renderer)) {
+        // Kroscloud fork: never on WebGPU — silently kills the upload
+        indicesTexture.internalFormat = "RGBA32UI";
+      }
       indicesTexture.needsUpdate = true;
       renderer.initTexture(indicesTexture);
       this.dynoIndices.value = indicesTexture;
+    } else if (isWebGPURenderer(renderer)) {
+      // Kroscloud fork: standard mirror-write + needsUpdate re-upload; the
+      // image.data array stays the raycast CPU mirror.
+      const textureIndices = indicesTexture.image.data as Uint32Array;
+      textureIndices.set(indices.subarray(0, textureIndices.length));
+      indicesTexture.needsUpdate = true;
     } else {
       const textureIndices = indicesTexture.image.data as Uint32Array;
       textureIndices.set(indices.subarray(0, numSplats));
@@ -1269,7 +1291,10 @@ export class SplatPager {
     const texture = new THREE.DataArrayTexture(data, width, height, depth);
     texture.format = format;
     texture.type = type;
-    texture.internalFormat = internalFormat;
+    if (!isWebGPURenderer(this.renderer)) {
+      // Kroscloud fork: never on WebGPU — silently kills the upload (P0/S1)
+      texture.internalFormat = internalFormat;
+    }
     texture.needsUpdate = true;
     this.renderer.initTexture(texture);
     return texture;

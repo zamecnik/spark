@@ -5,7 +5,7 @@ import {
   PackedSplats,
   PagedSplats,
   Readback,
-  type SplatGenerator,
+  SplatGenerator,
   SplatMesh,
   SplatPager,
 } from ".";
@@ -947,7 +947,11 @@ export class SparkRenderer extends THREE.Mesh {
 
     // Kroscloud fork: the WebGPU branch replaces generate()+driveSort() with
     // the backend's keygen→GPU-radix-sort→ordered-draw (fork plan §4.2).
-    // driveLod is NOT wired on this branch yet (paged .rad arrives in P3).
+    // driveLod runs UNCHANGED (§4.2 step 2) — only its two external inputs
+    // are supplied here: the accumulator's viewToWorld (normally set by
+    // prepareGenerate) and the visible-generators walk. The stale-cut
+    // machinery (mappingVersion pipeline gates) has no equivalent on this
+    // branch by design — a new cut draws correctly next frame.
     if (this.webgpuBackend) {
       const didSort = this.webgpuBackend.update({
         spark: this,
@@ -959,6 +963,16 @@ export class SparkRenderer extends THREE.Mesh {
         this.sortedCenter.copy(center);
         this.sortedDir.copy(dir);
         this.setDirty();
+      }
+      if (this.enableDriveLod) {
+        this.current.viewToWorld.copy(camera.matrixWorld);
+        const visibleGenerators: SplatGenerator[] = [];
+        scene.traverseVisible((obj) => {
+          if (obj instanceof SplatGenerator) {
+            visibleGenerators.push(obj);
+          }
+        });
+        this.driveLod({ visibleGenerators, camera, scene });
       }
       return;
     }
@@ -1677,10 +1691,22 @@ export class SparkRenderer extends THREE.Mesh {
             THREE.RGBAIntegerFormat,
             THREE.UnsignedIntType,
           );
-          texture.internalFormat = "RGBA32UI";
+          if (!this.webgpuBackend) {
+            // Kroscloud fork: a WebGL internalFormat string silently
+            // disables the WebGPU texture upload (P0/S1)
+            texture.internalFormat = "RGBA32UI";
+          }
           texture.needsUpdate = true;
           instance = { lodId, numSplats, indices, texture };
           this.lodInstances.set(mesh, instance);
+        } else if (this.webgpuBackend) {
+          // Kroscloud fork: standard mirror-write + needsUpdate re-upload
+          // (no texSubImage2D on WebGPU); image.data stays the CPU mirror.
+          instance.numSplats = numSplats;
+          instance.indices.set(
+            indices.subarray(0, instance.indices.length),
+          );
+          instance.texture.needsUpdate = true;
         } else {
           instance.numSplats = numSplats;
           // instance.indices.set(indices.subarray(0, numSplats));

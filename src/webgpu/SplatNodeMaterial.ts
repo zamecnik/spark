@@ -63,6 +63,7 @@ import {
   float,
   instanceIndex,
   int,
+  ivec2,
   mat3,
   max,
   min,
@@ -75,6 +76,7 @@ import {
   sqrt,
   textureLoad,
   transpose,
+  uint,
   uniform,
   varyingProperty,
   vec2,
@@ -106,6 +108,11 @@ export type SplatNodeMaterialOptions = {
   // u32 storage buffer node (e.g. instancedArray(n, "uint")); element i is
   // the splat index drawn by instance i. Identity in P1; P2's sort writes it.
   orderNode: TslNode;
+  // LOD cut-index DataTexture (4096-wide RGBA32UI, 4 u32 indices per texel —
+  // Spark's dynoIndices/lodInstances layout). When present, order[i] yields a
+  // cut SLOT which is resolved through this texture to the actual splat
+  // index ((page<<16)|slot for the paged pool). P3 path.
+  cutIndicesTexture?: THREE.DataTexture;
   // SH coefficient textures; pass only the degrees to evaluate
   // (min(fileSh, maxSh) clamping = pass fewer textures).
   sh1Texture?: THREE.DataArrayTexture;
@@ -160,6 +167,7 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
     const {
       packedTexture,
       orderNode,
+      cutIndicesTexture,
       sh1Texture,
       sh2Texture,
       sh3Texture,
@@ -170,6 +178,7 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
     } = options;
 
     stripWebGLInternalFormat(packedTexture);
+    if (cutIndicesTexture) stripWebGLInternalFormat(cutIndicesTexture);
     for (const tex of [sh1Texture, sh2Texture, sh3Texture]) {
       if (tex) stripWebGLInternalFormat(tex);
     }
@@ -193,7 +202,30 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
       const rejectPos = vec4(0.0, 0.0, 2.0, 1.0); // outside the frustum
       const rejected = bool(false).toVar();
 
-      const splatIndex = orderNode.element(instanceIndex);
+      // order[instanceIndex] → slot; with a cut, slot resolves through the
+      // cut-index texture (verbatim readIndex: ivec2((i>>2)&4095, i>>14),
+      // component [i&3] via select-cascade — P0/S2 pattern)
+      const slot = orderNode.element(instanceIndex);
+      let splatIndex: TslNode = slot;
+      if (cutIndicesTexture) {
+        const texel = textureLoad(
+          cutIndicesTexture,
+          ivec2(
+            int(slot.shiftRight(uint(2)).bitAnd(uint(4095))),
+            int(slot.shiftRight(uint(14))),
+          ),
+        );
+        const comp = slot.bitAnd(uint(3));
+        splatIndex = select(
+          comp.equal(uint(0)),
+          texel.x,
+          select(
+            comp.equal(uint(1)),
+            texel.y,
+            select(comp.equal(uint(2)), texel.z, texel.w),
+          ),
+        );
+      }
 
       const texCoord = paged
         ? pagedSplatTexCoordTsl(int(splatIndex))
