@@ -16,6 +16,12 @@ function isWebGPURenderer(renderer: unknown): boolean {
 }
 import { LN_SCALE_MAX, LN_SCALE_MIN, dyno } from ".";
 import { evaluateExtSH } from "./ExtSplats";
+import {
+  kcDisposeGrownTexture,
+  kcGrowthCapRows,
+  kcInitialCutRows,
+  kcRegrowLog,
+} from "./kcRegrowDebug";
 import { evaluatePackedSH } from "./PackedSplats";
 import { getSplatFileType, getSplatFileTypeFromPath } from "./SplatLoader";
 import type { SplatSource } from "./SplatMesh";
@@ -58,6 +64,9 @@ export class PagedSplats implements SplatSource {
   numSplats: number;
   splatEncoding?: SplatEncoding;
   radMetaPromise?: Promise<{ meta: RadMeta; chunksStart: number }>;
+  // Kroscloud fork: RadMeta.count captured at meta resolution — upper bound
+  // on any cut size, used to clamp the cut-texture pre-size (0 = unknown).
+  totalFileSplats = 0;
 
   dynoNumSplats: dyno.DynoInt<"numSplats">;
   dynoIndices: dyno.DynoUsampler2D<"indices", THREE.DataTexture>;
@@ -159,6 +168,9 @@ export class PagedSplats implements SplatSource {
       throw new Error("Failed to decode RAD header");
     })().then((metaStart) => {
       // console.log("RAD meta: ", metaStart.meta);
+      // Kroscloud fork: total file entry count (leaves + ancestors) — the
+      // cut-texture pre-size clamp (any cut ≤ leaf count ≤ this).
+      this.totalFileSplats = metaStart.meta.count || 0;
       return metaStart;
     });
 
@@ -318,7 +330,7 @@ export class PagedSplats implements SplatSource {
     });
   }
 
-  update(numSplats: number, indices: Uint32Array) {
+  update(numSplats: number, indices: Uint32Array, presizeRows?: number) {
     if (!this.pager) {
       throw new Error("PagedSplats.pager not set");
     }
@@ -335,7 +347,9 @@ export class PagedSplats implements SplatSource {
     let prevRows = 0;
     if (indicesTexture && rows > indicesTexture.image.height) {
       prevRows = indicesTexture.image.height;
-      indicesTexture.dispose();
+      // P6 diagnosis lever: dispose policy for the old texture is runtime-
+      // selectable (baseline/leak/defer) — see kcRegrowDebug.ts.
+      kcDisposeGrownTexture(renderer, indicesTexture);
       indicesTexture = undefined;
     }
 
@@ -352,19 +366,32 @@ export class PagedSplats implements SplatSource {
       let texRows = rows;
       let texData: Uint32Array = indices;
       if (isWebGPURenderer(renderer)) {
-        // Floor 384 rows (6.29M slots): every desktop budget ≤ 6M fits with
-        // ZERO mid-session regrows (leaf-complete cuts of 4.59M-class scenes
-        // included). This is not only the recompile-jank fix: the regrow
-        // path (texture recreate + full backend rebuild while streaming) is
-        // empirically correlated with D3D12 device removal — every stress
-        // run that regrew died, every run that didn't survived.
+        // Pre-size to min(session budget, scene size): a fixed-budget
+        // session can then NEVER hit the mid-session regrow — the
+        // anomalously heavy transition (whole-texture upload +
+        // ~25-pipeline WGSL recompile, 2.7–11 s stall, the 2026-08-06 TDR
+        // aggravator) — and small scenes don't pay budget-sized keygen
+        // scans (capacity-bound sort cost). Regrow remains only for
+        // runtime lodSplatCount raises, with ×2 geometric growth and
+        // DEFERRED old-resource disposal (kcRegrowDebug).
+        const sceneRows =
+          this.totalFileSplats > 0
+            ? Math.ceil(this.totalFileSplats / 16384)
+            : Number.POSITIVE_INFINITY;
+        const floorRows = Math.min(
+          presizeRows ?? kcInitialCutRows(0),
+          sceneRows,
+        );
         texRows = Math.min(
-          Math.max(rows, prevRows * 2, 384),
-          Math.max(rows, 512),
+          Math.max(rows, prevRows * 2, floorRows),
+          Math.max(rows, kcGrowthCapRows()),
         );
         if (texRows !== rows) {
           texData = new Uint32Array(texRows * 16384);
           texData.set(indices);
+        }
+        if (prevRows > 0) {
+          kcRegrowLog("regrowCreate", { prevRows, rows, texRows });
         }
       }
       indicesTexture = new THREE.DataTexture(

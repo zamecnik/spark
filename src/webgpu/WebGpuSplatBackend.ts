@@ -66,6 +66,7 @@ import {
   splatTexCoordTsl,
   stripWebGLInternalFormat,
 } from "./packedSplatsTsl";
+import { kcDisposeOldMaterial, kcRegrowLog } from "../kcRegrowDebug";
 import { type RadixSort, createRadixSort } from "./radixSort";
 import { SplatNodeMaterial } from "./SplatNodeMaterial";
 
@@ -672,8 +673,11 @@ export class WebGpuSplatBackend {
     });
 
     if (this.state) {
-      this.state.material.dispose();
+      // P6 diagnosis lever: old-material dispose policy is runtime-
+      // selectable (baseline/leak/defer) — see kcRegrowDebug.ts.
+      kcDisposeOldMaterial(spark.renderer, this.state.material);
     }
+    kcRegrowLog("buildState", { capacity });
     this.state = {
       mesh,
       kind: src.kind,

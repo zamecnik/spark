@@ -11,6 +11,12 @@ import {
 } from ".";
 import { SplatAccumulator } from "./SplatAccumulator";
 import { SplatGeometry } from "./SplatGeometry";
+import {
+  kcDisposeGrownTexture,
+  kcGrowthCapRows,
+  kcInitialCutRows,
+  kcRegrowLog,
+} from "./kcRegrowDebug";
 import { SplatWorker } from "./SplatWorker";
 import { SPLAT_TEX_HEIGHT, SPLAT_TEX_WIDTH } from "./defines";
 import { getShaders } from "./shaders";
@@ -1662,12 +1668,19 @@ export class SparkRenderer extends THREE.Mesh {
     >,
   ) {
     // console.log("updateLodIndices", keyIndices);
+    // Pre-size cut textures to the CURRENT session budget so fixed-budget
+    // sessions never regrow (see kcRegrowDebug.ts); mirrors the traverse's
+    // own maxSplats bound (lodSplatCount × lodSplatScale).
+    const budgetSplats =
+      (this.lodSplatCount ?? this.defaultSplatTarget()) * this.lodSplatScale;
+    const presizeRows = kcInitialCutRows(budgetSplats);
+
     for (const [uuid, countIndices] of Object.entries(keyIndices)) {
       const { lodId, numSplats, indices } = countIndices;
       const mesh = uuidToMesh.get(uuid) as SplatMesh;
 
       if (mesh.paged) {
-        mesh.paged.update(numSplats, indices);
+        mesh.paged.update(numSplats, indices, presizeRows);
         // console.log("*** paged.update", lodId, numSplats, indices.slice(0, 5).join(","));
       } else {
         let instance = this.lodInstances.get(mesh);
@@ -1675,7 +1688,8 @@ export class SparkRenderer extends THREE.Mesh {
         if (instance) {
           if (indices.length > instance.indices.length) {
             prevRows = instance.texture.image.height;
-            instance.texture.dispose();
+            // P6 diagnosis lever — see kcRegrowDebug.ts.
+            kcDisposeGrownTexture(this.renderer, instance.texture);
             instance = undefined;
           }
         }
@@ -1694,16 +1708,24 @@ export class SparkRenderer extends THREE.Mesh {
           let texRows = rows;
           let texData = indices;
           if (this.webgpuBackend) {
-            // 384-row floor: no mid-session regrow for budgets ≤ 6M — the
-            // regrow path is empirically correlated with D3D12 device
-            // removal (see SplatPager.update).
+            // Budget pre-size clamped by the scene's own lod-array size —
+            // see SplatPager.update / kcRegrowDebug.ts.
+            const lodTotal =
+              mesh.packedSplats?.lodSplats?.numSplats ?? 0;
+            const sceneRows =
+              lodTotal > 0
+                ? Math.ceil(lodTotal / 16384)
+                : Number.POSITIVE_INFINITY;
             texRows = Math.min(
-              Math.max(rows, prevRows * 2, 384),
-              Math.max(rows, 512),
+              Math.max(rows, prevRows * 2, Math.min(presizeRows, sceneRows)),
+              Math.max(rows, kcGrowthCapRows()),
             );
             if (texRows !== rows) {
               texData = new Uint32Array(texRows * 16384);
               texData.set(indices);
+            }
+            if (prevRows > 0) {
+              kcRegrowLog("regrowCreate", { prevRows, rows, texRows });
             }
           }
           const texture = new THREE.DataTexture(
