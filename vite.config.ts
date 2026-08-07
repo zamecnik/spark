@@ -1,3 +1,4 @@
+// Modified by Kroscloud, 2026 — see FORK-CHANGES.md
 import fs from "node:fs";
 import path from "node:path";
 import MagicString from "magic-string";
@@ -127,7 +128,7 @@ export default defineConfig(({ mode }) => {
       },
       sourcemap: true,
       rollupOptions: {
-        external: ["three", /^three\/addons/],
+        external: ["three", "three/tsl", "three/webgpu", /^three\/addons/],
         output: {
           globals: {
             three: "THREE",
