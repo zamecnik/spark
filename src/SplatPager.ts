@@ -352,8 +352,13 @@ export class PagedSplats implements SplatSource {
       let texRows = rows;
       let texData: Uint32Array = indices;
       if (isWebGPURenderer(renderer)) {
+        // Floor 256 rows (4.19M slots): every desktop budget ≤ 4M fits with
+        // ZERO mid-session regrows. This is not only the recompile-jank fix:
+        // the regrow path (texture recreate + full backend rebuild while
+        // streaming) is empirically correlated with D3D12 device removal —
+        // every stress run that regrew died, every run that didn't survived.
         texRows = Math.min(
-          Math.max(rows, prevRows * 2, 128),
+          Math.max(rows, prevRows * 2, 256),
           Math.max(rows, 512),
         );
         if (texRows !== rows) {
