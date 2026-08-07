@@ -850,6 +850,18 @@ class WebGpuSplatBackend {
     }
     spark.activeSplats = src.numSplats;
     spark.geometry.instanceCount = src.numSplats;
+    const ctx = mesh.context;
+    if (ctx) {
+      if (src.kind === "static" && ctx.numSplats) {
+        ctx.numSplats.value = src.numSplats;
+      } else if (src.kind === "lodPacked") {
+        if (ctx.numSplats) ctx.numSplats.value = src.numSplats;
+        if (ctx.enableLod) ctx.enableLod.value = true;
+        if (ctx.lodIndices && src.cutTexture) {
+          ctx.lodIndices.value = src.cutTexture;
+        }
+      }
+    }
     return didSort;
   }
   // Called from SparkRenderer.onBeforeRender: per-frame material uniforms.
