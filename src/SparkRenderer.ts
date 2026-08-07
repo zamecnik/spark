@@ -1694,11 +1694,11 @@ export class SparkRenderer extends THREE.Mesh {
           let texRows = rows;
           let texData = indices;
           if (this.webgpuBackend) {
-            // 256-row floor: no mid-session regrow for budgets ≤ 4M — the
+            // 384-row floor: no mid-session regrow for budgets ≤ 6M — the
             // regrow path is empirically correlated with D3D12 device
             // removal (see SplatPager.update).
             texRows = Math.min(
-              Math.max(rows, prevRows * 2, 256),
+              Math.max(rows, prevRows * 2, 384),
               Math.max(rows, 512),
             );
             if (texRows !== rows) {
