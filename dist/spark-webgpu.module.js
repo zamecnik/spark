@@ -1,6 +1,7 @@
 import * as TSL from "three/tsl";
 import { uint, float, vec2, max, select, normalize, vec3, vec4, ivec3, int, exp, textureLoad, uniform, varyingProperty, Fn, bool, instanceIndex, ivec2, round, clamp, If, min, pow, cameraProjectionMatrix, positionGeometry, mat3, transpose, sqrt, dot, Discard, mix, instancedArray, workgroupArray, workgroupId, invocationLocalIndex, workgroupBarrier, atomicStore, atomicAdd, atomicLoad, atomicOr, Return } from "three/tsl";
 import { MeshBasicNodeMaterial, Vector2, Vector4, Vector3, DoubleSide, CustomBlending, AddEquation, OneFactor, OneMinusSrcAlphaFactor, Matrix4, Quaternion } from "three/webgpu";
+import { d as kcDisposeOldMaterial, b as kcRegrowLog } from "./kcRegrowDebug-gV7aMG4z.js";
 const unpackHalf2x16$1 = TSL.unpackHalf2x16;
 const SPLAT_TEX_WIDTH_BITS = 11;
 const SPLAT_TEX_LAYER_BITS = 22;
@@ -1093,8 +1094,9 @@ class WebGpuSplatBackend {
       paged: pagedTiling
     });
     if (this.state) {
-      this.state.material.dispose();
+      kcDisposeOldMaterial(spark.renderer, this.state.material);
     }
+    kcRegrowLog("buildState", { capacity });
     this.state = {
       mesh,
       kind: src.kind,

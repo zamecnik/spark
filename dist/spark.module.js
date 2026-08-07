@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { Loader, FileLoader, Quaternion, Vector3, Color, Matrix4 } from "three";
 import { FullScreenQuad } from "three/addons/postprocessing/Pass.js";
+import { k as kcInitialCutRows, a as kcDisposeGrownTexture, b as kcRegrowLog, c as kcGrowthCapRows } from "./kcRegrowDebug-gV7aMG4z.js";
 class OldSplatGeometry extends THREE.InstancedBufferGeometry {
   constructor(ordering, activeSplats) {
     super();
@@ -10704,18 +10705,21 @@ const _SparkRenderer = class _SparkRenderer extends THREE.Mesh {
     await worker.call("disposeLodTree", { lodId: oldest.lodId });
   }
   updateLodIndices(uuidToMesh, keyIndices) {
+    var _a2, _b2;
+    const budgetSplats = (this.lodSplatCount ?? this.defaultSplatTarget()) * this.lodSplatScale;
+    const presizeRows = kcInitialCutRows(budgetSplats);
     for (const [uuid, countIndices] of Object.entries(keyIndices)) {
       const { lodId, numSplats, indices } = countIndices;
       const mesh = uuidToMesh.get(uuid);
       if (mesh.paged) {
-        mesh.paged.update(numSplats, indices);
+        mesh.paged.update(numSplats, indices, presizeRows);
       } else {
         let instance = this.lodInstances.get(mesh);
         let prevRows = 0;
         if (instance) {
           if (indices.length > instance.indices.length) {
             prevRows = instance.texture.image.height;
-            instance.texture.dispose();
+            kcDisposeGrownTexture(this.renderer, instance.texture);
             instance = void 0;
           }
         }
@@ -10728,13 +10732,18 @@ const _SparkRenderer = class _SparkRenderer extends THREE.Mesh {
           let texRows = rows;
           let texData = indices;
           if (this.webgpuBackend) {
+            const lodTotal = ((_b2 = (_a2 = mesh.packedSplats) == null ? void 0 : _a2.lodSplats) == null ? void 0 : _b2.numSplats) ?? 0;
+            const sceneRows = lodTotal > 0 ? Math.ceil(lodTotal / 16384) : Number.POSITIVE_INFINITY;
             texRows = Math.min(
-              Math.max(rows, prevRows * 2, 384),
-              Math.max(rows, 512)
+              Math.max(rows, prevRows * 2, Math.min(presizeRows, sceneRows)),
+              Math.max(rows, kcGrowthCapRows())
             );
             if (texRows !== rows) {
               texData = new Uint32Array(texRows * 16384);
               texData.set(indices);
+            }
+            if (prevRows > 0) {
+              kcRegrowLog("regrowCreate", { prevRows, rows, texRows });
             }
           }
           const texture2 = new THREE.DataTexture(
@@ -11138,6 +11147,7 @@ function isWebGPURenderer(renderer) {
 class PagedSplats {
   constructor(options) {
     var _a2;
+    this.totalFileSplats = 0;
     this.pager = options.pager;
     this.rootUrl = options.rootUrl ?? "";
     this.requestHeader = options.requestHeader;
@@ -11212,6 +11222,7 @@ class PagedSplats {
       }
       throw new Error("Failed to decode RAD header");
     })().then((metaStart) => {
+      this.totalFileSplats = metaStart.meta.count || 0;
       return metaStart;
     });
     this.radMetaPromise.catch((error) => {
@@ -11338,7 +11349,7 @@ class PagedSplats {
       return lodSplats;
     });
   }
-  update(numSplats, indices) {
+  update(numSplats, indices, presizeRows) {
     if (!this.pager) {
       throw new Error("PagedSplats.pager not set");
     }
@@ -11350,20 +11361,28 @@ class PagedSplats {
     let prevRows = 0;
     if (indicesTexture && rows > indicesTexture.image.height) {
       prevRows = indicesTexture.image.height;
-      indicesTexture.dispose();
+      kcDisposeGrownTexture(renderer, indicesTexture);
       indicesTexture = void 0;
     }
     if (!indicesTexture) {
       let texRows = rows;
       let texData = indices;
       if (isWebGPURenderer(renderer)) {
+        const sceneRows = this.totalFileSplats > 0 ? Math.ceil(this.totalFileSplats / 16384) : Number.POSITIVE_INFINITY;
+        const floorRows = Math.min(
+          presizeRows ?? kcInitialCutRows(0),
+          sceneRows
+        );
         texRows = Math.min(
-          Math.max(rows, prevRows * 2, 384),
-          Math.max(rows, 512)
+          Math.max(rows, prevRows * 2, floorRows),
+          Math.max(rows, kcGrowthCapRows())
         );
         if (texRows !== rows) {
           texData = new Uint32Array(texRows * 16384);
           texData.set(indices);
+        }
+        if (prevRows > 0) {
+          kcRegrowLog("regrowCreate", { prevRows, rows, texRows });
         }
       }
       indicesTexture = new THREE.DataTexture(

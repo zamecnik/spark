@@ -2,6 +2,7 @@
 Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 const TSL = require("three/tsl");
 const webgpu = require("three/webgpu");
+const kcRegrowDebug = require("./kcRegrowDebug-C_gpgxNu.cjs");
 function _interopNamespaceDefault(e) {
   const n = Object.create(null, { [Symbol.toStringTag]: { value: "Module" } });
   if (e) {
@@ -1111,8 +1112,9 @@ class WebGpuSplatBackend {
       paged: pagedTiling
     });
     if (this.state) {
-      this.state.material.dispose();
+      kcRegrowDebug.kcDisposeOldMaterial(spark.renderer, this.state.material);
     }
+    kcRegrowDebug.kcRegrowLog("buildState", { capacity });
     this.state = {
       mesh,
       kind: src.kind,
