@@ -118,11 +118,17 @@ export default defineConfig(({ mode }) => {
     build: {
       minify: isMinify,
       lib: {
-        entry: path.resolve(__dirname, "src/index.ts"),
+        // Kroscloud fork: the WebGPU module is a SEPARATE, self-contained
+        // entry so WebGL2-only consumers never resolve three/webgpu.
+        entry: {
+          spark: path.resolve(__dirname, "src/index.ts"),
+          "spark-webgpu": path.resolve(__dirname, "src/webgpu/index.ts"),
+        },
         name: "spark",
         formats: ["es", "cjs"],
-        fileName: (format) => {
-          const base = format === "es" ? "spark.module" : `spark.${format}`;
+        fileName: (format, entryName) => {
+          const base =
+            format === "es" ? `${entryName}.module` : `${entryName}.${format}`;
           return isMinify ? `${base}.min.js` : `${base}.js`;
         },
       },

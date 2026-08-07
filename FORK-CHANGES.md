@@ -20,8 +20,8 @@ Conventions:
 
 | File | Change |
 |---|---|
-| `vite.config.ts` | Rollup externals extended with `three/tsl`, `three/webgpu` (bundling them would duplicate three and break `instanceof` in consumers). |
-| `package.json` | (planned P5) version suffix `-kroscloud.N` for vendored tarball releases. |
+| `vite.config.ts` | Rollup externals extended with `three/tsl`, `three/webgpu` (bundling them would duplicate three and break `instanceof` in consumers). Second lib entry `spark-webgpu` → `dist/spark-webgpu.module.js` so the WebGPU module ships as its own self-contained bundle (lazy-load requirement; WebGL2-only consumers never resolve `three/webgpu`). |
+| `package.json` | `./webgpu` subpath export for the second bundle. (planned P5) version suffix `-kroscloud.N` for vendored tarball releases. |
 
 ## Added files (`src/webgpu/`)
 
@@ -29,7 +29,9 @@ Conventions:
 |---|---|
 | `packedSplatsTsl.ts` | TSL port of `shaders/splatDefines.glsl` packed-splat unpack: u8 RGBA, fp16 centers, log-u8 scales with 0-sentinel, `decodeQuatOctXy88R8`, both texture tiling functions (`splatTexCoord` 2048-wide, `pagedSplatTexCoord` 256-wide). Index math kept identical to upstream so SH textures co-index with the packed texture. |
 | `shTsl.ts` | TSL port of the packed spherical-harmonics evaluation from `PackedSplats.ts` (`defineEvalPackedSH1/2/3`): sign-extending word-straddling sint7/sint8/sint6 extraction and `shMax/{63,127,31}` dequantization, bit-exact. |
-| `SplatNodeMaterial.ts` | Hand-written TSL node material reproducing `shaders/splatVertex.glsl` + `shaders/splatFragment.glsl` for the WebGPU path: verbatim projection math (center rejects, clipXY guard, Jacobian, preBlur/blur, eigen decomposition, maxPixelRadius clamp order), LOD `a>1` opacity chain, premultiplied-alpha fragment. Draw ordering comes from an `order` storage buffer indexed by `instanceIndex` (identity in P1; GPU radix sort producer arrives in P2). |
+| `SplatNodeMaterial.ts` | Hand-written TSL node material reproducing `shaders/splatVertex.glsl` + `shaders/splatFragment.glsl` for the WebGPU path: verbatim projection math (center rejects, clipXY guard, Jacobian, preBlur/blur, eigen decomposition, maxPixelRadius clamp order), LOD `a>1` opacity chain, premultiplied-alpha fragment. Draw ordering comes from an `order` storage buffer indexed by `instanceIndex` (identity in P1; GPU radix sort producer arrives in P2). Not ported (default-off/dead upstream, unused by our apps): enable2DGS, depth-of-field, the dead `if(false)` falloff branch, encodeLinear, log-depth. |
+| `index.ts` (webgpu) | Module entry for the `./webgpu` subpath. |
+| `alphaReference.ts` | Pure-math mirror of the vertex alpha chain (the ×2-once convention) with WGSL round-half-even semantics; pinned by `test/webgpu/alphaChain.test.ts` hand-computed fixtures and reused by the browser parity probe. |
 
 ## Behavioral deviations from upstream (WebGPU path only)
 
