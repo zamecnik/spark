@@ -267,6 +267,10 @@ export class WebGpuSplatBackend {
   frames = 0;
   sorts = 0;
   lastSortFrame = -1;
+  // Each rebuild is a main-thread WGSL pipeline recompile (~25 pipelines).
+  // With the cut-texture allocation headroom this should be 1 (rarely 2)
+  // per scene — watch it via ?splatdebug state().webgpu.rebuilds.
+  rebuilds = 0;
 
   private state: MeshState | null = null;
   private sortedOnce = false;
@@ -317,6 +321,7 @@ export class WebGpuSplatBackend {
     ) {
       this.buildState(spark, mesh, src);
       rebuilt = true;
+      this.rebuilds++;
     }
     const state = this.state as MeshState;
 

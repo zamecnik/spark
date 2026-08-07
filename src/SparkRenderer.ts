@@ -1671,8 +1671,10 @@ export class SparkRenderer extends THREE.Mesh {
         // console.log("*** paged.update", lodId, numSplats, indices.slice(0, 5).join(","));
       } else {
         let instance = this.lodInstances.get(mesh);
+        let prevRows = 0;
         if (instance) {
           if (indices.length > instance.indices.length) {
+            prevRows = instance.texture.image.height;
             instance.texture.dispose();
             instance = undefined;
           }
@@ -1684,10 +1686,27 @@ export class SparkRenderer extends THREE.Mesh {
           if (indices.length !== capacity) {
             throw new Error("Indices length != capacity");
           }
+          // Kroscloud fork: on WebGPU, allocate with headroom — texture
+          // recreation forces a backend pipeline rebuild (main-thread WGSL
+          // recompile); floor 128 rows / ×2 growth capped at 512, matching
+          // PagedSplats.update. Zero-filled tail = the traverse's own
+          // padding semantics (consumers bound by numSplats).
+          let texRows = rows;
+          let texData = indices;
+          if (this.webgpuBackend) {
+            texRows = Math.min(
+              Math.max(rows, prevRows * 2, 128),
+              Math.max(rows, 512),
+            );
+            if (texRows !== rows) {
+              texData = new Uint32Array(texRows * 16384);
+              texData.set(indices);
+            }
+          }
           const texture = new THREE.DataTexture(
-            indices,
+            texData,
             4096,
-            rows,
+            texRows,
             THREE.RGBAIntegerFormat,
             THREE.UnsignedIntType,
           );
@@ -1697,7 +1716,7 @@ export class SparkRenderer extends THREE.Mesh {
             texture.internalFormat = "RGBA32UI";
           }
           texture.needsUpdate = true;
-          instance = { lodId, numSplats, indices, texture };
+          instance = { lodId, numSplats, indices: texData, texture };
           this.lodInstances.set(mesh, instance);
         } else if (this.webgpuBackend) {
           // Kroscloud fork: standard mirror-write + needsUpdate re-upload

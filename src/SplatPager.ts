@@ -332,16 +332,39 @@ export class PagedSplats implements SplatSource {
       this.dynoIndices.value === SplatPager.emptyIndicesTexture
         ? undefined
         : this.dynoIndices.value;
+    let prevRows = 0;
     if (indicesTexture && rows > indicesTexture.image.height) {
+      prevRows = indicesTexture.image.height;
       indicesTexture.dispose();
       indicesTexture = undefined;
     }
 
     if (!indicesTexture) {
+      // Kroscloud fork: on WebGPU, recreating this texture forces the
+      // backend to rebuild its material + sort pipelines (a main-thread WGSL
+      // recompile of ~25 pipelines — live-tested as a seconds-long browser
+      // freeze when the cut grew row-by-row during streaming). Allocate with
+      // headroom so growth recreations happen at most ~once per scene:
+      // floor 128 rows (2M-splat class, 8.4 MB) and geometric ×2 growth,
+      // capped at 512 rows. The padded tail is zero-filled — identical
+      // semantics to the traverse's own zero-padding (consumers bound by
+      // numSplats, never by texture size).
+      let texRows = rows;
+      let texData: Uint32Array = indices;
+      if (isWebGPURenderer(renderer)) {
+        texRows = Math.min(
+          Math.max(rows, prevRows * 2, 128),
+          Math.max(rows, 512),
+        );
+        if (texRows !== rows) {
+          texData = new Uint32Array(texRows * 16384);
+          texData.set(indices);
+        }
+      }
       indicesTexture = new THREE.DataTexture(
-        indices,
+        texData,
         4096,
-        rows,
+        texRows,
         THREE.RGBAIntegerFormat,
         THREE.UnsignedIntType,
       );
