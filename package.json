@@ -1,6 +1,6 @@
 {
   "name": "@sparkjsdev/spark",
-  "version": "2.1.0",
+  "version": "2.1.0-kroscloud.1",
   "description": "An advanced 3D Gaussian Splatting renderer for THREE.js",
   "homepage": "https://sparkjs.dev/",
   "type": "module",
@@ -47,7 +47,9 @@
     "test": "node --no-warnings --loader ts-node/esm --test test/**/*.test.ts"
   },
   "repository": "sparkjs-dev/spark",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "license": "MIT",
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
@@ -72,5 +74,12 @@
   "peerDependencies": {
     "three": ">=0.180.0"
   },
-  "keywords": ["3d", "three.js", "gsplats", "3dgs", "gaussian", "splats"]
+  "keywords": [
+    "3d",
+    "three.js",
+    "gsplats",
+    "3dgs",
+    "gaussian",
+    "splats"
+  ]
 }
