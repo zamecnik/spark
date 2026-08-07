@@ -122,6 +122,13 @@ type SplatMeshLike = THREE.Object3D & {
   paged?: PagedSplatsLike;
   maxSh?: number;
   mappingVersion?: number;
+  // SplatMesh.raycast reads these context fields; stock feeds them from the
+  // accumulator scene-walk which never runs on the WebGPU branch
+  context?: {
+    numSplats?: { value: number };
+    enableLod?: { value: boolean };
+    lodIndices?: { value: unknown };
+  };
 };
 
 type LodInstanceLike = {
@@ -341,6 +348,25 @@ export class WebGpuSplatBackend {
     spark.activeSplats = src.numSplats;
     (spark.geometry as THREE.InstancedBufferGeometry).instanceCount =
       src.numSplats;
+
+    // Raycast contract (fork plan §4.4/app-contract rows 15–17): stock feeds
+    // SplatMesh.context from the accumulator scene-walk (SplatMesh.update),
+    // which never runs on this branch — without this, non-LOD raycasts
+    // iterate context.numSplats.value = 0 and return no hits (caught by the
+    // P4 byte-identity gate). Paged meshes don't consult the context (their
+    // raycast branch reads paged.numSplats directly).
+    const ctx = mesh.context;
+    if (ctx) {
+      if (src.kind === "static" && ctx.numSplats) {
+        ctx.numSplats.value = src.numSplats;
+      } else if (src.kind === "lodPacked") {
+        if (ctx.numSplats) ctx.numSplats.value = src.numSplats;
+        if (ctx.enableLod) ctx.enableLod.value = true;
+        if (ctx.lodIndices && src.cutTexture) {
+          ctx.lodIndices.value = src.cutTexture;
+        }
+      }
+    }
     return didSort;
   }
 
