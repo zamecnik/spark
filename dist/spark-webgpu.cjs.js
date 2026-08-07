@@ -19,7 +19,7 @@ function _interopNamespaceDefault(e) {
   return Object.freeze(n);
 }
 const TSL__namespace = /* @__PURE__ */ _interopNamespaceDefault(TSL);
-const unpackHalf2x16 = TSL__namespace.unpackHalf2x16;
+const unpackHalf2x16$1 = TSL__namespace.unpackHalf2x16;
 const SPLAT_TEX_WIDTH_BITS = 11;
 const SPLAT_TEX_LAYER_BITS = 22;
 const SPLAT_TEX_MASK = 2047;
@@ -69,8 +69,8 @@ function unpackSplatEncodingTsl(packedData, rgbMinMaxLnScaleMinMax) {
   const uA = TSL.float(word0.shiftRight(TSL.uint(24)).bitAnd(TSL.uint(255)));
   const rgb = TSL.vec3(uR, uG, uB).div(255).mul(rgbMax.sub(rgbMin)).add(rgbMin);
   const rgba = TSL.vec4(rgb, uA.div(255));
-  const xy = unpackHalf2x16(word1);
-  const zw = unpackHalf2x16(word2.bitAnd(TSL.uint(65535)));
+  const xy = unpackHalf2x16$1(word1);
+  const zw = unpackHalf2x16$1(word2.bitAnd(TSL.uint(65535)));
   const center = TSL.vec3(xy.x, xy.y, zw.x);
   const uSx = word3.bitAnd(TSL.uint(255));
   const uSy = word3.shiftRight(TSL.uint(8)).bitAnd(TSL.uint(255));
@@ -236,6 +236,7 @@ class SplatNodeMaterial extends webgpu.MeshBasicNodeMaterial {
     this.renderSize = TSL.uniform(new webgpu.Vector2(1, 1));
     this.renderToViewQuat = TSL.uniform(new webgpu.Vector4(0, 0, 0, 1));
     this.renderToViewPos = TSL.uniform(new webgpu.Vector3());
+    this.renderToViewScale = TSL.uniform(1);
     this.viewOrigin = TSL.uniform(new webgpu.Vector3());
     this.maxStdDev = TSL.uniform(1);
     this.minPixelRadius = TSL.uniform(0);
@@ -285,7 +286,7 @@ class SplatNodeMaterial extends webgpu.MeshBasicNodeMaterial {
       );
       const center = unpacked.center;
       const quaternion = unpacked.quaternion;
-      const scales = TSL.vec3(unpacked.scales).toVar();
+      const scales = TSL.vec3(unpacked.scales.mul(this.renderToViewScale)).toVar();
       const rgba = TSL.vec4(unpacked.rgba).toVar();
       if (lodOpacity) {
         rgba.a.assign(rgba.a.mul(2));
@@ -346,9 +347,10 @@ class SplatNodeMaterial extends webgpu.MeshBasicNodeMaterial {
         }
         adjustedStdDev.assign(uMaxStdDev.add(rgba.a.sub(1).mul(0.7)));
       });
-      const viewCenter = quatVecTsl(this.renderToViewQuat, center).add(
-        this.renderToViewPos
-      );
+      const viewCenter = quatVecTsl(
+        this.renderToViewQuat,
+        center.mul(this.renderToViewScale)
+      ).add(this.renderToViewPos);
       rejected.assign(rejected.or(viewCenter.z.greaterThanEqual(0)));
       const clipCenter = TSL.cameraProjectionMatrix.mul(TSL.vec4(viewCenter, 1));
       rejected.assign(
@@ -505,10 +507,494 @@ function referenceAlphaChain(u8, lodOpacity, {
   }
   return { alpha: a, adjustedStdDev, rejected: false };
 }
+const countOneBits = TSL__namespace.countOneBits;
+const TPW = 256;
+const EPT = 8;
+const EPW = TPW * EPT;
+const BUCKETS = 16;
+const SCAN_ITEMS = 512;
+const pad = (n, m) => Math.ceil(n / m) * m;
+function createRadixSort({
+  keysNode,
+  count,
+  numBits = 16
+}) {
+  if (numBits % 4 !== 0) throw new Error("numBits must be a multiple of 4");
+  const numPasses = numBits / 4;
+  const wgCount = Math.max(1, Math.ceil(count / EPW));
+  const blockSumCount = BUCKETS * wgCount;
+  const blockSums = TSL.instancedArray(pad(blockSumCount, SCAN_ITEMS), "uint");
+  const keysA = TSL.instancedArray(count, "uint");
+  const keysB = TSL.instancedArray(count, "uint");
+  const valsA = TSL.instancedArray(count, "uint");
+  const valsB = TSL.instancedArray(count, "uint");
+  const levels = [];
+  {
+    let items = blockSums;
+    let levelCount = blockSumCount;
+    for (; ; ) {
+      const wgs = Math.ceil(levelCount / SCAN_ITEMS);
+      const level = {
+        items,
+        count: levelCount,
+        wgs,
+        blockSums: TSL.instancedArray(Math.max(1, pad(wgs, SCAN_ITEMS)), "uint")
+      };
+      levels.push(level);
+      if (wgs <= 1) break;
+      items = level.blockSums;
+      levelCount = wgs;
+    }
+  }
+  const makeHistogram = (srcKeys, bit) => {
+    const hist = TSL.workgroupArray("uint", BUCKETS).setAtomic(true);
+    return TSL.Fn(() => {
+      const TID = TSL.invocationLocalIndex;
+      const WGID = TSL.workgroupId.x;
+      const WID = WGID.mul(TSL.uint(EPW));
+      TSL.If(TID.lessThan(TSL.uint(BUCKETS)), () => {
+        TSL.atomicStore(hist.element(TID), TSL.uint(0));
+      });
+      TSL.workgroupBarrier();
+      for (let r = 0; r < EPT; r++) {
+        const GID = WID.add(TSL.uint(r * TPW)).add(TID);
+        TSL.If(GID.lessThan(TSL.uint(count)), () => {
+          const digit = srcKeys.element(GID).shiftRight(TSL.uint(bit)).bitAnd(TSL.uint(15));
+          TSL.atomicAdd(hist.element(digit), TSL.uint(1));
+        });
+      }
+      TSL.workgroupBarrier();
+      TSL.If(TID.lessThan(TSL.uint(BUCKETS)), () => {
+        blockSums.element(TID.mul(TSL.uint(wgCount)).add(WGID)).assign(TSL.atomicLoad(hist.element(TID)));
+      });
+    })().compute([wgCount], [TPW]).setName(`radixHist_bit${bit}`);
+  };
+  const makeScan = (level, idx) => {
+    const temp = TSL.workgroupArray("uint", SCAN_ITEMS * 2);
+    const { items, count: n, blockSums: sumsOut } = level;
+    return TSL.Fn(() => {
+      const TID = TSL.invocationLocalIndex;
+      const WGID = TSL.workgroupId.x;
+      const GID = WGID.mul(TSL.uint(TPW)).add(TID);
+      const ELM_TID = TID.mul(TSL.uint(2));
+      const ELM_GID = GID.mul(TSL.uint(2));
+      temp.element(ELM_TID).assign(
+        TSL.select(
+          ELM_GID.greaterThanEqual(TSL.uint(n)),
+          TSL.uint(0),
+          items.element(ELM_GID)
+        )
+      );
+      temp.element(ELM_TID.add(TSL.uint(1))).assign(
+        TSL.select(
+          ELM_GID.add(TSL.uint(1)).greaterThanEqual(TSL.uint(n)),
+          TSL.uint(0),
+          items.element(ELM_GID.add(TSL.uint(1)))
+        )
+      );
+      let offset = 1;
+      for (let d = SCAN_ITEMS >> 1; d > 0; d >>= 1) {
+        TSL.workgroupBarrier();
+        const ai = TSL.uint(offset).mul(ELM_TID.add(TSL.uint(1))).sub(TSL.uint(1));
+        const bi = TSL.uint(offset).mul(ELM_TID.add(TSL.uint(2))).sub(TSL.uint(1));
+        TSL.If(TID.lessThan(TSL.uint(d)), () => {
+          temp.element(bi).addAssign(temp.element(ai));
+        });
+        offset *= 2;
+      }
+      TSL.If(TID.equal(TSL.uint(0)), () => {
+        sumsOut.element(WGID).assign(temp.element(TSL.uint(SCAN_ITEMS - 1)));
+        temp.element(TSL.uint(SCAN_ITEMS - 1)).assign(TSL.uint(0));
+      });
+      for (let d = 1; d < SCAN_ITEMS; d *= 2) {
+        offset >>= 1;
+        TSL.workgroupBarrier();
+        const ai = TSL.uint(offset).mul(ELM_TID.add(TSL.uint(1))).sub(TSL.uint(1));
+        const bi = TSL.uint(offset).mul(ELM_TID.add(TSL.uint(2))).sub(TSL.uint(1));
+        TSL.If(TID.lessThan(TSL.uint(d)), () => {
+          const t = temp.element(ai).toVar();
+          temp.element(ai).assign(temp.element(bi));
+          temp.element(bi).addAssign(t);
+        });
+      }
+      TSL.workgroupBarrier();
+      TSL.If(ELM_GID.lessThan(TSL.uint(n)), () => {
+        items.element(ELM_GID).assign(temp.element(ELM_TID));
+      });
+      TSL.If(ELM_GID.add(TSL.uint(1)).lessThan(TSL.uint(n)), () => {
+        items.element(ELM_GID.add(TSL.uint(1))).assign(temp.element(ELM_TID.add(TSL.uint(1))));
+      });
+    })().compute([level.wgs], [TPW]).setName(`radixScan_L${idx}`);
+  };
+  const makeAddBlock = (level, idx) => {
+    const { items, count: n, blockSums: sums } = level;
+    return TSL.Fn(() => {
+      const TID = TSL.invocationLocalIndex;
+      const WGID = TSL.workgroupId.x;
+      const GID = WGID.mul(TSL.uint(TPW)).add(TID);
+      const ELM_ID = GID.mul(TSL.uint(2));
+      TSL.If(ELM_ID.lessThan(TSL.uint(n)), () => {
+        const bs = sums.element(WGID);
+        items.element(ELM_ID).addAssign(bs);
+        TSL.If(ELM_ID.add(TSL.uint(1)).lessThan(TSL.uint(n)), () => {
+          items.element(ELM_ID.add(TSL.uint(1))).addAssign(bs);
+        });
+      });
+    })().compute([level.wgs], [TPW]).setName(`radixScanAdd_L${idx}`);
+  };
+  const makeReorder = (inKeys, outKeys, inVals, outVals, bit, isFirst, isLast) => {
+    const masks = TSL.workgroupArray("uint", 128).setAtomic(true);
+    const offsets = TSL.workgroupArray("uint", BUCKETS);
+    return TSL.Fn(() => {
+      const TID = TSL.invocationLocalIndex;
+      const WGID = TSL.workgroupId.x;
+      const WID = WGID.mul(TSL.uint(EPW));
+      const wordIdx = TID.shiftRight(TSL.uint(5)).toVar();
+      const bitIdx = TID.bitAnd(TSL.uint(31)).toVar();
+      TSL.If(TID.lessThan(TSL.uint(BUCKETS)), () => {
+        offsets.element(TID).assign(TSL.uint(0));
+      });
+      TSL.If(TID.lessThan(TSL.uint(128)), () => {
+        TSL.atomicStore(masks.element(TID), TSL.uint(0));
+      });
+      TSL.workgroupBarrier();
+      for (let round = 0; round < EPT; round++) {
+        const GID = WID.add(TSL.uint(round * TPW)).add(TID).toVar();
+        const isValid = GID.lessThan(TSL.uint(count)).toVar();
+        const k = TSL.select(isValid, inKeys.element(GID), TSL.uint(0)).toVar();
+        const digit = TSL.select(
+          isValid,
+          k.shiftRight(TSL.uint(bit)).bitAnd(TSL.uint(15)),
+          TSL.uint(16)
+        ).toVar();
+        const v = (isFirst ? GID : TSL.select(isValid, inVals.element(GID), TSL.uint(0))).toVar();
+        TSL.If(isValid, () => {
+          TSL.atomicOr(
+            masks.element(digit.mul(TSL.uint(8)).add(wordIdx)),
+            TSL.uint(1).shiftLeft(bitIdx)
+          );
+        });
+        TSL.workgroupBarrier();
+        TSL.If(isValid, () => {
+          const base = digit.mul(TSL.uint(8)).toVar();
+          const localPrefix = offsets.element(digit).toVar();
+          for (let w = 0; w < 7; w++) {
+            TSL.If(TSL.uint(w).lessThan(wordIdx), () => {
+              localPrefix.addAssign(
+                countOneBits(TSL.atomicLoad(masks.element(base.add(TSL.uint(w)))))
+              );
+            });
+          }
+          localPrefix.addAssign(
+            countOneBits(
+              TSL.atomicLoad(masks.element(base.add(wordIdx))).bitAnd(
+                TSL.uint(1).shiftLeft(bitIdx).sub(TSL.uint(1))
+              )
+            )
+          );
+          const pid = digit.mul(TSL.uint(wgCount)).add(WGID);
+          const pos = blockSums.element(pid).add(localPrefix).toVar();
+          if (!isLast) outKeys.element(pos).assign(k);
+          outVals.element(pos).assign(v);
+        });
+        if (round < EPT - 1) {
+          TSL.workgroupBarrier();
+          TSL.If(TID.lessThan(TSL.uint(BUCKETS)), () => {
+            const cnt = TSL.uint(0).toVar();
+            for (let w = 0; w < 8; w++) {
+              const idx = TID.mul(TSL.uint(8)).add(TSL.uint(w));
+              cnt.addAssign(countOneBits(TSL.atomicLoad(masks.element(idx))));
+              TSL.atomicStore(masks.element(idx), TSL.uint(0));
+            }
+            offsets.element(TID).addAssign(cnt);
+          });
+          TSL.workgroupBarrier();
+        }
+      }
+    })().compute([wgCount], [TPW]).setName(`radixReorder_bit${bit}`);
+  };
+  const scanNodes = levels.map((level, i) => makeScan(level, i));
+  const addNodes = levels.map(
+    (level, i) => level.wgs > 1 ? makeAddBlock(level, i) : null
+  );
+  const steps = [];
+  let curKeys = keysNode;
+  let curVals = valsA;
+  let nxtKeys = keysA;
+  let nxtVals = valsB;
+  for (let pass = 0; pass < numPasses; pass++) {
+    const bit = pass * 4;
+    const isFirst = pass === 0;
+    const isLast = pass === numPasses - 1;
+    steps.push(makeHistogram(curKeys, bit));
+    for (let i = 0; i < levels.length; i++) steps.push(scanNodes[i]);
+    for (let i = levels.length - 1; i >= 0; i--) {
+      const addNode = addNodes[i];
+      if (addNode) steps.push(addNode);
+    }
+    steps.push(makeReorder(curKeys, nxtKeys, curVals, nxtVals, bit, isFirst, isLast));
+    if (!isLast) {
+      curKeys = nxtKeys;
+      nxtKeys = curKeys === keysA ? keysB : keysA;
+      const t = curVals;
+      curVals = nxtVals;
+      nxtVals = t;
+    }
+  }
+  const sortedValues = (numPasses - 1) % 2 === 1 ? valsA : valsB;
+  return {
+    steps,
+    sortedValues,
+    wgCount,
+    dispatchesPerSort: steps.length
+  };
+}
+const unpackHalf2x16 = TSL__namespace.unpackHalf2x16;
+function fromHalf(h) {
+  const s = (h & 32768) >> 15;
+  const e = (h & 31744) >> 10;
+  const f = h & 1023;
+  if (e === 0) return (s ? -1 : 1) * 2 ** -14 * (f / 1024);
+  if (e === 31) return f ? Number.NaN : (s ? -1 : 1) * Number.POSITIVE_INFINITY;
+  return (s ? -1 : 1) * 2 ** (e - 15) * (1 + f / 1024);
+}
+class WebGpuSplatBackend {
+  constructor() {
+    this.sortRadial = true;
+    this.freezeOrder = false;
+    this.frames = 0;
+    this.sorts = 0;
+    this.lastSortFrame = -1;
+    this.state = null;
+    this.sortedOnce = false;
+    this.warnedMultiMesh = false;
+    this.placeholderMaterial = new webgpu.MeshBasicNodeMaterial();
+  }
+  // Called from SparkRenderer.updateInternal (WebGPU branch). Returns true
+  // if a sort was submitted this frame (caller updates sortedCenter/Dir).
+  update({
+    spark,
+    scene,
+    camera,
+    viewChanged
+  }) {
+    this.frames++;
+    const mesh = this.findSplatMesh(scene);
+    if (!mesh || mesh.packedSplats.numSplats === 0) {
+      spark.activeSplats = 0;
+      return false;
+    }
+    const packed = mesh.packedSplats;
+    const texture = packed.getTexture();
+    this.sortRadial = spark.sortRadial ?? true;
+    let rebuilt = false;
+    if (!this.state || this.state.mesh !== mesh || this.state.numSplats !== packed.numSplats || this.state.packedTexture !== texture) {
+      this.buildState(spark, mesh, packed, texture);
+      rebuilt = true;
+    }
+    const state = this.state;
+    let didSort = false;
+    if (!this.freezeOrder && (viewChanged || rebuilt || !this.sortedOnce)) {
+      this.updateKeygenUniforms(state, camera);
+      spark.renderer.compute([state.keygen, ...state.radix.steps]);
+      this.sortedOnce = true;
+      this.sorts++;
+      this.lastSortFrame = this.frames;
+      didSort = true;
+    }
+    spark.activeSplats = state.numSplats;
+    spark.geometry.instanceCount = state.numSplats;
+    return didSort;
+  }
+  // Called from SparkRenderer.onBeforeRender: per-frame material uniforms.
+  applyPerFrame(spark, camera) {
+    const state = this.state;
+    if (!state) return;
+    const mat = state.material;
+    mat.renderSize.value.copy(spark.renderSize);
+    mat.maxStdDev.value = spark.maxStdDev;
+    mat.minPixelRadius.value = spark.minPixelRadius;
+    mat.maxPixelRadius.value = spark.maxPixelRadius;
+    mat.minAlpha.value = spark.minAlpha;
+    mat.preBlurAmount.value = spark.preBlurAmount;
+    mat.blurAmount.value = spark.blurAmount;
+    mat.falloff.value = spark.falloff;
+    mat.clipXY.value = spark.clipXY;
+    mat.focalAdjustment.value = spark.focalAdjustment;
+    const enc = state.packedSplats.splatEncoding ?? {};
+    mat.rgbMinMaxLnScaleMinMax.value.set(
+      enc.rgbMin ?? 0,
+      enc.rgbMax ?? 1,
+      enc.lnScaleMin ?? -12,
+      enc.lnScaleMax ?? 9
+    );
+    mat.shMax.value.set(enc.sh1Max ?? 1, enc.sh2Max ?? 1, enc.sh3Max ?? 1);
+    const objectToView = new webgpu.Matrix4().copy(camera.matrixWorldInverse).multiply(state.mesh.matrixWorld);
+    const pos = new webgpu.Vector3();
+    const quat = new webgpu.Quaternion();
+    const scl = new webgpu.Vector3();
+    objectToView.decompose(pos, quat, scl);
+    mat.renderToViewQuat.value.set(quat.x, quat.y, quat.z, quat.w);
+    mat.renderToViewPos.value.copy(pos);
+    mat.renderToViewScale.value = scl.x;
+    const worldToObject = new webgpu.Matrix4().copy(state.mesh.matrixWorld).invert();
+    const camWorld = camera.getWorldPosition(new webgpu.Vector3());
+    mat.viewOrigin.value.copy(camWorld.applyMatrix4(worldToObject));
+  }
+  // Debug/test access (harness reads the permutation + material).
+  getState() {
+    const s = this.state;
+    if (!s) return null;
+    return {
+      numSplats: s.numSplats,
+      material: s.material,
+      sortedValues: s.radix.sortedValues,
+      keysNode: s.keysNode
+    };
+  }
+  findSplatMesh(scene) {
+    const found = [];
+    scene.traverse((obj) => {
+      const candidate = obj;
+      if (obj.visible && candidate.packedSplats && typeof candidate.packedSplats.getTexture === "function" && candidate.packedSplats.numSplats > 0) {
+        found.push(obj);
+      }
+    });
+    if (found.length > 1 && !this.warnedMultiMesh) {
+      this.warnedMultiMesh = true;
+      console.warn(
+        "WebGpuSplatBackend: multiple SplatMeshes found; only the first is rendered on the WebGPU path (P2 scope — composite cuts arrive with the paged path)."
+      );
+    }
+    return found[0] ?? null;
+  }
+  buildState(spark, mesh, packed, packedTexture) {
+    var _a, _b, _c;
+    const numSplats = packed.numSplats;
+    const arr = packed.packedArray;
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let minZ = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    let maxZ = Number.NEGATIVE_INFINITY;
+    for (let i = 0; i < numSplats; i++) {
+      const w1 = arr[i * 4 + 1];
+      const w2 = arr[i * 4 + 2];
+      const x = fromHalf(w1 & 65535);
+      const y = fromHalf(w1 >>> 16);
+      const z = fromHalf(w2 & 65535);
+      if (!Number.isFinite(x + y + z)) continue;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z;
+      if (z > maxZ) maxZ = z;
+    }
+    const keysNode = TSL.instancedArray(numSplats, "uint");
+    const radix = createRadixSort({ keysNode, count: numSplats, numBits: 16 });
+    const uMeshToWorld = TSL.uniform(new webgpu.Matrix4());
+    const uCameraPos = TSL.uniform(new webgpu.Vector3());
+    const uCameraDir = TSL.uniform(new webgpu.Vector3(0, 0, -1));
+    const uDistRange = TSL.uniform(new webgpu.Vector3(0, 1, 0));
+    const sortRadial = this.sortRadial;
+    const keygen = TSL.Fn(() => {
+      const i = TSL.instanceIndex;
+      TSL.If(i.greaterThanEqual(TSL.uint(numSplats)), () => {
+        TSL.Return();
+      });
+      const texCoord = splatTexCoordTsl(TSL.int(i));
+      const t = TSL.textureLoad(packedTexture, texCoord.xy).depth(texCoord.z);
+      const xy = unpackHalf2x16(t.y);
+      const zw = unpackHalf2x16(t.z.bitAnd(TSL.uint(65535)));
+      const world = uMeshToWorld.mul(TSL.vec4(TSL.vec3(xy.x, xy.y, zw.x), 1)).xyz.toVar();
+      const metric = sortRadial ? world.sub(uCameraPos).length() : world.sub(uCameraPos).dot(uCameraDir).add(100);
+      const q = TSL.uint(
+        TSL.float(1).sub(
+          TSL.clamp(
+            metric.sub(uDistRange.x).div(uDistRange.y.sub(uDistRange.x)),
+            0,
+            1
+          )
+        ).mul(65535)
+      );
+      keysNode.element(i).assign(q);
+    })().compute([Math.ceil(numSplats / 256)], [256]).setName("splatKeygen");
+    const numSh = Math.min(packed.getNumSh(), mesh.maxSh ?? 3);
+    const sh = numSh > 0 ? packed.ensureShTextures() : {};
+    const enc = packed.splatEncoding ?? {};
+    const material = new SplatNodeMaterial({
+      packedTexture,
+      orderNode: radix.sortedValues,
+      sh1Texture: numSh >= 1 ? (_a = sh.sh1Texture) == null ? void 0 : _a.value : void 0,
+      sh2Texture: numSh >= 2 ? (_b = sh.sh2Texture) == null ? void 0 : _b.value : void 0,
+      sh3Texture: numSh >= 3 ? (_c = sh.sh3Texture) == null ? void 0 : _c.value : void 0,
+      lodOpacity: enc.lodOpacity ?? false
+    });
+    if (this.state) {
+      this.state.material.dispose();
+    }
+    this.state = {
+      mesh,
+      packedSplats: packed,
+      numSplats,
+      packedTexture,
+      material,
+      keysNode,
+      keygen,
+      radix,
+      boundsMin: new webgpu.Vector3(minX, minY, minZ),
+      boundsMax: new webgpu.Vector3(maxX, maxY, maxZ),
+      uMeshToWorld,
+      uCameraPos,
+      uCameraDir,
+      uDistRange
+    };
+    this.sortedOnce = false;
+    spark.material = material;
+  }
+  updateKeygenUniforms(state, camera) {
+    state.mesh.updateWorldMatrix(true, false);
+    state.uMeshToWorld.value.copy(state.mesh.matrixWorld);
+    const camPos = camera.getWorldPosition(new webgpu.Vector3());
+    state.uCameraPos.value.copy(camPos);
+    const camDir = camera.getWorldDirection(new webgpu.Vector3());
+    state.uCameraDir.value.copy(camDir);
+    const { boundsMin: mn, boundsMax: mx } = state;
+    let minD = Number.POSITIVE_INFINITY;
+    let maxD = Number.NEGATIVE_INFINITY;
+    const corner = new webgpu.Vector3();
+    for (let c = 0; c < 8; c++) {
+      corner.set(
+        c & 1 ? mx.x : mn.x,
+        c & 2 ? mx.y : mn.y,
+        c & 4 ? mx.z : mn.z
+      );
+      corner.applyMatrix4(state.mesh.matrixWorld);
+      const d = this.sortRadial ? corner.distanceTo(camPos) : corner.sub(camPos).dot(camDir) + 100;
+      if (d < minD) minD = d;
+      if (d > maxD) maxD = d;
+    }
+    if (this.sortRadial) {
+      const camObj = camPos.clone().applyMatrix4(new webgpu.Matrix4().copy(state.mesh.matrixWorld).invert());
+      const closest = new webgpu.Vector3(
+        Math.min(Math.max(camObj.x, mn.x), mx.x),
+        Math.min(Math.max(camObj.y, mn.y), mx.y),
+        Math.min(Math.max(camObj.z, mn.z), mx.z)
+      ).applyMatrix4(state.mesh.matrixWorld);
+      minD = Math.max(0, closest.distanceTo(camPos));
+    }
+    if (maxD <= minD) maxD = minD + 1;
+    state.uDistRange.value.set(minD, maxD, 0);
+  }
+}
 exports.SPLAT_TEX_LAYER_BITS = SPLAT_TEX_LAYER_BITS;
 exports.SPLAT_TEX_MASK = SPLAT_TEX_MASK;
 exports.SPLAT_TEX_WIDTH_BITS = SPLAT_TEX_WIDTH_BITS;
 exports.SplatNodeMaterial = SplatNodeMaterial;
+exports.WebGpuSplatBackend = WebGpuSplatBackend;
+exports.createRadixSort = createRadixSort;
 exports.decodeQuatOctXy88R8Tsl = decodeQuatOctXy88R8Tsl;
 exports.evaluatePackedSH1Tsl = evaluatePackedSH1Tsl;
 exports.evaluatePackedSH2Tsl = evaluatePackedSH2Tsl;
@@ -518,6 +1004,7 @@ exports.pagedSplatTexCoordTsl = pagedSplatTexCoordTsl;
 exports.quatQuatTsl = quatQuatTsl;
 exports.quatVecTsl = quatVecTsl;
 exports.referenceAlphaChain = referenceAlphaChain;
+exports.roundEven = roundEven;
 exports.scaleQuaternionToMatrixColumnsTsl = scaleQuaternionToMatrixColumnsTsl;
 exports.splatTexCoordTsl = splatTexCoordTsl;
 exports.stockNetAlpha = stockNetAlpha;

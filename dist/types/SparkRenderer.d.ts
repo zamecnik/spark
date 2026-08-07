@@ -296,11 +296,36 @@ export interface SparkRendererOptions {
      * @default undefined = false
      */
     depthWrite?: boolean;
+    /**
+     * Kroscloud fork: attach the WebGPU render path. Construct a
+     * WebGpuSplatBackend from the lazy-loaded "@sparkjsdev/spark/webgpu"
+     * module and pass it here together with a THREE.WebGPURenderer. When set,
+     * the WebGL2 accumulate/readback/CPU-sort pipeline is bypassed entirely:
+     * the backend runs a per-frame TSL keygen + GPU radix sort and draws via
+     * SplatNodeMaterial. When absent, behavior is byte-identical to upstream.
+     */
+    webgpuBackend?: SparkWebGpuBackendLike;
+}
+/**
+ * Kroscloud fork: structural interface of WebGpuSplatBackend, declared here
+ * so the core bundle never imports three/webgpu (the implementation lives in
+ * the separate spark-webgpu bundle).
+ */
+export interface SparkWebGpuBackendLike {
+    placeholderMaterial: THREE.Material;
+    update(args: {
+        spark: any;
+        scene: THREE.Scene;
+        camera: THREE.Camera;
+        viewChanged: boolean;
+    }): boolean;
+    applyPerFrame(spark: any, camera: THREE.Camera): void;
 }
 export declare class SparkRenderer extends THREE.Mesh {
     readonly renderer: THREE.WebGLRenderer;
-    readonly material: THREE.ShaderMaterial;
+    material: THREE.Material;
     readonly uniforms: ReturnType<typeof SparkRenderer.makeUniforms>;
+    readonly webgpuBackend: SparkWebGpuBackendLike | null;
     autoUpdate: boolean;
     preUpdate: boolean;
     static sparkOverride?: SparkRenderer;

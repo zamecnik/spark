@@ -9876,6 +9876,11 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     this.pageSizeWarning = false;
     this.material = material;
     this.uniforms = uniforms;
+    this.webgpuBackend = options.webgpuBackend ?? null;
+    if (this.webgpuBackend) {
+      this.material = this.webgpuBackend.placeholderMaterial;
+      geometry.instanceCount = 0;
+    }
     this.frustumCulled = false;
     this.renderer = options.renderer;
     this.onDirty = options.onDirty;
@@ -10073,7 +10078,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
   onBeforeRender(renderer, scene, camera) {
     var _a2;
     const spark = _SparkRenderer.sparkOverride ?? this;
-    const frame = renderer.info.render.frame;
+    const frame = renderer.info.render.frame ?? renderer.info.frame;
     const isNewFrame = frame !== spark.lastFrame;
     spark.lastFrame = frame;
     if (spark.target) {
@@ -10160,6 +10165,9 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
         }
       }
     }
+    if (spark.webgpuBackend) {
+      spark.webgpuBackend.applyPerFrame(spark, camera);
+    }
     spark.dirty = false;
   }
   clearSplats() {
@@ -10206,6 +10214,20 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     const center = camera.getWorldPosition(new THREE__namespace.Vector3());
     const dir = camera.getWorldDirection(new THREE__namespace.Vector3());
     const viewChanged = center.distanceTo(this.sortedCenter) > 1e-3 || dir.dot(this.sortedDir) < 0.999;
+    if (this.webgpuBackend) {
+      const didSort = this.webgpuBackend.update({
+        spark: this,
+        scene,
+        camera,
+        viewChanged
+      });
+      if (didSort) {
+        this.sortedCenter.copy(center);
+        this.sortedDir.copy(dir);
+        this.setDirty();
+      }
+      return;
+    }
     const next = this.accumulators.pop();
     if (!next) {
       throw new Error("No next accumulator");

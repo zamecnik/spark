@@ -16,6 +16,7 @@ export declare class SplatNodeMaterial extends MeshBasicNodeMaterial {
     renderSize: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<Vector2>>;
     renderToViewQuat: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<Vector4>>;
     renderToViewPos: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<Vector3>>;
+    renderToViewScale: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
     viewOrigin: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<Vector3>>;
     maxStdDev: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
     minPixelRadius: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
