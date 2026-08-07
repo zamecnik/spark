@@ -10748,7 +10748,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
           let texData = indices;
           if (this.webgpuBackend) {
             texRows = Math.min(
-              Math.max(rows, prevRows * 2, 256),
+              Math.max(rows, prevRows * 2, 384),
               Math.max(rows, 512)
             );
             if (texRows !== rows) {
@@ -11377,7 +11377,7 @@ class PagedSplats {
       let texData = indices;
       if (isWebGPURenderer(renderer)) {
         texRows = Math.min(
-          Math.max(rows, prevRows * 2, 256),
+          Math.max(rows, prevRows * 2, 384),
           Math.max(rows, 512)
         );
         if (texRows !== rows) {
