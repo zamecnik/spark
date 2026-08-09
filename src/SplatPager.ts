@@ -987,7 +987,11 @@ export class SplatPager {
   }
 
   private ensureShTextures(numSh: number) {
-    this.curSh = Math.max(this.curSh, numSh);
+    // maxSh caps ALLOCATION, not just evaluation: bands above it never get
+    // their maxPages-deep plane textures, and the per-band upload blocks below
+    // skip automatically (their `!== empty` guard stays false). Evaluation is
+    // already capped downstream via min(numSh, maxSh, pager.maxSh).
+    this.curSh = Math.max(this.curSh, Math.min(numSh, this.maxSh));
     if (!this.extSplats) {
       if (
         this.curSh >= 1 &&

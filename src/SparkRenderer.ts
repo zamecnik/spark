@@ -228,6 +228,17 @@ export interface SparkRendererOptions {
    */
   maxPagedSplats?: number;
   /**
+   * Highest SH band the page pool ALLOCATES (and therefore uploads and
+   * evaluates) for paged splats. Without a cap the pool commits SH plane
+   * textures for every band present in the .rad chunk DATA, sized maxPages
+   * deep (sh1 0.5 MB/page + sh2 1 MB/page + sh3 1 MB/page, GPU + equal CPU
+   * mirrors) — on a 4 GB iPhone that is the difference between fitting under
+   * WebKit's GPU-process memory ceiling and thrashing against it, for bands a
+   * phone screen cannot resolve anyway.
+   * @default 3
+   */
+  pagedMaxSh?: number;
+  /**
    * Number of parallel chunk fetchers for LoD. These are run within a shared pool
    * of 4 background WebWorker threads, so setting it above 4 will not have any
    * effect. Setting it 3 leaves one spare worker for other loading/decoding tasks.
@@ -427,6 +438,7 @@ export class SparkRenderer extends THREE.Mesh {
   lodInflate: boolean;
   pagedExtSplats: boolean;
   maxPagedSplats: number;
+  pagedMaxSh: number;
   numLodFetchers: number;
   behindFoveate: number;
   coneFov0: number;
@@ -586,6 +598,7 @@ export class SparkRenderer extends THREE.Mesh {
     this.pagedExtSplats = options.pagedExtSplats ?? false;
     const defaultPages = isMobile() ? (isIos() ? 96 : 128) : 256;
     this.maxPagedSplats = options.maxPagedSplats ?? defaultPages * 65536;
+    this.pagedMaxSh = options.pagedMaxSh ?? 3;
     this.numLodFetchers = options.numLodFetchers ?? 3;
     this.behindFoveate = options.behindFoveate ?? 0.2;
     this.coneFov0 = options.coneFov0 ?? 90.0;
@@ -1332,6 +1345,7 @@ export class SparkRenderer extends THREE.Mesh {
           renderer: this.renderer,
           extSplats: this.pagedExtSplats,
           maxSplats: this.maxPagedSplats,
+          maxSh: this.pagedMaxSh,
           numFetchers: this.numLodFetchers,
         });
 

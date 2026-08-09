@@ -9915,6 +9915,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     this.pagedExtSplats = options.pagedExtSplats ?? false;
     const defaultPages = isMobile() ? isIos() ? 96 : 128 : 256;
     this.maxPagedSplats = options.maxPagedSplats ?? defaultPages * 65536;
+    this.pagedMaxSh = options.pagedMaxSh ?? 3;
     this.numLodFetchers = options.numLodFetchers ?? 3;
     this.behindFoveate = options.behindFoveate ?? 0.2;
     this.coneFov0 = options.coneFov0 ?? 90;
@@ -10493,6 +10494,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
           renderer: this.renderer,
           extSplats: this.pagedExtSplats,
           maxSplats: this.maxPagedSplats,
+          maxSh: this.pagedMaxSh,
           numFetchers: this.numLodFetchers
         });
         const { lodId } = await worker.call("newLodTree", {
@@ -11809,7 +11811,7 @@ const _SplatPager = class _SplatPager {
     }
   }
   ensureShTextures(numSh) {
-    this.curSh = Math.max(this.curSh, numSh);
+    this.curSh = Math.max(this.curSh, Math.min(numSh, this.maxSh));
     if (!this.extSplats) {
       if (this.curSh >= 1 && this.sh1Texture.value === _SplatPager.emptySh1Texture) {
         this.sh1Texture.value = this.newUint32ArrayTexture(
