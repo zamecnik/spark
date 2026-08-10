@@ -72,14 +72,25 @@ export class SsogSplats extends PagedSplats {
     const L = model.lodLevels;
     const coarsestSplats = model.counts[L - 1];
 
+    // Scene-size clamps: the composed cut can never exceed the finest level
+    // (counts[0] — levels are alternatives, not additive), and the pool can
+    // never hold more distinct chunks than the artifact has blocks. An
+    // oversized budget (e.g. a rad leaf-class ceiling leaking in) must not
+    // inflate the padded sort capacity or the pool textures past the scene.
+    const maxCut = model.counts[0];
+    const cutSplats = Math.min(budget * 1.15, maxCut);
+
     // Slack is QUANTIFIED, not vibes (§2.3): ≥ the max per-(leaf,level) block
     // footprint (a single near leaf can stage ~binSize ≈ 8+ pages of finer
     // blocks at once) plus an in-flight staging margin of one block per
     // fetcher. An unquantified headroom can livelock the keep-old protocol.
     const slackSplats =
       (model.maxLeafBlockFootprint + numFetchers) * SSOG_PAGE_SPLATS;
-    const poolPages = Math.ceil(
-      (budget * 1.15 + coarsestSplats + slackSplats) / SSOG_PAGE_SPLATS,
+    const poolPages = Math.min(
+      Math.ceil(
+        (cutSplats + coarsestSplats + slackSplats) / SSOG_PAGE_SPLATS,
+      ),
+      model.totalBlocks,
     );
 
     const pager = new SplatPager({
@@ -101,9 +112,10 @@ export class SsogSplats extends PagedSplats {
 
     // §2.4 capacity policy: allocated once at scene init from lod-meta
     // counts[] — the coarsest term covers the balancer's soft-target worst
-    // case (all-at-coarsest); NO regrow ever, ≤1 pipeline build per scene.
+    // case (all-at-coarsest), the counts[0] clamp bounds it by the scene;
+    // NO regrow ever, ≤1 pipeline build per scene.
     this.capacityRows = Math.ceil(
-      Math.max(budget * 1.15, coarsestSplats) / CUT_ROW_SPLATS,
+      Math.max(cutSplats, coarsestSplats) / CUT_ROW_SPLATS,
     );
     this.capacitySplats = this.capacityRows * CUT_ROW_SPLATS;
     // Feeds PagedSplats.update's pre-size clamp (sceneRows) consistently.
