@@ -108,6 +108,18 @@ export class SsogLodController {
   private frameCounter = 0;
   private tickCount = 0;
   private converged = false;
+  /**
+   * A flip scan was deferred by the WebGL2 sort backpressure — retry on the
+   * first sort-idle frame, OR after one metronome period regardless: under
+   * continuous motion the stock sort loop chains back-to-back (`sorting`
+   * flips false→true within one task in onSortComplete), so frames may NEVER
+   * observe idle and an unbounded gate starves flips entirely (observed
+   * live: 0 flips across a whole dolly). The stock mappingUpdated-while-
+   * sorting deferral (§2.4) keeps display correct either way — this gate
+   * only bounds recompose queueing.
+   */
+  private flipRetryPending = false;
+  private flipRetryFrames = 0;
   /** did the last selection tick move budgetScale (outside the dead zone)? */
   private scaleMoved = false;
 
@@ -238,6 +250,19 @@ export class SsogLodController {
     if (this.phase === "reveal") {
       this.revealTick(camera);
       return;
+    }
+    // sort-idle flip retry (see flipRetryPending) — runs between metronome
+    // beats so backpressure defers recomposition without starving it
+    if (this.flipRetryPending) {
+      this.flipRetryFrames += 1;
+      if (
+        !(this.isWebGL2 && this.sparkRenderer.sorting) ||
+        this.flipRetryFrames >= this.metronomeFrames
+      ) {
+        this.flipRetryPending = false;
+        this.flipRetryFrames = 0;
+        this.flipReadyLeaves();
+      }
     }
     this.frameCounter += 1;
     if (this.frameCounter < this.metronomeFrames) {
@@ -579,7 +604,11 @@ export class SsogLodController {
     // WebGL2 sort-worker backpressure §2.4) --------------------------------
     if (this.isWebGL2 && this.sparkRenderer.sorting) {
       this.stats.deferredBySort += 1;
+      this.flipRetryPending = anyPending;
+      this.flipRetryFrames = 0;
     } else if (anyPending) {
+      this.flipRetryPending = false;
+      this.flipRetryFrames = 0;
       this.flipReadyLeaves();
     }
 

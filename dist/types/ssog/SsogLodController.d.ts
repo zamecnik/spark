@@ -55,6 +55,18 @@ export declare class SsogLodController {
     private frameCounter;
     private tickCount;
     private converged;
+    /**
+     * A flip scan was deferred by the WebGL2 sort backpressure — retry on the
+     * first sort-idle frame, OR after one metronome period regardless: under
+     * continuous motion the stock sort loop chains back-to-back (`sorting`
+     * flips false→true within one task in onSortComplete), so frames may NEVER
+     * observe idle and an unbounded gate starves flips entirely (observed
+     * live: 0 flips across a whole dolly). The stock mappingUpdated-while-
+     * sorting deferral (§2.4) keeps display correct either way — this gate
+     * only bounds recompose queueing.
+     */
+    private flipRetryPending;
+    private flipRetryFrames;
     /** did the last selection tick move budgetScale (outside the dead zone)? */
     private scaleMoved;
     /** chunk → last controller tick it was in tiers 1–3 (cooldown bookkeeping) */
