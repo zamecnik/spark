@@ -29,6 +29,9 @@ export { SpzReader, SpzWriter, transcodeSpz } from "./spz";
 export { PackedSplats, type PackedSplatsOptions } from "./PackedSplats";
 export { ExtSplats, type ExtSplatsOptions } from "./ExtSplats";
 export * from "./SplatPager";
+// Kroscloud fork [ssog-2]: the ssog subpath entry (built as its own bundle
+// with this package external) reuses the core worker pool for unit decode.
+export { SplatWorker, NewSplatWorkerPool, workerPool } from "./SplatWorker";
 export {
   SplatGenerator,
   type GsplatGenerator,

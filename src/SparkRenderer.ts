@@ -1295,7 +1295,10 @@ export class SparkRenderer extends THREE.Mesh {
             (generator.packedSplats?.lodSplats ||
               generator.extSplats?.lodSplats ||
               generator.paged) &&
-            generator.enableLod !== false
+            generator.enableLod !== false &&
+            // Kroscloud fork [ssog-3]: externally-LOD'd paged sources (ssog)
+            // are driven by their own controller, never by driveLod.
+            generator.paged?.externalLod !== true
           );
         }) as SplatMesh[]);
     const hasPaged = lodMeshes.some((mesh) => mesh.paged);

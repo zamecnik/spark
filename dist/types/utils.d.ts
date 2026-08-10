@@ -1,14 +1,10 @@
 import * as THREE from "three";
+export { computeMaxSplats, encodeQuatOctXy88R8, encodeSh1Rgb, encodeSh2Rgb, encodeSh3Rgb, floatToUint8, fromHalf, setPackedSplatCenter, setPackedSplatQuat, setPackedSplatRgba, setPackedSplatScales, toHalf, type QuatXyzw, } from './packedEncode.js';
 export declare const threeRevision: number;
 export declare const threeMrtArray: boolean;
 export declare function normalize(vec: number[]): number[];
 export declare function floatBitsToUint(f: number): number;
 export declare function uintBitsToFloat(u: number): number;
-export declare const toHalf: typeof toHalfNative;
-export declare const fromHalf: typeof fromHalfNative;
-declare function toHalfNative(f: number): number;
-declare function fromHalfNative(u: number): number;
-export declare function floatToUint8(v: number): number;
 export declare function floatToSint8(v: number): number;
 export declare function Uint8ToFloat(v: number): number;
 export declare function Sint8ToFloat(v: number): number;
@@ -63,17 +59,6 @@ export declare function setPackedSplat(packedSplats: Uint32Array, index: number,
     lnScaleMax?: number;
     lodOpacity?: boolean;
 }): void;
-export declare function setPackedSplatCenter(packedSplats: Uint32Array, index: number, x: number, y: number, z: number): void;
-export declare function setPackedSplatScales(packedSplats: Uint32Array, index: number, scaleX: number, scaleY: number, scaleZ: number, encoding?: {
-    lnScaleMin?: number;
-    lnScaleMax?: number;
-}): void;
-export declare function setPackedSplatQuat(packedSplats: Uint32Array, index: number, quatX: number, quatY: number, quatZ: number, quatW: number): void;
-export declare function setPackedSplatRgba(packedSplats: Uint32Array, index: number, r: number, g: number, b: number, a: number, encoding?: {
-    rgbMin?: number;
-    rgbMax?: number;
-    lodOpacity?: boolean;
-}): void;
 export declare function setPackedSplatRgb(packedSplats: Uint32Array, index: number, r: number, g: number, b: number, encoding?: {
     rgbMin?: number;
     rgbMax?: number;
@@ -98,7 +83,6 @@ export declare function getTextureSize(numSplats: number): {
     depth: number;
     maxSplats: number;
 };
-export declare function computeMaxSplats(numSplats: number): number;
 export declare function isMobile(): boolean;
 export declare function isAndroid(): boolean;
 export declare function isOculus(): boolean;
@@ -141,17 +125,6 @@ export declare function epsilonSign(value: number, epsilon?: number): number;
 export declare function encodeQuatXyz888(q: THREE.Quaternion): number;
 export declare function decodeQuatXyz888(encoded: number, out: THREE.Quaternion): THREE.Quaternion;
 /**
- * Encodes a THREE.Quaternion into a 24‐bit integer.
- *
- * Bit layout (LSB → MSB):
- *   - Bits  0–7:  quantized U (8 bits)
- *   - Bits  8–15: quantized V (8 bits)
- *   - Bits 16–23: quantized angle θ (8 bits) from [0,π]
- *
- * This version uses folded octahedral mapping (all inline).
- */
-export declare function encodeQuatOctXy88R8(q: THREE.Quaternion): number;
-/**
  * Decodes a 24‐bit encoded quaternion (packed in a number) back to a THREE.Quaternion.
  *
  * Assumes the same bit layout as in encodeQuatOctXy88R8.
@@ -176,15 +149,6 @@ export declare function encodeQuatEulerXyz888(q: THREE.Quaternion): number;
 export declare function decodeQuatEulerXyz888(encoded: number, out: THREE.Quaternion): THREE.Quaternion;
 export declare function encodeQuatOctXy1010R12(qx: number, qy: number, qz: number, qw: number): number;
 export declare function decodeQuatOctXy1010R12(encoded: number, out: THREE.Quaternion): THREE.Quaternion;
-export declare function encodeSh1Rgb(sh1Array: Uint32Array, index: number, sh1Rgb: Float32Array, encoding?: {
-    sh1Max?: number;
-}): void;
-export declare function encodeSh2Rgb(sh2Array: Uint32Array, index: number, sh2Rgb: Float32Array, encoding?: {
-    sh2Max?: number;
-}): void;
-export declare function encodeSh3Rgb(sh3Array: Uint32Array, index: number, sh3Rgb: Float32Array, encoding?: {
-    sh3Max?: number;
-}): void;
 export declare function encodeExtRgb(r: number, g: number, b: number): number;
 export declare function decodeExtRgb(encoded: number): THREE.Color;
 export declare function encodeExtSh1Rgb(sh1Array: Uint32Array, index: number, sh1Rgb: Float32Array): void;
@@ -203,4 +167,3 @@ export declare class GunzipReader {
     });
     read(numBytes: number): Promise<Uint8Array>;
 }
-export {};

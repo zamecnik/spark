@@ -1,6 +1,6 @@
 {
   "name": "@sparkjsdev/spark",
-  "version": "2.1.0-kroscloud.6",
+  "version": "2.1.0-kroscloud.7",
   "description": "An advanced 3D Gaussian Splatting renderer for THREE.js",
   "homepage": "https://sparkjs.dev/",
   "type": "module",
@@ -17,6 +17,11 @@
       "types": "./dist/types/webgpu/index.d.ts",
       "import": "./dist/spark-webgpu.module.js",
       "require": "./dist/spark-webgpu.cjs.js"
+    },
+    "./ssog": {
+      "types": "./dist/types/ssog/index.d.ts",
+      "import": "./dist/spark-ssog.module.js",
+      "require": "./dist/spark-ssog.cjs.js"
     }
   },
   "scripts": {

@@ -50,6 +50,8 @@ export enum SplatFileType {
   PCSOGS = "pcsogs",
   PCSOGSZIP = "pcsogszip",
   RAD = "rad",
+  // Kroscloud fork [ssog-4]: Streamed-SOG lod-meta bundle (SsogSplats).
+  SSOG = "ssog",
 }
 
 export type SplatEncoding = {

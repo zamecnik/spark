@@ -1,3 +1,4 @@
+// Modified by Kroscloud, 2026 — see FORK-CHANGES.md [ssog-1]
 import init_wasm, {
   sort_splats,
   sort32_splats,
@@ -18,7 +19,12 @@ import init_wasm, {
   bhatt_lod_extsplats,
   get_lod_tree_level,
 } from "spark-worker-rs";
+import type { PcSogsJson, PcSogsV2Json } from "./SplatLoader";
+import { DEFAULT_SPLAT_ENCODING } from "./defines";
 import type { ExtResult, PackedResult, SplatEncoding } from "./defines";
+// Kroscloud fork [ssog-1]: SOG unit decode for the ssog module. pcsogsDecode
+// is the three-free carve-out — three must NEVER enter this inline bundle.
+import { unpackPcSogs } from "./pcsogsDecode";
 
 const rpcHandlers = {
   sortSplats16,
@@ -37,7 +43,24 @@ const rpcHandlers = {
   traverseLodTrees,
   getLodTreeLevel,
   nextChunk,
+  unpackSsogUnit,
 };
+
+// Kroscloud fork [ssog-1]: decode one ssog unit ({L}_{i}/meta.json + webp
+// planes fetched by SsogUnitCache) into the standard PackedSplats shape that
+// SplatPager.uploadPage consumes (P0b-verified byte-identical reuse).
+// Result arrays are transferred back via getTransferable.
+async function unpackSsogUnit({
+  json,
+  files,
+  encoding,
+}: {
+  json: PcSogsJson | PcSogsV2Json;
+  files: Record<string, ArrayBuffer>;
+  encoding?: SplatEncoding;
+}) {
+  return await unpackPcSogs(json, files, encoding ?? DEFAULT_SPLAT_ENCODING);
+}
 
 async function onMessage(event: MessageEvent) {
   const {

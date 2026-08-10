@@ -8,6 +8,9 @@
     "strict": true,
     "skipLibCheck": true,
     "moduleResolution": "bundler",
+    "paths": {
+      "@sparkjsdev/spark": ["./src/index.ts"]
+    },
     "declaration": true,
     "emitDeclarationOnly": true,
     "sourceMap": true,

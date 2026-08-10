@@ -48,6 +48,11 @@ export interface PagedSplatsOptions {
 }
 
 export class PagedSplats implements SplatSource {
+  // Kroscloud fork [ssog-3]: when true, an EXTERNAL controller owns paging +
+  // cut composition for this source (SsogLodController) — SparkRenderer's
+  // driveLod must skip the mesh entirely (lodMeshes filter guard).
+  readonly externalLod: boolean = false;
+
   pager?: SplatPager;
   rootUrl: string;
   requestHeader?: Record<string, string>;

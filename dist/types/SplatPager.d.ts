@@ -12,6 +12,7 @@ export interface PagedSplatsOptions {
     maxSh?: number;
 }
 export declare class PagedSplats implements SplatSource {
+    readonly externalLod: boolean;
     pager?: SplatPager;
     rootUrl: string;
     requestHeader?: Record<string, string>;
