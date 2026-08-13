@@ -15,6 +15,8 @@ type SparkRendererLike = THREE.Mesh & {
     maxStdDev: number;
     minPixelRadius: number;
     maxPixelRadius: number;
+    ssogFillV2: boolean;
+    ssogMinContribution: number;
     minAlpha: number;
     preBlurAmount: number;
     blurAmount: number;

@@ -69,6 +69,19 @@ export declare class SsogLodController {
     private flipRetryFrames;
     /** did the last selection tick move budgetScale (outside the dead zone)? */
     private scaleMoved;
+    /**
+     * Pool-settled detection (Phase C liveness finding): at fragmented near
+     * poses the block-aware pool guard can defer EVERY remaining grow flip
+     * forever (observed live: 191k deferrals at one fixed pose — quality is
+     * pool-limited before budget-limited, which is the DESIGNED trade). With
+     * only displayed==balanced as the criterion, `converged` never fires
+     * there: the metronome spins every period and the Phase D render-on-demand
+     * supplier would never rest. So "no flips for 3 consecutive ticks with a
+     * quiet pager" also counts as converged; the motion/resource/params gates
+     * un-converge exactly as before.
+     */
+    private lastFlipsStat;
+    private ticksNoProgress;
     /** chunk → last controller tick it was in tiers 1–3 (cooldown bookkeeping) */
     private chunkLastNeeded;
     /**
@@ -130,6 +143,13 @@ export declare class SsogLodController {
     constructor(options: SsogLodControllerOptions);
     /** Q8: call once per rendered frame from the app rAF. */
     frame(camera: THREE.PerspectiveCamera): void;
+    /**
+     * Public convergence probe (Phase C harness gates; the §2.9 render-on-
+     * demand supplier will consume it in Phase D): true when the ladder is at
+     * its balanced target, budgetScale has settled in the dead zone, and no
+     * flip retry is queued behind the WebGL2 sort backpressure.
+     */
+    get isConverged(): boolean;
     /** Detach-only stop (pano roundtrip): state stays warm for reattach. */
     detach(): void;
     attach(): void;

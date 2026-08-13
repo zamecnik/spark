@@ -122,6 +122,19 @@ export class SsogLodController {
   private flipRetryFrames = 0;
   /** did the last selection tick move budgetScale (outside the dead zone)? */
   private scaleMoved = false;
+  /**
+   * Pool-settled detection (Phase C liveness finding): at fragmented near
+   * poses the block-aware pool guard can defer EVERY remaining grow flip
+   * forever (observed live: 191k deferrals at one fixed pose — quality is
+   * pool-limited before budget-limited, which is the DESIGNED trade). With
+   * only displayed==balanced as the criterion, `converged` never fires
+   * there: the metronome spins every period and the Phase D render-on-demand
+   * supplier would never rest. So "no flips for 3 consecutive ticks with a
+   * quiet pager" also counts as converged; the motion/resource/params gates
+   * un-converge exactly as before.
+   */
+  private lastFlipsStat = 0;
+  private ticksNoProgress = 0;
 
   /** chunk → last controller tick it was in tiers 1–3 (cooldown bookkeeping) */
   private chunkLastNeeded: Map<number, number> = new Map();
@@ -272,6 +285,16 @@ export class SsogLodController {
     if (this.gatesPass(camera)) {
       this.lodTick(camera);
     }
+  }
+
+  /**
+   * Public convergence probe (Phase C harness gates; the §2.9 render-on-
+   * demand supplier will consume it in Phase D): true when the ladder is at
+   * its balanced target, budgetScale has settled in the dead zone, and no
+   * flip retry is queued behind the WebGL2 sort backpressure.
+   */
+  get isConverged(): boolean {
+    return this.phase === "run" && this.converged && !this.flipRetryPending;
   }
 
   /** Detach-only stop (pano roundtrip): state stays warm for reattach. */
@@ -474,6 +497,18 @@ export class SsogLodController {
       this.addLeafRefs(li, this.L - 1);
     }
     this.compose();
+    // §2.7 raycast contract: the dblclick 5-ray median consensus reads its
+    // bounded set from the PINNED coarsest level — a complete, view-
+    // independent scene that is resident for the whole session (tier-1 pin
+    // means these pool pages never move or evict). Published in leaf-table
+    // order, so raycast RESULTS are deterministic across runs regardless of
+    // page-assignment order. SplatMesh.raycast consumes this over the pool
+    // CPU mirror with lodOpacity=false (rescale ≡ 1). Copy, don't alias —
+    // this.cut is rewritten by every later recompose.
+    this.mesh.raycastIndices = {
+      numSplats: this.composedSplats,
+      indices: this.cut.slice(0, this.composedSplats),
+    };
     this.phase = "run";
     this.stats.phase = "run";
     this.converged = false; // ladder-up begins
@@ -623,7 +658,25 @@ export class SsogLodController {
         break;
       }
     }
-    this.converged = allAtTarget && !this.scaleMoved;
+    // ... OR pool-settled (see ticksNoProgress): the remaining flips are
+    // deferred by the pool/capacity guards and nothing is in flight — at a
+    // fixed pose that state is permanent by construction (the priority set,
+    // residency, and guards are all pose-stable).
+    const flipsSince = this.stats.flips - this.lastFlipsStat;
+    this.lastFlipsStat = this.stats.flips;
+    if (flipsSince > 0 || !anyPending) {
+      this.ticksNoProgress = 0;
+    } else {
+      this.ticksNoProgress += 1;
+    }
+    const pagerQuiet =
+      !pager ||
+      (pager.fetchers.length === 0 &&
+        pager.newUploads.length === 0 &&
+        pager.readyUploads.length === 0);
+    this.converged =
+      (allAtTarget || (this.ticksNoProgress >= 3 && pagerQuiet)) &&
+      !this.scaleMoved;
 
     this.stats.ticks = this.tickCount;
     this.stats.budgetScale = this.budgetScale;

@@ -89,6 +89,19 @@ export interface SparkRendererOptions {
    */
   maxPixelRadius?: number;
   /**
+   * Kroscloud fork [ssog-5]: enable the SSOG_FILL_V2 fill layer (ssog meshes
+   * only — the app enables it when routing an ssog scene). Runtime-uniform
+   * gated; false keeps the shader output byte-identical to upstream.
+   * @default false
+   */
+  ssogFillV2?: boolean;
+  /**
+   * Kroscloud fork [ssog-5]: SSOG_FILL_V2 contribution-cull threshold
+   * (alpha-pixel integral); 0 disables the cull while the layer stays on.
+   * @default 1.0
+   */
+  ssogMinContribution?: number;
+  /**
    * Whether to use extended Gsplat encoding for intermediary accumulator splats.
    * @default false
    */
@@ -388,6 +401,9 @@ export class SparkRenderer extends THREE.Mesh {
   maxStdDev: number;
   minPixelRadius: number;
   maxPixelRadius: number;
+  // Kroscloud [ssog-5]: SSOG_FILL_V2 fill layer (ssog meshes only)
+  ssogFillV2: boolean;
+  ssogMinContribution: number;
   accumExtSplats: boolean;
   covSplats: boolean;
   minAlpha: number;
@@ -570,6 +586,8 @@ export class SparkRenderer extends THREE.Mesh {
     this.maxStdDev = options.maxStdDev ?? Math.sqrt(8.0);
     this.minPixelRadius = options.minPixelRadius ?? 0.0; //1.6;
     this.maxPixelRadius = options.maxPixelRadius ?? 512.0;
+    this.ssogFillV2 = options.ssogFillV2 ?? false;
+    this.ssogMinContribution = options.ssogMinContribution ?? 1.0;
     this.accumExtSplats = options.accumExtSplats ?? false;
     this.covSplats = options.covSplats ?? false;
     this.minAlpha = options.minAlpha ?? 0.5 * (1.0 / 255.0);
@@ -684,6 +702,9 @@ export class SparkRenderer extends THREE.Mesh {
       minPixelRadius: { value: 0.0 },
       // Maximum pixel radius for splat rendering
       maxPixelRadius: { value: 512.0 },
+      // Kroscloud [ssog-5]: SSOG_FILL_V2 fill layer (ssog meshes only)
+      ssogFillV2: { value: false },
+      ssogMinContribution: { value: 1.0 },
       // Minimum alpha value for splat rendering
       minAlpha: { value: 0.5 * (1.0 / 255.0) },
       // Enable interpreting 0-thickness Gsplats as 2DGS
@@ -838,6 +859,8 @@ export class SparkRenderer extends THREE.Mesh {
     this.uniforms.maxStdDev.value = spark.maxStdDev;
     this.uniforms.minPixelRadius.value = spark.minPixelRadius;
     this.uniforms.maxPixelRadius.value = spark.maxPixelRadius;
+    this.uniforms.ssogFillV2.value = spark.ssogFillV2;
+    this.uniforms.ssogMinContribution.value = spark.ssogMinContribution;
     this.uniforms.minAlpha.value = spark.minAlpha;
     this.uniforms.enable2DGS.value = spark.enable2DGS;
     // this.uniforms.enableRayEval.value = spark.enableRayEval;

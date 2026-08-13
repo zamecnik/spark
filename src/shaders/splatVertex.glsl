@@ -33,6 +33,11 @@ uniform float focalDistance;
 uniform float apertureAngle;
 uniform float clipXY;
 uniform float focalAdjustment;
+// Kroscloud fork [ssog-5]: SSOG_FILL_V2 fill layer (ssog meshes only, plan
+// §2.6). Runtime-uniform gated (no shader variant / pipeline rebuild); with
+// ssogFillV2 false the output is byte-identical to upstream (P4 floor).
+uniform bool ssogFillV2;
+uniform float ssogMinContribution;
 
 uniform usampler2D ordering;
 uniform usampler2DArray extSplats;
@@ -240,6 +245,19 @@ void main() {
     }
     vRgba.a = rgba.a;
 
+    // SSOG_FILL_V2 elements 1 + 3-discard (§2.6): alphaClip discard and the
+    // contribution cull BEFORE eigen decomposition. contribution = total
+    // alpha-pixel integral of the projected Gaussian; ssogMinContribution 0
+    // disables the cull (the WebGL2 descope valve) while the gate stays on.
+    if (ssogFillV2) {
+        if (rgba.a < 1.0 / 255.0) {
+            return;
+        }
+        if (rgba.a * 6.2831853071795862 * sqrt(max(det, 0.0)) < ssogMinContribution) {
+            return;
+        }
+    }
+
     // Compute the eigenvalue and eigenvectors of the 2D covariance matrix
     float eigenAvg = 0.5 * (a + d);
     float eigenDelta = sqrt(max(0.0, eigenAvg * eigenAvg - det));
@@ -250,8 +268,28 @@ void main() {
         : ((a >= d) ? vec2(1.0, 0.0) : vec2(0.0, 1.0));
     vec2 eigenVec2 = vec2(eigenVec1.y, -eigenVec1.x);
 
-    float scale1 = min(maxPixelRadius, adjustedStdDev * sqrt(eigen1));
-    float scale2 = min(maxPixelRadius, adjustedStdDev * sqrt(eigen2));
+    float r1 = adjustedStdDev * sqrt(eigen1);
+    float r2 = adjustedStdDev * sqrt(eigen2);
+    float scale1;
+    float scale2;
+    if (ssogFillV2) {
+        // SSOG_FILL_V2 element 2 (§2.6): kernel cap WITH covariance rescale —
+        // upstream's viewport-adaptive cap, BOTH axes scaled by one factor so
+        // anisotropy survives (a true smaller Gaussian, no alpha comp).
+        float cap = min(1024.0, min(renderSize.x, renderSize.y));
+        float capScale = min(1.0, cap / max(r1, r2));
+        // element 3 (alpha quad shrink): beyond z* std-devs the falloff drops
+        // below alphaClip = 1/255 — shrink the quad AND the UV span together
+        // (same pixels-per-std-dev, identical Gaussian, fewer pixels filled).
+        float zStar = sqrt(2.0 * max(0.0, log(rgba.a * 255.0)));
+        float quadScale = min(1.0, zStar / adjustedStdDev);
+        scale1 = r1 * capScale * quadScale;
+        scale2 = r2 * capScale * quadScale;
+        vSplatUv = position.xy * (adjustedStdDev * quadScale);
+    } else {
+        scale1 = min(maxPixelRadius, r1);
+        scale2 = min(maxPixelRadius, r2);
+    }
     if (scale1 < minPixelRadius && scale2 < minPixelRadius) {
         return;
     }

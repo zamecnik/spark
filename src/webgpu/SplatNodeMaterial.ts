@@ -64,6 +64,7 @@ import {
   instanceIndex,
   int,
   ivec2,
+  log,
   mat3,
   max,
   min,
@@ -149,6 +150,12 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
   maxStdDev = uniform(1.0);
   minPixelRadius = uniform(0.0);
   maxPixelRadius = uniform(512.0);
+  // Kroscloud [ssog-5]: SSOG_FILL_V2 fill layer (plan §2.6, ssog meshes
+  // only). Float 0/1 gate (WGSL disallows bool in the uniform address
+  // space); expression-identical twin of the splatVertex.glsl block (the
+  // R13 cross-path SSIM gate enforces the twin discipline).
+  ssogFillV2 = uniform(0.0);
+  ssogMinContribution = uniform(1.0);
   minAlpha = uniform(0.5 * (1.0 / 255.0));
   preBlurAmount = uniform(0.0);
   blurAmount = uniform(0.3);
@@ -426,6 +433,23 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
       vRgba.a.assign(rgba.a);
       vAdjustedStdDev.assign(adjustedStdDev);
 
+      // SSOG_FILL_V2 elements 1 + 3-discard (§2.6): alphaClip discard and
+      // the contribution cull BEFORE eigen decomposition (GLSL twin).
+      const fillOn = this.ssogFillV2.greaterThan(0.5);
+      rejected.assign(
+        rejected.or(fillOn.and(rgba.a.lessThan(1.0 / 255.0))),
+      );
+      rejected.assign(
+        rejected.or(
+          fillOn.and(
+            rgba.a
+              .mul(6.2831853071795862)
+              .mul(sqrt(max(det, 0.0)))
+              .lessThan(this.ssogMinContribution),
+          ),
+        ),
+      );
+
       // Compute the eigenvalues and eigenvectors of the 2D covariance matrix
       const eigenAvg = a.add(d).mul(0.5);
       const eigenDelta = sqrt(max(0.0, eigenAvg.mul(eigenAvg).sub(det)));
@@ -444,8 +468,38 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
       const eigenVec2 = vec2(eigenVec1.y, eigenVec1.x.negate());
 
       // maxPixelRadius clamp AFTER the adjustedStdDev multiply
-      const scale1 = min(this.maxPixelRadius, adjustedStdDev.mul(sqrt(eigen1)));
-      const scale2 = min(this.maxPixelRadius, adjustedStdDev.mul(sqrt(eigen2)));
+      const r1 = adjustedStdDev.mul(sqrt(eigen1));
+      const r2 = adjustedStdDev.mul(sqrt(eigen2));
+      // SSOG_FILL_V2 element 2 (§2.6): kernel cap WITH covariance rescale —
+      // upstream's viewport-adaptive cap, BOTH axes scaled by one factor so
+      // anisotropy survives; element 3 (alpha quad shrink): beyond z*
+      // std-devs the falloff drops below alphaClip = 1/255 — shrink the quad
+      // AND the UV span together (same pixels-per-std-dev, identical
+      // Gaussian, fewer pixels filled). GLSL twin in splatVertex.glsl.
+      const fillCap = min(
+        1024.0,
+        min(this.renderSize.x, this.renderSize.y),
+      );
+      const capScale = min(1.0, fillCap.div(max(r1, r2)));
+      const zStar = sqrt(
+        max(0.0, log(rgba.a.mul(255.0))).mul(2.0),
+      );
+      const quadScale = min(1.0, zStar.div(adjustedStdDev));
+      const scale1 = select(
+        fillOn,
+        r1.mul(capScale).mul(quadScale),
+        min(this.maxPixelRadius, r1),
+      );
+      const scale2 = select(
+        fillOn,
+        r2.mul(capScale).mul(quadScale),
+        min(this.maxPixelRadius, r2),
+      );
+      If(fillOn, () => {
+        vSplatUv.assign(
+          positionGeometry.xy.mul(adjustedStdDev.mul(quadScale)),
+        );
+      });
       rejected.assign(
         rejected.or(
           scale1

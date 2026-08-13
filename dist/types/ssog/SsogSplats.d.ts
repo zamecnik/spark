@@ -12,6 +12,17 @@ export interface SsogSplatsOptions {
     maxSh?: number;
     /** parallel unit-block fetchers; device-tiered default (mobile 2, else 4) */
     numFetchers?: number;
+    /**
+     * Pool fragmentation factor on the BUDGET term of the §2.3 pool formula
+     * (Phase C finding): the composed cut references rows scattered across
+     * blocks, so displayed pages run well under full occupancy (~55% measured
+     * on the 4.59M reference scene at a 2M budget) and the block-aware pool
+     * guard then caps effective quality at ~0.55×budget. A factor ≈ 1.8
+     * restores budget-level quality at the cost of a proportionally larger
+     * pool. Default 1 (pre-calibration behavior); the app sets the calibrated
+     * per-tier value.
+     */
+    poolFactor?: number;
 }
 export declare class SsogSplats extends PagedSplats {
     readonly externalLod: boolean;

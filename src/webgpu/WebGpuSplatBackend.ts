@@ -145,6 +145,8 @@ type SparkRendererLike = THREE.Mesh & {
   maxStdDev: number;
   minPixelRadius: number;
   maxPixelRadius: number;
+  ssogFillV2: boolean;
+  ssogMinContribution: number;
   minAlpha: number;
   preBlurAmount: number;
   blurAmount: number;
@@ -386,6 +388,8 @@ export class WebGpuSplatBackend {
     mat.maxStdDev.value = spark.maxStdDev;
     mat.minPixelRadius.value = spark.minPixelRadius;
     mat.maxPixelRadius.value = spark.maxPixelRadius;
+    mat.ssogFillV2.value = spark.ssogFillV2 ? 1 : 0;
+    mat.ssogMinContribution.value = spark.ssogMinContribution;
     mat.minAlpha.value = spark.minAlpha;
     mat.preBlurAmount.value = spark.preBlurAmount;
     mat.blurAmount.value = spark.blurAmount;

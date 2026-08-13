@@ -22,6 +22,8 @@ export declare class SplatNodeMaterial extends MeshBasicNodeMaterial {
     maxStdDev: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
     minPixelRadius: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
     maxPixelRadius: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
+    ssogFillV2: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
+    ssogMinContribution: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
     minAlpha: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
     preBlurAmount: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
     blurAmount: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;

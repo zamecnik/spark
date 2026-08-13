@@ -44,6 +44,17 @@ export interface SsogSplatsOptions {
   maxSh?: number;
   /** parallel unit-block fetchers; device-tiered default (mobile 2, else 4) */
   numFetchers?: number;
+  /**
+   * Pool fragmentation factor on the BUDGET term of the §2.3 pool formula
+   * (Phase C finding): the composed cut references rows scattered across
+   * blocks, so displayed pages run well under full occupancy (~55% measured
+   * on the 4.59M reference scene at a 2M budget) and the block-aware pool
+   * guard then caps effective quality at ~0.55×budget. A factor ≈ 1.8
+   * restores budget-level quality at the cost of a proportionally larger
+   * pool. Default 1 (pre-calibration behavior); the app sets the calibrated
+   * per-tier value.
+   */
+  poolFactor?: number;
 }
 
 export class SsogSplats extends PagedSplats {
@@ -86,9 +97,11 @@ export class SsogSplats extends PagedSplats {
     // fetcher. An unquantified headroom can livelock the keep-old protocol.
     const slackSplats =
       (model.maxLeafBlockFootprint + numFetchers) * SSOG_PAGE_SPLATS;
+    const poolFactor = options.poolFactor ?? 1;
     const poolPages = Math.min(
       Math.ceil(
-        (cutSplats + coarsestSplats + slackSplats) / SSOG_PAGE_SPLATS,
+        (cutSplats * poolFactor + coarsestSplats + slackSplats) /
+          SSOG_PAGE_SPLATS,
       ),
       model.totalBlocks,
     );

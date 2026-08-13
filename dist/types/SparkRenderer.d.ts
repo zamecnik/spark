@@ -57,6 +57,19 @@ export interface SparkRendererOptions {
      */
     maxPixelRadius?: number;
     /**
+     * Kroscloud fork [ssog-5]: enable the SSOG_FILL_V2 fill layer (ssog meshes
+     * only — the app enables it when routing an ssog scene). Runtime-uniform
+     * gated; false keeps the shader output byte-identical to upstream.
+     * @default false
+     */
+    ssogFillV2?: boolean;
+    /**
+     * Kroscloud fork [ssog-5]: SSOG_FILL_V2 contribution-cull threshold
+     * (alpha-pixel integral); 0 disables the cull while the layer stays on.
+     * @default 1.0
+     */
+    ssogMinContribution?: number;
+    /**
      * Whether to use extended Gsplat encoding for intermediary accumulator splats.
      * @default false
      */
@@ -344,6 +357,8 @@ export declare class SparkRenderer extends THREE.Mesh {
     maxStdDev: number;
     minPixelRadius: number;
     maxPixelRadius: number;
+    ssogFillV2: boolean;
+    ssogMinContribution: number;
     accumExtSplats: boolean;
     covSplats: boolean;
     minAlpha: number;
@@ -482,6 +497,12 @@ export declare class SparkRenderer extends THREE.Mesh {
             value: number;
         };
         maxPixelRadius: {
+            value: number;
+        };
+        ssogFillV2: {
+            value: boolean;
+        };
+        ssogMinContribution: {
             value: number;
         };
         minAlpha: {
