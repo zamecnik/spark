@@ -737,6 +737,9 @@ class SsogLodController {
     if (!pager) {
       return 0;
     }
+    if (pager.maxPages >= this.splats.model.totalBlocks) {
+      return pager.maxPages;
+    }
     return pager.maxPages - pager.numFetchers;
   }
   /** iterate global chunk ids of a (leaf, level) ref */

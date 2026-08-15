@@ -435,6 +435,18 @@ export class SsogLodController {
     if (!pager) {
       return 0;
     }
+    // [ssog-6] Whole-scene-resident pools need NO fetcher headroom: when
+    // maxPages covers every block of the artifact nothing ever has to be
+    // evicted to fetch, so reserving numFetchers pages would — on tiny
+    // deep-ladder scenes, where the kroscloud.8 totalBlocks clamp makes
+    // maxPages == totalBlocks < numFetchers — drive the limit to zero or
+    // negative and defer EVERY grow flip forever (found live in the Phase D
+    // mixed-band sweep: 20k/3-level fixture, 191 deferrals, 0 flips, ladder
+    // pinned at coarsest). Production-scale artifacts (multi-level ⇒ >1M
+    // splats ⇒ dozens of blocks ≫ numFetchers) never take this branch.
+    if (pager.maxPages >= this.splats.model.totalBlocks) {
+      return pager.maxPages;
+    }
     return pager.maxPages - pager.numFetchers;
   }
 
