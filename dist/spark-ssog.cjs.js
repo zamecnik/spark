@@ -513,6 +513,7 @@ class SsogLodController {
     this.budgetScale = 1;
     this.phase = "reveal";
     this.detached = false;
+    this.heldPending = false;
     this.composedSplats = 0;
     this.displayedTotal = 0;
     this.frameCounter = 0;
@@ -551,6 +552,8 @@ class SsogLodController {
       headroomViolations: 0,
       capacityDeferrals: 0,
       poolDeferrals: 0,
+      /** [B4] wave-gather hold observations (per flip-scan pass, not unique) */
+      batchHolds: 0,
       displayedChunkCount: 0,
       capacityOverflowInCompose: 0,
       missingSamples: [],
@@ -569,7 +572,8 @@ class SsogLodController {
     this.lodBaseDistance = options.lodBaseDistance ?? 5 / 16 * chunkExtent;
     this.moveGateFactor = options.moveGateFactor ?? 0.2;
     this.metronomeFrames = options.metronomeFrames ?? 10;
-    this.cooldownTicks = options.cooldownTicks ?? 10;
+    this.cooldownTicks = options.cooldownTicks ?? 100;
+    this.flipBatchTicks = options.flipBatchTicks ?? 2;
     this.isWebGL2 = options.isWebGL2 ?? (this.splats.pager ? this.splats.pager.renderer.isWebGPURenderer !== true : true);
     const model = this.splats.model;
     this.L = model.lodLevels;
@@ -580,6 +584,7 @@ class SsogLodController {
     this.balancedLevel = new Int32Array(this.NL);
     this.bucketOf = new Int32Array(this.NL);
     this.dBucket = new Float64Array(this.NL);
+    this.readySinceTick = new Int32Array(this.NL).fill(-1);
     this.cut = new Uint32Array(this.splats.capacitySplats);
     const pinned = [];
     for (let u = 0; u < model.numUnits; u++) {
@@ -808,11 +813,9 @@ class SsogLodController {
     this.selectionAndBalance(camera, uniformScale);
     let anyPending = false;
     for (let li = 0; li < this.NL; li++) {
-      const cur = this.displayed[li];
       const target = this.balancedLevel[li];
-      const next = cur + Math.sign(target - cur);
-      this.desired[li] = next;
-      if (next !== cur) {
+      this.desired[li] = target;
+      if (target !== this.displayed[li]) {
         anyPending = true;
       }
     }
@@ -911,7 +914,7 @@ class SsogLodController {
       this.ticksNoProgress += 1;
     }
     const pagerQuiet = !pager || pager.fetchers.length === 0 && pager.newUploads.length === 0 && pager.readyUploads.length === 0;
-    this.converged = (allAtTarget || this.ticksNoProgress >= 3 && pagerQuiet) && !this.scaleMoved;
+    this.converged = (allAtTarget || this.ticksNoProgress >= 3 && pagerQuiet && !this.heldPending) && !this.scaleMoved;
     this.stats.ticks = this.tickCount;
     this.stats.budgetScale = this.budgetScale;
     this.stats.composedSplats = this.composedSplats;
@@ -1043,11 +1046,21 @@ class SsogLodController {
     const pending = this.pendingUploadPages();
     const readyShrink = [];
     const readyGrow = [];
+    const growPendingByFile = /* @__PURE__ */ new Map();
+    const growReadyByFile = /* @__PURE__ */ new Map();
     for (let li = 0; li < this.NL; li++) {
       const to = this.desired[li];
       const from = this.displayed[li];
       if (to === from) {
+        this.readySinceTick[li] = -1;
         continue;
+      }
+      const o = (li * this.L + to) * 3;
+      const delta = model.leafLods[o + 2] - model.leafLods[(li * this.L + from) * 3 + 2];
+      const grow = delta > 0;
+      const file = grow && model.leafLods[o + 2] > 0 ? model.leafLods[o] : -1;
+      if (file >= 0) {
+        growPendingByFile.set(file, (growPendingByFile.get(file) ?? 0) + 1);
       }
       let ready = true;
       this.forEachLeafChunk(li, to, (c) => {
@@ -1056,16 +1069,41 @@ class SsogLodController {
         }
       });
       if (!ready) {
+        this.readySinceTick[li] = -1;
         continue;
       }
-      const delta = model.leafLods[(li * this.L + to) * 3 + 2] - model.leafLods[(li * this.L + from) * 3 + 2];
-      if (delta <= 0) {
+      if (!grow) {
+        this.readySinceTick[li] = -1;
         readyShrink.push(li);
       } else {
+        if (file >= 0) {
+          growReadyByFile.set(file, (growReadyByFile.get(file) ?? 0) + 1);
+        }
         readyGrow.push(li);
       }
     }
-    if (readyShrink.length === 0 && readyGrow.length === 0) {
+    const releaseTick = this.flipBatchTicks <= 0 || this.tickCount % this.flipBatchTicks === 0;
+    let held = 0;
+    const eligibleGrow = [];
+    for (const li of readyGrow) {
+      const o = (li * this.L + this.desired[li]) * 3;
+      const file = model.leafLods[o + 2] > 0 ? model.leafLods[o] : -1;
+      if (file < 0 || growReadyByFile.get(file) === growPendingByFile.get(file)) {
+        eligibleGrow.push(li);
+        continue;
+      }
+      if (this.readySinceTick[li] < 0) {
+        this.readySinceTick[li] = this.tickCount;
+      }
+      if (releaseTick && this.tickCount - this.readySinceTick[li] >= this.flipBatchTicks) {
+        eligibleGrow.push(li);
+      } else {
+        held += 1;
+        this.stats.batchHolds += 1;
+      }
+    }
+    this.heldPending = held > 0;
+    if (readyShrink.length === 0 && eligibleGrow.length === 0) {
       return;
     }
     const poolLimit = this.poolGuardLimit();
@@ -1075,13 +1113,14 @@ class SsogLodController {
       this.addLeafRefs(li, to);
       this.displayedTotal += model.leafLods[(li * this.L + to) * 3 + 2] - model.leafLods[(li * this.L + this.displayed[li]) * 3 + 2];
       this.displayed[li] = to;
+      this.readySinceTick[li] = -1;
       flipped += 1;
     };
     for (const li of readyShrink) {
       applyFlip(li, this.desired[li]);
     }
-    readyGrow.sort((a, b) => this.dBucket[a] - this.dBucket[b]);
-    for (const li of readyGrow) {
+    eligibleGrow.sort((a, b) => this.dBucket[a] - this.dBucket[b]);
+    for (const li of eligibleGrow) {
       const to = this.desired[li];
       const from = this.displayed[li];
       const delta = model.leafLods[(li * this.L + to) * 3 + 2] - model.leafLods[(li * this.L + from) * 3 + 2];
@@ -1099,6 +1138,7 @@ class SsogLodController {
       }
       this.displayedTotal += delta;
       this.displayed[li] = to;
+      this.readySinceTick[li] = -1;
       flipped += 1;
     }
     this.stats.displayedChunkCount = this.chunkRefs.size;

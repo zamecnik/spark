@@ -15,8 +15,18 @@ export interface SsogLodControllerOptions {
     moveGateFactor?: number;
     /** controller tick every N frames (default 10) */
     metronomeFrames?: number;
-    /** chunk fetch-priority cooldown in controller ticks (default 10 — C4) */
+    /**
+     * chunk fetch-priority cooldown in controller ticks (default 100 — C4
+     * revised: upstream gsplat-params parity at the same tick cadence)
+     */
     cooldownTicks?: number;
+    /**
+     * grow-flip wave gather window in controller ticks (default 2): a ready
+     * grow flip waits for the REST of its unit file's pending leaves at most
+     * this long, so refinement lands as few spatially-coherent waves instead
+     * of a per-block trickle. 0 = flip as soon as ready (pre-kroscloud.10).
+     */
+    flipBatchTicks?: number;
     /**
      * WebGL2 sort-worker backpressure: gate cut RECOMPOSITION on
      * sparkRenderer.sorting (§2.4). Default: auto-detect from the renderer.
@@ -32,6 +42,7 @@ export declare class SsogLodController {
     readonly moveGateFactor: number;
     readonly metronomeFrames: number;
     readonly cooldownTicks: number;
+    readonly flipBatchTicks: number;
     readonly isWebGL2: boolean;
     /** set true after any external param change to force a tick */
     paramsDirty: boolean;
@@ -47,6 +58,19 @@ export declare class SsogLodController {
     private readonly balancedLevel;
     private readonly bucketOf;
     private readonly dBucket;
+    /**
+     * [B4] controller tick at which a pending GROW leaf first became ready
+     * while its unit-file wave was still incomplete (−1 = not held). Bounds
+     * the wave-gather hold to flipBatchTicks (quantized release).
+     */
+    private readonly readySinceTick;
+    /**
+     * [B4] the last flip scan left ready-but-held grow flips (a BOUNDED
+     * state — quantized deadline release resolves it within 2·flipBatchTicks
+     * ticks). Pool-settled convergence must not latch over it: a converged
+     * controller stops ticking, which would strand the held flips forever.
+     */
+    private heldPending;
     /** fixed-capacity compose buffer (§2.4 capacity policy — never regrows) */
     private readonly cut;
     private composedSplats;
@@ -124,6 +148,8 @@ export declare class SsogLodController {
         headroomViolations: number;
         capacityDeferrals: number;
         poolDeferrals: number;
+        /** [B4] wave-gather hold observations (per flip-scan pass, not unique) */
+        batchHolds: number;
         displayedChunkCount: number;
         capacityOverflowInCompose: number;
         missingSamples: {

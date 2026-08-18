@@ -16,12 +16,24 @@
 //     0.2·lodBaseDistance, rotated > 90°, FOV Δ > 2%, resource-arrival,
 //     params-dirty, not-yet-converged);
 //   - keep-old-until-resident swap state machine with cancel/retarget: a leaf
-//     never leaves the cut (pop, never hole); desired = one step from
-//     displayed toward the balanced target (tier-3 staged prefetch);
+//     never leaves the cut (pop, never hole); desired = the balanced target
+//     DIRECTLY (kroscloud.10 flip-visibility alignment — upstream
+//     selectDesiredLodIndex semantics: one fetch + ONE flip per leaf, no
+//     intermediate-level pops; underfill display stays dormant as upstream's
+//     viewer ships it);
+//   - unit-coherent grow-flip waves (kroscloud.10): ready grow flips gather
+//     by their desired level's unit FILE and land together when every
+//     pending grow leaf of that file is ready (upstream file-arrival apply
+//     granule) or after flipBatchTicks (default 2) — a bounded hold that
+//     turns the per-64k-block trickle into few spatially-coherent waves;
+//     shrink flips stay immediate (budget/pool relief);
 //   - fetchPriority tiers: (1) coarsest PINNED, (2) displayed, (3) desired
 //     nearest-first with the free-pool headroom assert BEFORE each staged
-//     leaf (livelock guard; sub-step staging fallback), (4) cooldown 10
-//     controller ticks (C4);
+//     leaf (livelock guard; sub-step staging fallback), (4) cooldown 100
+//     controller ticks (C4 revised kroscloud.10 — upstream gsplat-params
+//     cooldownTicks=100 at the same 10-frame tick cadence; the earlier 10
+//     was a 10× misscale that evicted band-boundary content in ~1.6 s and
+//     re-popped it from the network on revisit);
 //   - initial reveal: coarsest pinned; the first cut is the complete coarsest
 //     scene (a conservative strengthening of the §2.4 "≥95% resident"
 //     trigger that keeps the no-hole invariant absolute) → activeSplats>0
@@ -55,8 +67,18 @@ export interface SsogLodControllerOptions {
   moveGateFactor?: number;
   /** controller tick every N frames (default 10) */
   metronomeFrames?: number;
-  /** chunk fetch-priority cooldown in controller ticks (default 10 — C4) */
+  /**
+   * chunk fetch-priority cooldown in controller ticks (default 100 — C4
+   * revised: upstream gsplat-params parity at the same tick cadence)
+   */
   cooldownTicks?: number;
+  /**
+   * grow-flip wave gather window in controller ticks (default 2): a ready
+   * grow flip waits for the REST of its unit file's pending leaves at most
+   * this long, so refinement lands as few spatially-coherent waves instead
+   * of a per-block trickle. 0 = flip as soon as ready (pre-kroscloud.10).
+   */
+  flipBatchTicks?: number;
   /**
    * WebGL2 sort-worker backpressure: gate cut RECOMPOSITION on
    * sparkRenderer.sorting (§2.4). Default: auto-detect from the renderer.
@@ -78,6 +100,7 @@ export class SsogLodController {
   readonly moveGateFactor: number;
   readonly metronomeFrames: number;
   readonly cooldownTicks: number;
+  readonly flipBatchTicks: number;
   readonly isWebGL2: boolean;
 
   /** set true after any external param change to force a tick */
@@ -98,6 +121,19 @@ export class SsogLodController {
   private readonly balancedLevel: Int32Array;
   private readonly bucketOf: Int32Array;
   private readonly dBucket: Float64Array;
+  /**
+   * [B4] controller tick at which a pending GROW leaf first became ready
+   * while its unit-file wave was still incomplete (−1 = not held). Bounds
+   * the wave-gather hold to flipBatchTicks (quantized release).
+   */
+  private readonly readySinceTick: Int32Array;
+  /**
+   * [B4] the last flip scan left ready-but-held grow flips (a BOUNDED
+   * state — quantized deadline release resolves it within 2·flipBatchTicks
+   * ticks). Pool-settled convergence must not latch over it: a converged
+   * controller stops ticking, which would strand the held flips forever.
+   */
+  private heldPending = false;
 
   /** fixed-capacity compose buffer (§2.4 capacity policy — never regrows) */
   private readonly cut: Uint32Array;
@@ -190,6 +226,8 @@ export class SsogLodController {
     headroomViolations: 0,
     capacityDeferrals: 0,
     poolDeferrals: 0,
+    /** [B4] wave-gather hold observations (per flip-scan pass, not unique) */
+    batchHolds: 0,
     displayedChunkCount: 0,
     capacityOverflowInCompose: 0,
     missingSamples: [] as {
@@ -218,7 +256,8 @@ export class SsogLodController {
       options.lodBaseDistance ?? (5 / 16) * chunkExtent; // C3
     this.moveGateFactor = options.moveGateFactor ?? 0.2;
     this.metronomeFrames = options.metronomeFrames ?? 10;
-    this.cooldownTicks = options.cooldownTicks ?? 10;
+    this.cooldownTicks = options.cooldownTicks ?? 100;
+    this.flipBatchTicks = options.flipBatchTicks ?? 2;
     this.isWebGL2 =
       options.isWebGL2 ??
       (this.splats.pager
@@ -236,6 +275,7 @@ export class SsogLodController {
     this.balancedLevel = new Int32Array(this.NL);
     this.bucketOf = new Int32Array(this.NL);
     this.dBucket = new Float64Array(this.NL);
+    this.readySinceTick = new Int32Array(this.NL).fill(-1);
 
     this.cut = new Uint32Array(this.splats.capacitySplats);
 
@@ -538,17 +578,18 @@ export class SsogLodController {
     const uniformScale = this.cameraLocal(camera);
     this.selectionAndBalance(camera, uniformScale);
 
-    // ---- swap state machine: desired = one step toward balanced (cancel/
-    // retarget is implicit — desired is recomputed from the CURRENT target
-    // every tick, so an in-flight prefetch for an abandoned target simply
-    // falls out of the priority tiers) -------------------------------------
+    // ---- swap state machine: desired = the balanced target DIRECTLY
+    // (kroscloud.10 — upstream selectDesiredLodIndex semantics: one fetch +
+    // one flip per leaf; the old one-step ladder popped every intermediate
+    // level AND downloaded it just to show it for a tick). Cancel/retarget
+    // is implicit — desired is recomputed from the CURRENT target every
+    // tick, so an in-flight prefetch for an abandoned target simply falls
+    // out of the priority tiers. ------------------------------------------
     let anyPending = false;
     for (let li = 0; li < this.NL; li++) {
-      const cur = this.displayed[li];
       const target = this.balancedLevel[li];
-      const next = cur + Math.sign(target - cur);
-      this.desired[li] = next;
-      if (next !== cur) {
+      this.desired[li] = target;
+      if (target !== this.displayed[li]) {
         anyPending = true;
       }
     }
@@ -686,8 +727,12 @@ export class SsogLodController {
       (pager.fetchers.length === 0 &&
         pager.newUploads.length === 0 &&
         pager.readyUploads.length === 0);
+    // [B4] heldPending blocks the pool-settled leg only — held flips are a
+    // bounded state the quantized release resolves, but a latched converged
+    // stops the metronome and would strand them.
     this.converged =
-      (allAtTarget || (this.ticksNoProgress >= 3 && pagerQuiet)) &&
+      (allAtTarget ||
+        (this.ticksNoProgress >= 3 && pagerQuiet && !this.heldPending)) &&
       !this.scaleMoved;
 
     this.stats.ticks = this.tickCount;
@@ -843,14 +888,32 @@ export class SsogLodController {
     const model = this.splats.model;
     const pending = this.pendingUploadPages();
 
-    // ready = ALL blocks of (leaf, desired) resident AND uploaded
+    // ready = ALL blocks of (leaf, desired) resident AND uploaded.
+    // [B4] grow readiness is additionally tallied per desired unit FILE:
+    // upstream's apply granule is a file arrival (all leaves waiting on one
+    // file swap in the same update), so a ready grow leaf holds — at most
+    // flipBatchTicks — until its file's whole pending cohort is ready, and
+    // refinement lands as few spatially-coherent waves instead of a
+    // per-block trickle.
     const readyShrink: number[] = [];
     const readyGrow: number[] = [];
+    const growPendingByFile = new Map<number, number>();
+    const growReadyByFile = new Map<number, number>();
     for (let li = 0; li < this.NL; li++) {
       const to = this.desired[li];
       const from = this.displayed[li];
       if (to === from) {
+        this.readySinceTick[li] = -1;
         continue;
+      }
+      const o = (li * this.L + to) * 3;
+      const delta =
+        model.leafLods[o + 2] -
+        model.leafLods[(li * this.L + from) * 3 + 2];
+      const grow = delta > 0;
+      const file = grow && model.leafLods[o + 2] > 0 ? model.leafLods[o] : -1;
+      if (file >= 0) {
+        growPendingByFile.set(file, (growPendingByFile.get(file) ?? 0) + 1);
       }
       let ready = true;
       this.forEachLeafChunk(li, to, (c) => {
@@ -866,18 +929,59 @@ export class SsogLodController {
         }
       });
       if (!ready) {
+        this.readySinceTick[li] = -1;
         continue;
       }
-      const delta =
-        model.leafLods[(li * this.L + to) * 3 + 2] -
-        model.leafLods[(li * this.L + from) * 3 + 2];
-      if (delta <= 0) {
+      if (!grow) {
+        this.readySinceTick[li] = -1;
         readyShrink.push(li);
       } else {
+        if (file >= 0) {
+          growReadyByFile.set(file, (growReadyByFile.get(file) ?? 0) + 1);
+        }
         readyGrow.push(li);
       }
     }
-    if (readyShrink.length === 0 && readyGrow.length === 0) {
+
+    // [B4] wave eligibility: complete file cohort, no file data, or hold
+    // expired. A capacity/pool-deferred flip keeps its aging hold stamp so
+    // the deferral never extends the wave window. Deadline releases are
+    // QUANTIZED to flipBatchTicks boundaries — with per-leaf deadlines
+    // alone, staggered readiness released a partial wave EVERY tick under
+    // sustained streaming (measured: dolly event count unchanged at ~1 per
+    // tick, batchHolds 7.5k); quantizing bounds the incomplete-cohort event
+    // rate to 1 per flipBatchTicks ticks. Worst hold = 2·flipBatchTicks − 1
+    // ticks (~500 ms at defaults). Complete cohorts still land immediately.
+    const releaseTick =
+      this.flipBatchTicks <= 0 ||
+      this.tickCount % this.flipBatchTicks === 0;
+    let held = 0;
+    const eligibleGrow: number[] = [];
+    for (const li of readyGrow) {
+      const o = (li * this.L + this.desired[li]) * 3;
+      const file = model.leafLods[o + 2] > 0 ? model.leafLods[o] : -1;
+      if (
+        file < 0 ||
+        growReadyByFile.get(file) === growPendingByFile.get(file)
+      ) {
+        eligibleGrow.push(li);
+        continue;
+      }
+      if (this.readySinceTick[li] < 0) {
+        this.readySinceTick[li] = this.tickCount;
+      }
+      if (
+        releaseTick &&
+        this.tickCount - this.readySinceTick[li] >= this.flipBatchTicks
+      ) {
+        eligibleGrow.push(li);
+      } else {
+        held += 1;
+        this.stats.batchHolds += 1;
+      }
+    }
+    this.heldPending = held > 0;
+    if (readyShrink.length === 0 && eligibleGrow.length === 0) {
       return;
     }
 
@@ -898,14 +1002,15 @@ export class SsogLodController {
         model.leafLods[(li * this.L + to) * 3 + 2] -
         model.leafLods[(li * this.L + this.displayed[li]) * 3 + 2];
       this.displayed[li] = to;
+      this.readySinceTick[li] = -1;
       flipped += 1;
     };
     for (const li of readyShrink) {
       applyFlip(li, this.desired[li]);
     }
     // nearest-first so pool headroom goes to the leaves that matter most
-    readyGrow.sort((a, b) => this.dBucket[a] - this.dBucket[b]);
-    for (const li of readyGrow) {
+    eligibleGrow.sort((a, b) => this.dBucket[a] - this.dBucket[b]);
+    for (const li of eligibleGrow) {
       const to = this.desired[li];
       const from = this.displayed[li];
       const delta =
@@ -926,6 +1031,7 @@ export class SsogLodController {
       }
       this.displayedTotal += delta;
       this.displayed[li] = to;
+      this.readySinceTick[li] = -1;
       flipped += 1;
     }
     this.stats.displayedChunkCount = this.chunkRefs.size;
