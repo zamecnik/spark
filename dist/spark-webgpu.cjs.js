@@ -428,18 +428,19 @@ class SplatNodeMaterial extends webgpu.MeshBasicNodeMaterial {
       d.addAssign(fullBlurAmount);
       const det = a.mul(d).sub(b.mul(b));
       const blurAdjust = TSL.sqrt(TSL.max(0, detOrig.div(det)));
+      const rawAlpha = rgba.a.toVar("kcRawAlpha");
       rgba.a.assign(rgba.a.mul(blurAdjust));
       rejected.assign(rejected.or(rgba.a.lessThan(uMinAlpha)));
       vRgba.a.assign(rgba.a);
       vAdjustedStdDev.assign(adjustedStdDev);
       const fillOn = this.ssogFillV2.greaterThan(0.5);
       rejected.assign(
-        rejected.or(fillOn.and(rgba.a.lessThan(1 / 255)))
+        rejected.or(fillOn.and(rawAlpha.lessThan(1 / 255)))
       );
       rejected.assign(
         rejected.or(
           fillOn.and(
-            rgba.a.mul(6.283185307179586).mul(TSL.sqrt(TSL.max(det, 0))).lessThan(this.ssogMinContribution)
+            rawAlpha.mul(6.283185307179586).mul(TSL.sqrt(TSL.max(det, 0))).lessThan(this.ssogMinContribution)
           )
         )
       );

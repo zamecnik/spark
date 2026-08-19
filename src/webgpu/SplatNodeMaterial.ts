@@ -428,21 +428,26 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
 
       // Compute anti-aliasing intensity scaling factor
       const blurAdjust = sqrt(max(0.0, detOrig.div(det)));
+      const rawAlpha = rgba.a.toVar("kcRawAlpha");
       rgba.a.assign(rgba.a.mul(blurAdjust));
       rejected.assign(rejected.or(rgba.a.lessThan(uMinAlpha)));
       vRgba.a.assign(rgba.a);
       vAdjustedStdDev.assign(adjustedStdDev);
 
-      // SSOG_FILL_V2 elements 1 + 3-discard (§2.6): alphaClip discard and
-      // the contribution cull BEFORE eigen decomposition (GLSL twin).
+      // SSOG_FILL_V2 elements 1 + 3-discard (§2.6; CORRECTED [ssog-8] —
+      // RAW alpha × POST-blur (dilated) det, upstream compute-path
+      // semantics; the old post-blurAdjust form cancelled the dilation and
+      // tested true undilated ink, deleting every σ≤0.4 px splat at any
+      // opacity = the far-view dense-region black patches). GLSL twin in
+      // splatVertex.glsl.
       const fillOn = this.ssogFillV2.greaterThan(0.5);
       rejected.assign(
-        rejected.or(fillOn.and(rgba.a.lessThan(1.0 / 255.0))),
+        rejected.or(fillOn.and(rawAlpha.lessThan(1.0 / 255.0))),
       );
       rejected.assign(
         rejected.or(
           fillOn.and(
-            rgba.a
+            rawAlpha
               .mul(6.2831853071795862)
               .mul(sqrt(max(det, 0.0)))
               .lessThan(this.ssogMinContribution),

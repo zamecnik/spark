@@ -239,21 +239,29 @@ void main() {
 
     // Compute anti-aliasing intensity scaling factor
     float blurAdjust = sqrt(max(0.0, detOrig / det));
+    float rawAlpha = rgba.a;
     rgba.a *= blurAdjust;
     if (rgba.a < minAlpha) {
         return;
     }
     vRgba.a = rgba.a;
 
-    // SSOG_FILL_V2 elements 1 + 3-discard (§2.6): alphaClip discard and the
-    // contribution cull BEFORE eigen decomposition. contribution = total
-    // alpha-pixel integral of the projected Gaussian; ssogMinContribution 0
-    // disables the cull (the WebGL2 descope valve) while the gate stays on.
+    // SSOG_FILL_V2 elements 1 + 3-discard (§2.6; CORRECTED [ssog-8] to the
+    // upstream compute-path semantics): both gates test the RAW file alpha
+    // (pre-blurAdjust) and the contribution uses the POST-blur (dilated)
+    // det — a·2π·√det keeps a blur-floor for point splats (→ a·2π·blur as
+    // σ→0), so opaque sub-pixel splats survive. The previous form gated on
+    // the post-blurAdjust alpha, which cancels the dilation algebraically
+    // (a·blurAdjust·√det ≡ a·√detOrig) and therefore tested TRUE undilated
+    // ink: at ssogMinContribution=1 it vertex-deleted the ENTIRE σ≤0.4 px
+    // population at ANY opacity — the far-view dense-region black patches
+    // (densest regions have the smallest per-splat σ, so they blacked out
+    // first). ssogMinContribution 0 still disables the cull.
     if (ssogFillV2) {
-        if (rgba.a < 1.0 / 255.0) {
+        if (rawAlpha < 1.0 / 255.0) {
             return;
         }
-        if (rgba.a * 6.2831853071795862 * sqrt(max(det, 0.0)) < ssogMinContribution) {
+        if (rawAlpha * 6.2831853071795862 * sqrt(max(det, 0.0)) < ssogMinContribution) {
             return;
         }
     }
