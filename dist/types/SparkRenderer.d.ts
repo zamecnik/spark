@@ -70,6 +70,18 @@ export interface SparkRendererOptions {
      */
     ssogMinContribution?: number;
     /**
+     * Kroscloud fork [ssog-9]: expected-depth pick mode. 0 = normal color
+     * output (default, byte-identical); 1 = the fragment emits premultiplied
+     * (normDepth·a, 0, 0, a) with normDepth = (−viewZ − pickNear)/(pickFar −
+     * pickNear), for an offscreen RGBA16F pick target read back as R/A.
+     * @default 0
+     */
+    pickMode?: number;
+    /** [ssog-9] depth-normalization window start (view-space distance). @default 0 */
+    pickNear?: number;
+    /** [ssog-9] depth-normalization window end (view-space distance). @default 1 */
+    pickFar?: number;
+    /**
      * Whether to use extended Gsplat encoding for intermediary accumulator splats.
      * @default false
      */
@@ -359,6 +371,9 @@ export declare class SparkRenderer extends THREE.Mesh {
     maxPixelRadius: number;
     ssogFillV2: boolean;
     ssogMinContribution: number;
+    pickMode: number;
+    pickNear: number;
+    pickFar: number;
     accumExtSplats: boolean;
     covSplats: boolean;
     minAlpha: number;
@@ -503,6 +518,15 @@ export declare class SparkRenderer extends THREE.Mesh {
             value: boolean;
         };
         ssogMinContribution: {
+            value: number;
+        };
+        pickMode: {
+            value: number;
+        };
+        pickNear: {
+            value: number;
+        };
+        pickFar: {
             value: number;
         };
         minAlpha: {

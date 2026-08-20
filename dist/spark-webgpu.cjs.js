@@ -244,6 +244,9 @@ class SplatNodeMaterial extends webgpu.MeshBasicNodeMaterial {
     this.maxPixelRadius = TSL.uniform(512);
     this.ssogFillV2 = TSL.uniform(0);
     this.ssogMinContribution = TSL.uniform(1);
+    this.pickMode = TSL.uniform(0);
+    this.pickNear = TSL.uniform(0);
+    this.pickFar = TSL.uniform(1);
     this.minAlpha = TSL.uniform(0.5 * (1 / 255));
     this.preBlurAmount = TSL.uniform(0);
     this.blurAmount = TSL.uniform(0.3);
@@ -274,6 +277,7 @@ class SplatNodeMaterial extends webgpu.MeshBasicNodeMaterial {
     const vRgba = TSL.varyingProperty("vec4", "vSplatRgba");
     const vSplatUv = TSL.varyingProperty("vec2", "vSplatUv");
     const vAdjustedStdDev = TSL.varyingProperty("float", "vSplatAdjStdDev");
+    const vViewZ = TSL.varyingProperty("float", "vSplatViewZ");
     const uMaxStdDev = this.maxStdDev;
     const uMinAlpha = this.minAlpha;
     const uFalloff = this.falloff;
@@ -377,6 +381,7 @@ class SplatNodeMaterial extends webgpu.MeshBasicNodeMaterial {
         center.mul(this.renderToViewScale)
       ).add(this.renderToViewPos);
       rejected.assign(rejected.or(viewCenter.z.greaterThanEqual(0)));
+      vViewZ.assign(viewCenter.z);
       const clipCenter = TSL.cameraProjectionMatrix.mul(TSL.vec4(viewCenter, 1));
       rejected.assign(
         rejected.or(clipCenter.z.abs().greaterThanEqual(clipCenter.w))
@@ -521,7 +526,12 @@ class SplatNodeMaterial extends webgpu.MeshBasicNodeMaterial {
       TSL.If(rgba.a.lessThan(uMinAlpha), () => {
         TSL.Discard();
       });
-      return TSL.vec4(rgba.rgb.mul(rgba.a), rgba.a);
+      const normDepth = TSL.float(vViewZ).negate().sub(this.pickNear).div(TSL.float(this.pickFar).sub(this.pickNear));
+      return TSL.select(
+        this.pickMode.greaterThan(0.5),
+        TSL.vec4(normDepth.mul(rgba.a), 0, 0, rgba.a),
+        TSL.vec4(rgba.rgb.mul(rgba.a), rgba.a)
+      );
     })();
     this.transparent = true;
     this.depthWrite = false;
@@ -934,6 +944,9 @@ class WebGpuSplatBackend {
     mat.maxPixelRadius.value = spark.maxPixelRadius;
     mat.ssogFillV2.value = spark.ssogFillV2 ? 1 : 0;
     mat.ssogMinContribution.value = spark.ssogMinContribution;
+    mat.pickMode.value = spark.pickMode ?? 0;
+    mat.pickNear.value = spark.pickNear ?? 0;
+    mat.pickFar.value = spark.pickFar ?? 1;
     mat.minAlpha.value = spark.minAlpha;
     mat.preBlurAmount.value = spark.preBlurAmount;
     mat.blurAmount.value = spark.blurAmount;

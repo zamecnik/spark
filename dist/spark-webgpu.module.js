@@ -226,6 +226,9 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
     this.maxPixelRadius = uniform(512);
     this.ssogFillV2 = uniform(0);
     this.ssogMinContribution = uniform(1);
+    this.pickMode = uniform(0);
+    this.pickNear = uniform(0);
+    this.pickFar = uniform(1);
     this.minAlpha = uniform(0.5 * (1 / 255));
     this.preBlurAmount = uniform(0);
     this.blurAmount = uniform(0.3);
@@ -256,6 +259,7 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
     const vRgba = varyingProperty("vec4", "vSplatRgba");
     const vSplatUv = varyingProperty("vec2", "vSplatUv");
     const vAdjustedStdDev = varyingProperty("float", "vSplatAdjStdDev");
+    const vViewZ = varyingProperty("float", "vSplatViewZ");
     const uMaxStdDev = this.maxStdDev;
     const uMinAlpha = this.minAlpha;
     const uFalloff = this.falloff;
@@ -359,6 +363,7 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
         center.mul(this.renderToViewScale)
       ).add(this.renderToViewPos);
       rejected.assign(rejected.or(viewCenter.z.greaterThanEqual(0)));
+      vViewZ.assign(viewCenter.z);
       const clipCenter = cameraProjectionMatrix.mul(vec4(viewCenter, 1));
       rejected.assign(
         rejected.or(clipCenter.z.abs().greaterThanEqual(clipCenter.w))
@@ -503,7 +508,12 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
       If(rgba.a.lessThan(uMinAlpha), () => {
         Discard();
       });
-      return vec4(rgba.rgb.mul(rgba.a), rgba.a);
+      const normDepth = float(vViewZ).negate().sub(this.pickNear).div(float(this.pickFar).sub(this.pickNear));
+      return select(
+        this.pickMode.greaterThan(0.5),
+        vec4(normDepth.mul(rgba.a), 0, 0, rgba.a),
+        vec4(rgba.rgb.mul(rgba.a), rgba.a)
+      );
     })();
     this.transparent = true;
     this.depthWrite = false;
@@ -916,6 +926,9 @@ class WebGpuSplatBackend {
     mat.maxPixelRadius.value = spark.maxPixelRadius;
     mat.ssogFillV2.value = spark.ssogFillV2 ? 1 : 0;
     mat.ssogMinContribution.value = spark.ssogMinContribution;
+    mat.pickMode.value = spark.pickMode ?? 0;
+    mat.pickNear.value = spark.pickNear ?? 0;
+    mat.pickFar.value = spark.pickFar ?? 1;
     mat.minAlpha.value = spark.minAlpha;
     mat.preBlurAmount.value = spark.preBlurAmount;
     mat.blurAmount.value = spark.blurAmount;
