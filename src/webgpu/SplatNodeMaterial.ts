@@ -156,6 +156,12 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
   // R13 cross-path SSIM gate enforces the twin discipline).
   ssogFillV2 = uniform(0.0);
   ssogMinContribution = uniform(1.0);
+  // Kroscloud [ssog-9]: expected-depth pick mode (float 0/1 gate + the
+  // dedicated depth-normalization window); expression-identical twin of the
+  // splatFragment.glsl pick branch — see the comment there.
+  pickMode = uniform(0.0);
+  pickNear = uniform(0.0);
+  pickFar = uniform(1.0);
   minAlpha = uniform(0.5 * (1.0 / 255.0));
   preBlurAmount = uniform(0.0);
   blurAmount = uniform(0.3);
@@ -195,6 +201,8 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
     const vRgba = varyingProperty("vec4", "vSplatRgba");
     const vSplatUv = varyingProperty("vec2", "vSplatUv");
     const vAdjustedStdDev = varyingProperty("float", "vSplatAdjStdDev");
+    // [ssog-9] view-space splat-center z for the pick branch (GLSL vViewZ)
+    const vViewZ = varyingProperty("float", "vSplatViewZ");
 
     const uMaxStdDev = this.maxStdDev;
     const uMinAlpha = this.minAlpha;
@@ -340,6 +348,7 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
 
       // Discard splats behind the camera
       rejected.assign(rejected.or(viewCenter.z.greaterThanEqual(0.0)));
+      vViewZ.assign(viewCenter.z);
 
       // Compute the clip space center of the splat
       const clipCenter = cameraProjectionMatrix.mul(vec4(viewCenter, 1.0));
@@ -559,8 +568,19 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
         Discard();
       });
 
-      // encodeLinear=false passthrough (parity row 27); premultiplied output
-      return vec4(rgba.rgb.mul(rgba.a), rgba.a);
+      // encodeLinear=false passthrough (parity row 27); premultiplied output.
+      // [ssog-9] pick mode: premultiplied (normDepth·a, 0, 0, a) — the GLSL
+      // twin lives inside the PREMULTIPLIED_ALPHA arm; this material is
+      // premultiplied by construction (CustomBlending ONE/OMSA below).
+      const normDepth = float(vViewZ)
+        .negate()
+        .sub(this.pickNear)
+        .div(float(this.pickFar).sub(this.pickNear));
+      return select(
+        this.pickMode.greaterThan(0.5),
+        vec4(normDepth.mul(rgba.a), 0.0, 0.0, rgba.a),
+        vec4(rgba.rgb.mul(rgba.a), rgba.a),
+      );
     })();
 
     // Premultiplied over: r185 WebGPU ignores premultipliedAlpha on

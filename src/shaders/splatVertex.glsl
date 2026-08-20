@@ -10,6 +10,9 @@ out vec2 vSplatUv;
 out vec3 vNdc;
 flat out uint vSplatIndex;
 flat out float adjustedStdDev;
+// Kroscloud fork [ssog-9]: view-space splat-CENTER z (constant across the
+// quad) for the expected-depth pick mode in splatFragment.glsl.
+out float vViewZ;
 
 // uniform uint numSplats;
 uniform vec2 renderSize;
@@ -132,6 +135,7 @@ void main() {
     if (viewCenter.z >= 0.0) {
         return;
     }
+    vViewZ = viewCenter.z;
 
     // Compute the clip space center of the splat
     vec4 clipCenter = projectionMatrix * vec4(viewCenter, 1.0);

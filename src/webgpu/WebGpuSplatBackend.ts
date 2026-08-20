@@ -147,6 +147,11 @@ type SparkRendererLike = THREE.Mesh & {
   maxPixelRadius: number;
   ssogFillV2: boolean;
   ssogMinContribution: number;
+  // [ssog-9] expected-depth pick mode + normalization window (optional so
+  // older SparkRenderer-shaped hosts still type-check; defaults applied)
+  pickMode?: number;
+  pickNear?: number;
+  pickFar?: number;
   minAlpha: number;
   preBlurAmount: number;
   blurAmount: number;
@@ -390,6 +395,10 @@ export class WebGpuSplatBackend {
     mat.maxPixelRadius.value = spark.maxPixelRadius;
     mat.ssogFillV2.value = spark.ssogFillV2 ? 1 : 0;
     mat.ssogMinContribution.value = spark.ssogMinContribution;
+    // [ssog-9] expected-depth pick mode + normalization window
+    mat.pickMode.value = spark.pickMode ?? 0;
+    mat.pickNear.value = spark.pickNear ?? 0;
+    mat.pickFar.value = spark.pickFar ?? 1;
     mat.minAlpha.value = spark.minAlpha;
     mat.preBlurAmount.value = spark.preBlurAmount;
     mat.blurAmount.value = spark.blurAmount;
