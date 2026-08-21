@@ -234,10 +234,19 @@ export async function unpackPcSogs(
               .fill(0)
               .map((_, i) => shN.mins + (shN.maxs - shN.mins) * (i / 255));
 
+      // [ssog-10] Centroid stride = coefficients per centroid. splat-transform
+      // >= 3.x packs 64 centroids per row at `64 * shCoeffs` px wide (3 / 8 /
+      // 15 for bands 1 / 2 / 3); upstream Spark hard-codes 15, which reads
+      // garbage for SH1/SH2 files (every lookup lands on the wrong centroid
+      // - field-hit on an SH2 scene as washed-out colour + blue/white
+      // blotches). The image width is the authoritative source: writers have
+      // always used 64 columns, so width / 64 is the stride for every vintage.
+      const shStride = Math.max(1, Math.floor(centroids.width / 64));
+
       for (let i = 0; i < numSplats; ++i) {
         const i4 = i * 4;
         const label = labels.rgba[i4 + 0] + (labels.rgba[i4 + 1] << 8);
-        const col = (label & 63) * 15;
+        const col = (label & 63) * shStride;
         const row = label >>> 6;
         const offset = row * centroids.width + col;
 
