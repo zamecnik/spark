@@ -519,6 +519,7 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
     this.depthWrite = false;
     this.depthTest = true;
     this.side = DoubleSide;
+    this.forceSinglePass = true;
     this.blending = CustomBlending;
     this.blendEquation = AddEquation;
     this.blendSrc = OneFactor;

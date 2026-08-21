@@ -537,6 +537,7 @@ class SplatNodeMaterial extends webgpu.MeshBasicNodeMaterial {
     this.depthWrite = false;
     this.depthTest = true;
     this.side = webgpu.DoubleSide;
+    this.forceSinglePass = true;
     this.blending = webgpu.CustomBlending;
     this.blendEquation = webgpu.AddEquation;
     this.blendSrc = webgpu.OneFactor;

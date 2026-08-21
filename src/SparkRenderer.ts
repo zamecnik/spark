@@ -571,6 +571,12 @@ export class SparkRenderer extends THREE.Mesh {
       depthTest: options.depthTest ?? true,
       depthWrite: options.depthWrite ?? false,
       side: THREE.DoubleSide,
+      // [ssog-11] see SplatNodeMaterial: transparent + DoubleSide without
+      // this makes WebGLRenderer render the mesh twice (BackSide pass +
+      // FrontSide pass, r185 WebGLRenderer.js:2133) AND flip needsUpdate on
+      // the material twice per object per frame. Splat quads are
+      // camera-facing with a single winding, so the extra pass is pure cost.
+      forceSinglePass: true,
       allowOverride: false,
     });
 

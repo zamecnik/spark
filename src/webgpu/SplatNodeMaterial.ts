@@ -589,6 +589,17 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
     this.depthWrite = false;
     this.depthTest = true;
     this.side = DoubleSide;
+    // [ssog-11] MANDATORY with transparent + DoubleSide: three's renderers
+    // otherwise submit the mesh TWICE per frame - a BackSide pass and a
+    // FrontSide pass (r185 Renderer.js:3620 / WebGLRenderer.js:2133) - and
+    // the vertex stage runs in full on BOTH, because face culling happens
+    // after it. Splat quads are camera-facing billboards with one winding,
+    // so one of those passes shades every splat and emits zero fragments:
+    // 100% waste of the dominant per-frame cost (field-measured 2026-08-21:
+    // splat COUNT, not resolution, dominates on iPhone 13 / Pixel 4).
+    // With a single pass, side stays DoubleSide => cullMode none => identical
+    // coverage, in the correct depth-sorted order.
+    this.forceSinglePass = true;
     this.blending = CustomBlending;
     this.blendEquation = AddEquation;
     this.blendSrc = OneFactor;
