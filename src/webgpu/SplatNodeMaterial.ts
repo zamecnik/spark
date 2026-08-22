@@ -162,6 +162,12 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
   pickMode = uniform(0.0);
   pickNear = uniform(0.0);
   pickFar = uniform(1.0);
+  // Kroscloud [T1-3]: vertex early-exit A/B gate. 1 (default) = the cheap
+  // centre-only rejects guard the expensive phase-2 body; 0 = the guard is
+  // uniformly true, which restores the pre-T1-3 straight-line body exactly.
+  // Diagnostic only - the two states are specified to be pixel-identical,
+  // and the SSIM harness is what proves it.
+  earlyExit = uniform(1.0);
   minAlpha = uniform(0.5 * (1.0 / 255.0));
   preBlurAmount = uniform(0.0);
   blurAmount = uniform(0.3);
@@ -209,10 +215,41 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
     const uFalloff = this.falloff;
 
     // The GLSL uses early `return` (gl_Position pre-set outside the
-    // frustum); r185 TSL has no valued Return, so the port is straight-line
-    // with an accumulated `rejected` flag and a final select. Rejected lanes
-    // may compute inf/NaN downstream — the select masks them, and NaN
-    // comparisons (always false) can never un-set `rejected`.
+    // frustum); r185 TSL has no valued Return, so the port keeps an
+    // accumulated `rejected` flag and a final select. [T1-3] splits the body
+    // in two: PHASE 1 runs the three CENTRE-ONLY rejects (behind-camera,
+    // near/far, clipXY guard band) against nothing but the unpacked centre;
+    // PHASE 2 - SH, the parity lattice, the covariance/Jacobian/2D-cov/eigen
+    // chain and the fill gates - runs inside `If(rejected.not(), ...)`, so a
+    // splat that cannot produce a pixel pays only the centre transform.
+    //
+    // Why this is output-IDENTICAL, not an approximation:
+    //   - `rejected` is a monotone OR accumulator and nothing reads it
+    //     mid-body, so hoisting three of its terms cannot change its final
+    //     value, and the guarded terms can only re-assert an already-true
+    //     flag. The order of the terms INSIDE phase 2 is untouched (the
+    //     alpha rejects still run after parityQuantize, which is what makes
+    //     them what they are).
+    //   - the guarded block writes ONLY vars declared outside it. r185's
+    //     WGSLNodeBuilder sets allowGlobalVariables = true (:327) and emits
+    //     every `.toVar()` as a MODULE-scope `var<private>` in the vertex
+    //     template (:2515-2532; NodeBuilder.getVarFromNode :2114), so a var
+    //     assigned inside an If and read after it is legal WGSL and reads
+    //     the zero value when the branch is skipped. Varyings likewise live
+    //     in `var<private> varyings : VaryingsStruct`. NOTE the corollary:
+    //     never let a value be FIRST generated inside the block and read at
+    //     top level unless it is such a var - three only re-emits hoisted
+    //     flow code into another BLOCK (NodeBuilder.addFlowCodeHierarchy),
+    //     never back out to the top level.
+    //   - centre-rejected lanes emit rejectPos (z/w = 2), so their quad is
+    //     clipped whole and never samples the varyings left unwritten.
+    // Lanes rejected INSIDE the block may still compute inf/NaN downstream -
+    // the final select masks them, and NaN comparisons (always false) can
+    // never un-set `rejected`.
+    //
+    // `earlyExit` = 0 makes the guard uniformly true, restoring the exact
+    // pre-T1-3 straight-line body for an in-session A/B with nothing else
+    // varying (WebGpuSplatBackend.applyPerFrame / __kcSplatEarlyExit).
     this.vertexNode = Fn(() => {
       const rejectPos = vec4(0.0, 0.0, 2.0, 1.0); // outside the frustum
       const rejected = bool(false).toVar();
@@ -255,90 +292,11 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
       );
       const center = unpacked.center;
       const quaternion = unpacked.quaternion;
-      const scales = vec3(unpacked.scales.mul(this.renderToViewScale)).toVar();
-      const rgba = vec4(unpacked.rgba).toVar();
 
-      // File u8 ×2 applied EXACTLY ONCE (lodOpacity encoding); see header.
-      if (lodOpacity) {
-        rgba.a.assign(rgba.a.mul(2.0));
-      }
-
-      // SH added at read time in object space (stock fetchSplat), with the
-      // per-frame camera (plan-blessed deviation #1).
-      if (sh1Texture) {
-        const viewDir = normalize(center.sub(this.viewOrigin));
-        const shRgb = evaluatePackedShTsl({
-          coord: texCoord,
-          viewDir,
-          shMax: this.shMax,
-          sh1Texture,
-          sh2Texture,
-          sh3Texture,
-        });
-        // (no multi-component swizzle assignment in WGSL — rebuild the vec4)
-        rgba.assign(vec4(rgba.rgb.add(shRgb), rgba.a));
-      }
-
-      if (parityQuantize) {
-        // Accumulator repack lattice (packSplatEncoding with the DEFAULT
-        // encoding + the halve/re-double alpha round trip); see header.
-        const rgbQ = round(clamp(rgba.rgb.mul(255.0), 0.0, 255.0)).div(255.0);
-        const aQ = round(clamp(rgba.a.mul(0.5).mul(255.0), 0.0, 255.0))
-          .div(255.0)
-          .mul(2.0);
-        rgba.assign(vec4(rgbQ, aQ));
-        const lnScaleScale = float(254.0 / (LN_SCALE_MAX - LN_SCALE_MIN));
-        const requantScale = (s: TslNode) =>
-          select(
-            s.equal(0.0),
-            float(0.0),
-            exp(
-              round(
-                clamp(
-                  s.log().sub(LN_SCALE_MIN).mul(lnScaleScale),
-                  0.0,
-                  254.0,
-                ),
-              )
-                .div(lnScaleScale)
-                .add(LN_SCALE_MIN),
-            ),
-          );
-        scales.assign(
-          vec3(
-            requantScale(scales.x),
-            requantScale(scales.y),
-            requantScale(scales.z),
-          ),
-        );
-      }
-
-      // -- splatVertex.glsl main(), non-ext non-cov path ---------------------
-      const zeroScales = scales.equal(vec3(0.0));
-      rejected.assign(rejected.or(zeroScales.all()));
-
-      rejected.assign(
-        rejected.or(rgba.a.equal(0.0)).or(rgba.a.lessThan(uMinAlpha)),
-      );
-
-      const adjustedStdDev = float(uMaxStdDev).toVar();
-      If(rgba.a.greaterThan(1.0), () => {
-        // Stretch 1..2 to 1..5
-        rgba.a.assign(min(rgba.a.mul(4.0).sub(3.0), 5.0));
-
-        if (lodInflate) {
-          // Adjust size to compensate for loss of opacity
-          const opacity = exp(
-            rgba.a.mul(rgba.a).sub(1.0).div(2.718281828459045),
-          );
-          const rescale = pow(opacity, 1.0 / 3.0);
-          scales.assign(scales.mul(rescale));
-          rgba.a.assign(1.0);
-        }
-
-        // Expand the maximum std dev to approximately cover the larger range
-        adjustedStdDev.assign(uMaxStdDev.add(rgba.a.sub(1.0).mul(0.7)));
-      });
+      // -- PHASE 1 [T1-3]: centre-only rejects -------------------------------
+      // Hoisted VERBATIM from their old position after the SH / parity /
+      // covariance work; every input here is the unpacked centre plus
+      // camera state, so none of it depends on what phase 2 computes.
 
       // Compute the view space center of the splat
       const viewCenter = quatVecTsl(
@@ -366,169 +324,263 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
           .or(clipCenter.y.abs().greaterThan(clip)),
       );
 
-      vRgba.assign(rgba);
-      vSplatUv.assign(positionGeometry.xy.mul(adjustedStdDev));
+      // -- PHASE 2 [T1-3]: work only a drawable splat needs ------------------
+      // Declared out here so the emitted WGSL puts them at module scope and
+      // the tail below can read them (see the note in the header).
+      const scales = vec3(0.0, 0.0, 0.0).toVar();
+      const rgba = vec4(0.0, 0.0, 0.0, 0.0).toVar();
+      const ndcOffset = vec2(0.0, 0.0).toVar();
 
-      // Compute view space quaternion of splat
-      const viewQuaternion = quatQuatTsl(this.renderToViewQuat, quaternion);
+      If(rejected.not().or(this.earlyExit.lessThan(0.5)), () => {
+        scales.assign(vec3(unpacked.scales.mul(this.renderToViewScale)));
+        rgba.assign(vec4(unpacked.rgba));
 
-      // (enable2DGS zero-thickness branch not ported — see header)
+        // File u8 ×2 applied EXACTLY ONCE (lodOpacity encoding); see header.
+        if (lodOpacity) {
+          rgba.a.assign(rgba.a.mul(2.0));
+        }
 
-      // Compute the 3D covariance matrix of the splat
-      const [rsC0, rsC1, rsC2] = scaleQuaternionToMatrixColumnsTsl(
-        scales,
-        viewQuaternion,
-      );
-      // mat3 from three column vec3s — how three itself builds TBN matrices;
-      // the 0.180 type declarations only list the 1/9-scalar overloads.
-      const RS = (mat3 as TslNode)(rsC0, rsC1, rsC2);
-      const cov3D = RS.mul(transpose(RS));
+        // SH added at read time in object space (stock fetchSplat), with the
+        // per-frame camera (plan-blessed deviation #1).
+        if (sh1Texture) {
+          const viewDir = normalize(center.sub(this.viewOrigin));
+          const shRgb = evaluatePackedShTsl({
+            coord: texCoord,
+            viewDir,
+            shMax: this.shMax,
+            sh1Texture,
+            sh2Texture,
+            sh3Texture,
+          });
+          // (no multi-component swizzle assignment in WGSL — rebuild the vec4)
+          rgba.assign(vec4(rgba.rgb.add(shRgb), rgba.a));
+        }
 
-      // Compute the Jacobian of the splat's projection at its center.
-      // Column-major literal port of the GLSL mat3 constructors.
-      const scaledRenderSize = vec2(this.renderSize).mul(this.focalAdjustment);
-      const focal = scaledRenderSize
-        .mul(0.5)
-        .mul(
-          vec2(
-            cameraProjectionMatrix.element(int(0)).element(int(0)),
-            cameraProjectionMatrix.element(int(1)).element(int(1)),
+        if (parityQuantize) {
+          // Accumulator repack lattice (packSplatEncoding with the DEFAULT
+          // encoding + the halve/re-double alpha round trip); see header.
+          const rgbQ = round(clamp(rgba.rgb.mul(255.0), 0.0, 255.0)).div(255.0);
+          const aQ = round(clamp(rgba.a.mul(0.5).mul(255.0), 0.0, 255.0))
+            .div(255.0)
+            .mul(2.0);
+          rgba.assign(vec4(rgbQ, aQ));
+          const lnScaleScale = float(254.0 / (LN_SCALE_MAX - LN_SCALE_MIN));
+          const requantScale = (s: TslNode) =>
+            select(
+              s.equal(0.0),
+              float(0.0),
+              exp(
+                round(
+                  clamp(
+                    s.log().sub(LN_SCALE_MIN).mul(lnScaleScale),
+                    0.0,
+                    254.0,
+                  ),
+                )
+                  .div(lnScaleScale)
+                  .add(LN_SCALE_MIN),
+              ),
+            );
+          scales.assign(
+            vec3(
+              requantScale(scales.x),
+              requantScale(scales.y),
+              requantScale(scales.z),
+            ),
+          );
+        }
+
+        // -- splatVertex.glsl main(), non-ext non-cov path ---------------------
+        const zeroScales = scales.equal(vec3(0.0));
+        rejected.assign(rejected.or(zeroScales.all()));
+
+        rejected.assign(
+          rejected.or(rgba.a.equal(0.0)).or(rgba.a.lessThan(uMinAlpha)),
+        );
+
+        const adjustedStdDev = float(uMaxStdDev).toVar();
+        If(rgba.a.greaterThan(1.0), () => {
+          // Stretch 1..2 to 1..5
+          rgba.a.assign(min(rgba.a.mul(4.0).sub(3.0), 5.0));
+
+          if (lodInflate) {
+            // Adjust size to compensate for loss of opacity
+            const opacity = exp(
+              rgba.a.mul(rgba.a).sub(1.0).div(2.718281828459045),
+            );
+            const rescale = pow(opacity, 1.0 / 3.0);
+            scales.assign(scales.mul(rescale));
+            rgba.a.assign(1.0);
+          }
+
+          // Expand the maximum std dev to approximately cover the larger range
+          adjustedStdDev.assign(uMaxStdDev.add(rgba.a.sub(1.0).mul(0.7)));
+        });
+
+        vRgba.assign(rgba);
+        vSplatUv.assign(positionGeometry.xy.mul(adjustedStdDev));
+
+        // Compute view space quaternion of splat
+        const viewQuaternion = quatQuatTsl(this.renderToViewQuat, quaternion);
+
+        // (enable2DGS zero-thickness branch not ported — see header)
+
+        // Compute the 3D covariance matrix of the splat
+        const [rsC0, rsC1, rsC2] = scaleQuaternionToMatrixColumnsTsl(
+          scales,
+          viewQuaternion,
+        );
+        // mat3 from three column vec3s — how three itself builds TBN matrices;
+        // the 0.180 type declarations only list the 1/9-scalar overloads.
+        const RS = (mat3 as TslNode)(rsC0, rsC1, rsC2);
+        const cov3D = RS.mul(transpose(RS));
+
+        // Compute the Jacobian of the splat's projection at its center.
+        // Column-major literal port of the GLSL mat3 constructors.
+        const scaledRenderSize = vec2(this.renderSize).mul(this.focalAdjustment);
+        const focal = scaledRenderSize
+          .mul(0.5)
+          .mul(
+            vec2(
+              cameraProjectionMatrix.element(int(0)).element(int(0)),
+              cameraProjectionMatrix.element(int(1)).element(int(1)),
+            ),
+          );
+
+        const isOrthographic = cameraProjectionMatrix
+          .element(int(2))
+          .element(int(3))
+          .notEqual(-1.0);
+        const invZ = float(1.0).div(viewCenter.z);
+        const J1 = focal.mul(invZ);
+        const J2 = J1.mul(viewCenter.xy).negate().mul(invZ);
+        const jC0 = select(
+          isOrthographic,
+          vec3(focal.x, 0.0, 0.0),
+          vec3(J1.x, 0.0, J2.x),
+        );
+        const jC1 = select(
+          isOrthographic,
+          vec3(0.0, focal.y, 0.0),
+          vec3(0.0, J1.y, J2.y),
+        );
+        const J = (mat3 as TslNode)(jC0, jC1, vec3(0.0, 0.0, 0.0));
+
+        // Compute the 2D covariance by projecting the 3D covariance
+        // and picking out the XY plane components.
+        const cov2D = transpose(J).mul(cov3D).mul(J);
+        const a = float(cov2D.element(int(0)).element(int(0))).toVar();
+        const d = float(cov2D.element(int(1)).element(int(1))).toVar();
+        const b = cov2D.element(int(0)).element(int(1));
+
+        // Optionally pre-blur the splat to match non-antialias optimized splats
+        a.addAssign(this.preBlurAmount);
+        d.addAssign(this.preBlurAmount);
+
+        // (depth-of-field focusRadius branch not ported — see header)
+        const fullBlurAmount = this.blurAmount;
+
+        // Do convolution with a 0.5-pixel Gaussian for anti-aliasing
+        const detOrig = a.mul(d).sub(b.mul(b));
+        a.addAssign(fullBlurAmount);
+        d.addAssign(fullBlurAmount);
+        const det = a.mul(d).sub(b.mul(b));
+
+        // Compute anti-aliasing intensity scaling factor
+        const blurAdjust = sqrt(max(0.0, detOrig.div(det)));
+        const rawAlpha = rgba.a.toVar("kcRawAlpha");
+        rgba.a.assign(rgba.a.mul(blurAdjust));
+        rejected.assign(rejected.or(rgba.a.lessThan(uMinAlpha)));
+        vRgba.a.assign(rgba.a);
+        vAdjustedStdDev.assign(adjustedStdDev);
+
+        // SSOG_FILL_V2 elements 1 + 3-discard (§2.6; CORRECTED [ssog-8] —
+        // RAW alpha × POST-blur (dilated) det, upstream compute-path
+        // semantics; the old post-blurAdjust form cancelled the dilation and
+        // tested true undilated ink, deleting every σ≤0.4 px splat at any
+        // opacity = the far-view dense-region black patches). GLSL twin in
+        // splatVertex.glsl.
+        const fillOn = this.ssogFillV2.greaterThan(0.5);
+        rejected.assign(
+          rejected.or(fillOn.and(rawAlpha.lessThan(1.0 / 255.0))),
+        );
+        rejected.assign(
+          rejected.or(
+            fillOn.and(
+              rawAlpha
+                .mul(6.2831853071795862)
+                .mul(sqrt(max(det, 0.0)))
+                .lessThan(this.ssogMinContribution),
+            ),
           ),
         );
 
-      const isOrthographic = cameraProjectionMatrix
-        .element(int(2))
-        .element(int(3))
-        .notEqual(-1.0);
-      const invZ = float(1.0).div(viewCenter.z);
-      const J1 = focal.mul(invZ);
-      const J2 = J1.mul(viewCenter.xy).negate().mul(invZ);
-      const jC0 = select(
-        isOrthographic,
-        vec3(focal.x, 0.0, 0.0),
-        vec3(J1.x, 0.0, J2.x),
-      );
-      const jC1 = select(
-        isOrthographic,
-        vec3(0.0, focal.y, 0.0),
-        vec3(0.0, J1.y, J2.y),
-      );
-      const J = (mat3 as TslNode)(jC0, jC1, vec3(0.0, 0.0, 0.0));
+        // Compute the eigenvalues and eigenvectors of the 2D covariance matrix
+        const eigenAvg = a.add(d).mul(0.5);
+        const eigenDelta = sqrt(max(0.0, eigenAvg.mul(eigenAvg).sub(det)));
+        const eigen1 = eigenAvg.add(eigenDelta);
+        const eigen2 = eigenAvg.sub(eigenDelta);
 
-      // Compute the 2D covariance by projecting the 3D covariance
-      // and picking out the XY plane components.
-      const cov2D = transpose(J).mul(cov3D).mul(J);
-      const a = float(cov2D.element(int(0)).element(int(0))).toVar();
-      const d = float(cov2D.element(int(1)).element(int(1))).toVar();
-      const b = cov2D.element(int(0)).element(int(1));
-
-      // Optionally pre-blur the splat to match non-antialias optimized splats
-      a.addAssign(this.preBlurAmount);
-      d.addAssign(this.preBlurAmount);
-
-      // (depth-of-field focusRadius branch not ported — see header)
-      const fullBlurAmount = this.blurAmount;
-
-      // Do convolution with a 0.5-pixel Gaussian for anti-aliasing
-      const detOrig = a.mul(d).sub(b.mul(b));
-      a.addAssign(fullBlurAmount);
-      d.addAssign(fullBlurAmount);
-      const det = a.mul(d).sub(b.mul(b));
-
-      // Compute anti-aliasing intensity scaling factor
-      const blurAdjust = sqrt(max(0.0, detOrig.div(det)));
-      const rawAlpha = rgba.a.toVar("kcRawAlpha");
-      rgba.a.assign(rgba.a.mul(blurAdjust));
-      rejected.assign(rejected.or(rgba.a.lessThan(uMinAlpha)));
-      vRgba.a.assign(rgba.a);
-      vAdjustedStdDev.assign(adjustedStdDev);
-
-      // SSOG_FILL_V2 elements 1 + 3-discard (§2.6; CORRECTED [ssog-8] —
-      // RAW alpha × POST-blur (dilated) det, upstream compute-path
-      // semantics; the old post-blurAdjust form cancelled the dilation and
-      // tested true undilated ink, deleting every σ≤0.4 px splat at any
-      // opacity = the far-view dense-region black patches). GLSL twin in
-      // splatVertex.glsl.
-      const fillOn = this.ssogFillV2.greaterThan(0.5);
-      rejected.assign(
-        rejected.or(fillOn.and(rawAlpha.lessThan(1.0 / 255.0))),
-      );
-      rejected.assign(
-        rejected.or(
-          fillOn.and(
-            rawAlpha
-              .mul(6.2831853071795862)
-              .mul(sqrt(max(det, 0.0)))
-              .lessThan(this.ssogMinContribution),
+        const eigenVec1 = select(
+          b.abs().greaterThan(0.001),
+          normalize(vec2(b, eigen1.sub(a))),
+          select(
+            a.greaterThanEqual(d),
+            vec2(1.0, 0.0),
+            vec2(0.0, 1.0),
           ),
-        ),
-      );
-
-      // Compute the eigenvalues and eigenvectors of the 2D covariance matrix
-      const eigenAvg = a.add(d).mul(0.5);
-      const eigenDelta = sqrt(max(0.0, eigenAvg.mul(eigenAvg).sub(det)));
-      const eigen1 = eigenAvg.add(eigenDelta);
-      const eigen2 = eigenAvg.sub(eigenDelta);
-
-      const eigenVec1 = select(
-        b.abs().greaterThan(0.001),
-        normalize(vec2(b, eigen1.sub(a))),
-        select(
-          a.greaterThanEqual(d),
-          vec2(1.0, 0.0),
-          vec2(0.0, 1.0),
-        ),
-      );
-      const eigenVec2 = vec2(eigenVec1.y, eigenVec1.x.negate());
-
-      // maxPixelRadius clamp AFTER the adjustedStdDev multiply
-      const r1 = adjustedStdDev.mul(sqrt(eigen1));
-      const r2 = adjustedStdDev.mul(sqrt(eigen2));
-      // SSOG_FILL_V2 element 2 (§2.6): kernel cap WITH covariance rescale —
-      // upstream's viewport-adaptive cap, BOTH axes scaled by one factor so
-      // anisotropy survives; element 3 (alpha quad shrink): beyond z*
-      // std-devs the falloff drops below alphaClip = 1/255 — shrink the quad
-      // AND the UV span together (same pixels-per-std-dev, identical
-      // Gaussian, fewer pixels filled). GLSL twin in splatVertex.glsl.
-      const fillCap = min(
-        1024.0,
-        min(this.renderSize.x, this.renderSize.y),
-      );
-      const capScale = min(1.0, fillCap.div(max(r1, r2)));
-      const zStar = sqrt(
-        max(0.0, log(rgba.a.mul(255.0))).mul(2.0),
-      );
-      const quadScale = min(1.0, zStar.div(adjustedStdDev));
-      const scale1 = select(
-        fillOn,
-        r1.mul(capScale).mul(quadScale),
-        min(this.maxPixelRadius, r1),
-      );
-      const scale2 = select(
-        fillOn,
-        r2.mul(capScale).mul(quadScale),
-        min(this.maxPixelRadius, r2),
-      );
-      If(fillOn, () => {
-        vSplatUv.assign(
-          positionGeometry.xy.mul(adjustedStdDev.mul(quadScale)),
         );
+        const eigenVec2 = vec2(eigenVec1.y, eigenVec1.x.negate());
+
+        // maxPixelRadius clamp AFTER the adjustedStdDev multiply
+        const r1 = adjustedStdDev.mul(sqrt(eigen1));
+        const r2 = adjustedStdDev.mul(sqrt(eigen2));
+        // SSOG_FILL_V2 element 2 (§2.6): kernel cap WITH covariance rescale —
+        // upstream's viewport-adaptive cap, BOTH axes scaled by one factor so
+        // anisotropy survives; element 3 (alpha quad shrink): beyond z*
+        // std-devs the falloff drops below alphaClip = 1/255 — shrink the quad
+        // AND the UV span together (same pixels-per-std-dev, identical
+        // Gaussian, fewer pixels filled). GLSL twin in splatVertex.glsl.
+        const fillCap = min(
+          1024.0,
+          min(this.renderSize.x, this.renderSize.y),
+        );
+        const capScale = min(1.0, fillCap.div(max(r1, r2)));
+        const zStar = sqrt(
+          max(0.0, log(rgba.a.mul(255.0))).mul(2.0),
+        );
+        const quadScale = min(1.0, zStar.div(adjustedStdDev));
+        const scale1 = select(
+          fillOn,
+          r1.mul(capScale).mul(quadScale),
+          min(this.maxPixelRadius, r1),
+        );
+        const scale2 = select(
+          fillOn,
+          r2.mul(capScale).mul(quadScale),
+          min(this.maxPixelRadius, r2),
+        );
+        If(fillOn, () => {
+          vSplatUv.assign(
+            positionGeometry.xy.mul(adjustedStdDev.mul(quadScale)),
+          );
+        });
+        rejected.assign(
+          rejected.or(
+            scale1
+              .lessThan(this.minPixelRadius)
+              .and(scale2.lessThan(this.minPixelRadius)),
+          ),
+        );
+
+        // Compute the NDC coordinates for the ellipsoid's diagonal axes.
+        const posXY = positionGeometry.xy;
+        const pixelOffset = eigenVec1
+          .mul(scale1)
+          .mul(posXY.x)
+          .add(eigenVec2.mul(scale2).mul(posXY.y));
+        ndcOffset.assign(vec2(2.0).div(scaledRenderSize).mul(pixelOffset));
       });
-      rejected.assign(
-        rejected.or(
-          scale1
-            .lessThan(this.minPixelRadius)
-            .and(scale2.lessThan(this.minPixelRadius)),
-        ),
-      );
-
-      // Compute the NDC coordinates for the ellipsoid's diagonal axes.
-      const posXY = positionGeometry.xy;
-      const pixelOffset = eigenVec1
-        .mul(scale1)
-        .mul(posXY.x)
-        .add(eigenVec2.mul(scale2).mul(posXY.y));
-      const ndcOffset = vec2(2.0).div(scaledRenderSize).mul(pixelOffset);
 
       // Compute NDC center of the splat
       const ndcCenter = clipCenter.xyz.div(clipCenter.w);

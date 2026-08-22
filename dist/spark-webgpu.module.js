@@ -1,5 +1,5 @@
 import * as TSL from "three/tsl";
-import { uint, float, vec2, max, select, normalize, vec3, vec4, ivec3, int, exp, textureLoad, uniform, varyingProperty, Fn, bool, instanceIndex, ivec2, round, clamp, If, min, pow, cameraProjectionMatrix, positionGeometry, mat3, transpose, sqrt, log, dot, Discard, mix, instancedArray, workgroupArray, workgroupId, invocationLocalIndex, workgroupBarrier, atomicStore, atomicAdd, atomicLoad, atomicOr, Return } from "three/tsl";
+import { uint, float, vec2, max, select, normalize, vec3, vec4, ivec3, int, exp, textureLoad, uniform, varyingProperty, Fn, bool, instanceIndex, ivec2, cameraProjectionMatrix, If, round, clamp, min, pow, positionGeometry, mat3, transpose, sqrt, log, dot, Discard, mix, instancedArray, workgroupArray, workgroupId, invocationLocalIndex, workgroupBarrier, atomicStore, atomicAdd, atomicLoad, atomicOr, Return } from "three/tsl";
 import { MeshBasicNodeMaterial, Vector2, Vector4, Vector3, DoubleSide, CustomBlending, AddEquation, OneFactor, OneMinusSrcAlphaFactor, Matrix4, Quaternion } from "three/webgpu";
 import { d as kcDisposeOldMaterial, b as kcRegrowLog } from "./kcRegrowDebug-gV7aMG4z.js";
 const unpackHalf2x16$1 = TSL.unpackHalf2x16;
@@ -229,6 +229,7 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
     this.pickMode = uniform(0);
     this.pickNear = uniform(0);
     this.pickFar = uniform(1);
+    this.earlyExit = uniform(1);
     this.minAlpha = uniform(0.5 * (1 / 255));
     this.preBlurAmount = uniform(0);
     this.blurAmount = uniform(0.3);
@@ -297,67 +298,6 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
       );
       const center = unpacked.center;
       const quaternion = unpacked.quaternion;
-      const scales = vec3(unpacked.scales.mul(this.renderToViewScale)).toVar();
-      const rgba = vec4(unpacked.rgba).toVar();
-      if (lodOpacity) {
-        rgba.a.assign(rgba.a.mul(2));
-      }
-      if (sh1Texture) {
-        const viewDir = normalize(center.sub(this.viewOrigin));
-        const shRgb = evaluatePackedShTsl({
-          coord: texCoord,
-          viewDir,
-          shMax: this.shMax,
-          sh1Texture,
-          sh2Texture,
-          sh3Texture
-        });
-        rgba.assign(vec4(rgba.rgb.add(shRgb), rgba.a));
-      }
-      if (parityQuantize) {
-        const rgbQ = round(clamp(rgba.rgb.mul(255), 0, 255)).div(255);
-        const aQ = round(clamp(rgba.a.mul(0.5).mul(255), 0, 255)).div(255).mul(2);
-        rgba.assign(vec4(rgbQ, aQ));
-        const lnScaleScale = float(254 / (LN_SCALE_MAX - LN_SCALE_MIN));
-        const requantScale = (s) => select(
-          s.equal(0),
-          float(0),
-          exp(
-            round(
-              clamp(
-                s.log().sub(LN_SCALE_MIN).mul(lnScaleScale),
-                0,
-                254
-              )
-            ).div(lnScaleScale).add(LN_SCALE_MIN)
-          )
-        );
-        scales.assign(
-          vec3(
-            requantScale(scales.x),
-            requantScale(scales.y),
-            requantScale(scales.z)
-          )
-        );
-      }
-      const zeroScales = scales.equal(vec3(0));
-      rejected.assign(rejected.or(zeroScales.all()));
-      rejected.assign(
-        rejected.or(rgba.a.equal(0)).or(rgba.a.lessThan(uMinAlpha))
-      );
-      const adjustedStdDev = float(uMaxStdDev).toVar();
-      If(rgba.a.greaterThan(1), () => {
-        rgba.a.assign(min(rgba.a.mul(4).sub(3), 5));
-        if (lodInflate) {
-          const opacity = exp(
-            rgba.a.mul(rgba.a).sub(1).div(2.718281828459045)
-          );
-          const rescale = pow(opacity, 1 / 3);
-          scales.assign(scales.mul(rescale));
-          rgba.a.assign(1);
-        }
-        adjustedStdDev.assign(uMaxStdDev.add(rgba.a.sub(1).mul(0.7)));
-      });
       const viewCenter = quatVecTsl(
         this.renderToViewQuat,
         center.mul(this.renderToViewScale)
@@ -372,113 +312,179 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
       rejected.assign(
         rejected.or(clipCenter.x.abs().greaterThan(clip)).or(clipCenter.y.abs().greaterThan(clip))
       );
-      vRgba.assign(rgba);
-      vSplatUv.assign(positionGeometry.xy.mul(adjustedStdDev));
-      const viewQuaternion = quatQuatTsl(this.renderToViewQuat, quaternion);
-      const [rsC0, rsC1, rsC2] = scaleQuaternionToMatrixColumnsTsl(
-        scales,
-        viewQuaternion
-      );
-      const RS = mat3(rsC0, rsC1, rsC2);
-      const cov3D = RS.mul(transpose(RS));
-      const scaledRenderSize = vec2(this.renderSize).mul(this.focalAdjustment);
-      const focal = scaledRenderSize.mul(0.5).mul(
-        vec2(
-          cameraProjectionMatrix.element(int(0)).element(int(0)),
-          cameraProjectionMatrix.element(int(1)).element(int(1))
-        )
-      );
-      const isOrthographic = cameraProjectionMatrix.element(int(2)).element(int(3)).notEqual(-1);
-      const invZ = float(1).div(viewCenter.z);
-      const J1 = focal.mul(invZ);
-      const J2 = J1.mul(viewCenter.xy).negate().mul(invZ);
-      const jC0 = select(
-        isOrthographic,
-        vec3(focal.x, 0, 0),
-        vec3(J1.x, 0, J2.x)
-      );
-      const jC1 = select(
-        isOrthographic,
-        vec3(0, focal.y, 0),
-        vec3(0, J1.y, J2.y)
-      );
-      const J = mat3(jC0, jC1, vec3(0, 0, 0));
-      const cov2D = transpose(J).mul(cov3D).mul(J);
-      const a = float(cov2D.element(int(0)).element(int(0))).toVar();
-      const d = float(cov2D.element(int(1)).element(int(1))).toVar();
-      const b = cov2D.element(int(0)).element(int(1));
-      a.addAssign(this.preBlurAmount);
-      d.addAssign(this.preBlurAmount);
-      const fullBlurAmount = this.blurAmount;
-      const detOrig = a.mul(d).sub(b.mul(b));
-      a.addAssign(fullBlurAmount);
-      d.addAssign(fullBlurAmount);
-      const det = a.mul(d).sub(b.mul(b));
-      const blurAdjust = sqrt(max(0, detOrig.div(det)));
-      const rawAlpha = rgba.a.toVar("kcRawAlpha");
-      rgba.a.assign(rgba.a.mul(blurAdjust));
-      rejected.assign(rejected.or(rgba.a.lessThan(uMinAlpha)));
-      vRgba.a.assign(rgba.a);
-      vAdjustedStdDev.assign(adjustedStdDev);
-      const fillOn = this.ssogFillV2.greaterThan(0.5);
-      rejected.assign(
-        rejected.or(fillOn.and(rawAlpha.lessThan(1 / 255)))
-      );
-      rejected.assign(
-        rejected.or(
-          fillOn.and(
-            rawAlpha.mul(6.283185307179586).mul(sqrt(max(det, 0))).lessThan(this.ssogMinContribution)
-          )
-        )
-      );
-      const eigenAvg = a.add(d).mul(0.5);
-      const eigenDelta = sqrt(max(0, eigenAvg.mul(eigenAvg).sub(det)));
-      const eigen1 = eigenAvg.add(eigenDelta);
-      const eigen2 = eigenAvg.sub(eigenDelta);
-      const eigenVec1 = select(
-        b.abs().greaterThan(1e-3),
-        normalize(vec2(b, eigen1.sub(a))),
-        select(
-          a.greaterThanEqual(d),
-          vec2(1, 0),
-          vec2(0, 1)
-        )
-      );
-      const eigenVec2 = vec2(eigenVec1.y, eigenVec1.x.negate());
-      const r1 = adjustedStdDev.mul(sqrt(eigen1));
-      const r2 = adjustedStdDev.mul(sqrt(eigen2));
-      const fillCap = min(
-        1024,
-        min(this.renderSize.x, this.renderSize.y)
-      );
-      const capScale = min(1, fillCap.div(max(r1, r2)));
-      const zStar = sqrt(
-        max(0, log(rgba.a.mul(255))).mul(2)
-      );
-      const quadScale = min(1, zStar.div(adjustedStdDev));
-      const scale1 = select(
-        fillOn,
-        r1.mul(capScale).mul(quadScale),
-        min(this.maxPixelRadius, r1)
-      );
-      const scale2 = select(
-        fillOn,
-        r2.mul(capScale).mul(quadScale),
-        min(this.maxPixelRadius, r2)
-      );
-      If(fillOn, () => {
-        vSplatUv.assign(
-          positionGeometry.xy.mul(adjustedStdDev.mul(quadScale))
+      const scales = vec3(0, 0, 0).toVar();
+      const rgba = vec4(0, 0, 0, 0).toVar();
+      const ndcOffset = vec2(0, 0).toVar();
+      If(rejected.not().or(this.earlyExit.lessThan(0.5)), () => {
+        scales.assign(vec3(unpacked.scales.mul(this.renderToViewScale)));
+        rgba.assign(vec4(unpacked.rgba));
+        if (lodOpacity) {
+          rgba.a.assign(rgba.a.mul(2));
+        }
+        if (sh1Texture) {
+          const viewDir = normalize(center.sub(this.viewOrigin));
+          const shRgb = evaluatePackedShTsl({
+            coord: texCoord,
+            viewDir,
+            shMax: this.shMax,
+            sh1Texture,
+            sh2Texture,
+            sh3Texture
+          });
+          rgba.assign(vec4(rgba.rgb.add(shRgb), rgba.a));
+        }
+        if (parityQuantize) {
+          const rgbQ = round(clamp(rgba.rgb.mul(255), 0, 255)).div(255);
+          const aQ = round(clamp(rgba.a.mul(0.5).mul(255), 0, 255)).div(255).mul(2);
+          rgba.assign(vec4(rgbQ, aQ));
+          const lnScaleScale = float(254 / (LN_SCALE_MAX - LN_SCALE_MIN));
+          const requantScale = (s) => select(
+            s.equal(0),
+            float(0),
+            exp(
+              round(
+                clamp(
+                  s.log().sub(LN_SCALE_MIN).mul(lnScaleScale),
+                  0,
+                  254
+                )
+              ).div(lnScaleScale).add(LN_SCALE_MIN)
+            )
+          );
+          scales.assign(
+            vec3(
+              requantScale(scales.x),
+              requantScale(scales.y),
+              requantScale(scales.z)
+            )
+          );
+        }
+        const zeroScales = scales.equal(vec3(0));
+        rejected.assign(rejected.or(zeroScales.all()));
+        rejected.assign(
+          rejected.or(rgba.a.equal(0)).or(rgba.a.lessThan(uMinAlpha))
         );
+        const adjustedStdDev = float(uMaxStdDev).toVar();
+        If(rgba.a.greaterThan(1), () => {
+          rgba.a.assign(min(rgba.a.mul(4).sub(3), 5));
+          if (lodInflate) {
+            const opacity = exp(
+              rgba.a.mul(rgba.a).sub(1).div(2.718281828459045)
+            );
+            const rescale = pow(opacity, 1 / 3);
+            scales.assign(scales.mul(rescale));
+            rgba.a.assign(1);
+          }
+          adjustedStdDev.assign(uMaxStdDev.add(rgba.a.sub(1).mul(0.7)));
+        });
+        vRgba.assign(rgba);
+        vSplatUv.assign(positionGeometry.xy.mul(adjustedStdDev));
+        const viewQuaternion = quatQuatTsl(this.renderToViewQuat, quaternion);
+        const [rsC0, rsC1, rsC2] = scaleQuaternionToMatrixColumnsTsl(
+          scales,
+          viewQuaternion
+        );
+        const RS = mat3(rsC0, rsC1, rsC2);
+        const cov3D = RS.mul(transpose(RS));
+        const scaledRenderSize = vec2(this.renderSize).mul(this.focalAdjustment);
+        const focal = scaledRenderSize.mul(0.5).mul(
+          vec2(
+            cameraProjectionMatrix.element(int(0)).element(int(0)),
+            cameraProjectionMatrix.element(int(1)).element(int(1))
+          )
+        );
+        const isOrthographic = cameraProjectionMatrix.element(int(2)).element(int(3)).notEqual(-1);
+        const invZ = float(1).div(viewCenter.z);
+        const J1 = focal.mul(invZ);
+        const J2 = J1.mul(viewCenter.xy).negate().mul(invZ);
+        const jC0 = select(
+          isOrthographic,
+          vec3(focal.x, 0, 0),
+          vec3(J1.x, 0, J2.x)
+        );
+        const jC1 = select(
+          isOrthographic,
+          vec3(0, focal.y, 0),
+          vec3(0, J1.y, J2.y)
+        );
+        const J = mat3(jC0, jC1, vec3(0, 0, 0));
+        const cov2D = transpose(J).mul(cov3D).mul(J);
+        const a = float(cov2D.element(int(0)).element(int(0))).toVar();
+        const d = float(cov2D.element(int(1)).element(int(1))).toVar();
+        const b = cov2D.element(int(0)).element(int(1));
+        a.addAssign(this.preBlurAmount);
+        d.addAssign(this.preBlurAmount);
+        const fullBlurAmount = this.blurAmount;
+        const detOrig = a.mul(d).sub(b.mul(b));
+        a.addAssign(fullBlurAmount);
+        d.addAssign(fullBlurAmount);
+        const det = a.mul(d).sub(b.mul(b));
+        const blurAdjust = sqrt(max(0, detOrig.div(det)));
+        const rawAlpha = rgba.a.toVar("kcRawAlpha");
+        rgba.a.assign(rgba.a.mul(blurAdjust));
+        rejected.assign(rejected.or(rgba.a.lessThan(uMinAlpha)));
+        vRgba.a.assign(rgba.a);
+        vAdjustedStdDev.assign(adjustedStdDev);
+        const fillOn = this.ssogFillV2.greaterThan(0.5);
+        rejected.assign(
+          rejected.or(fillOn.and(rawAlpha.lessThan(1 / 255)))
+        );
+        rejected.assign(
+          rejected.or(
+            fillOn.and(
+              rawAlpha.mul(6.283185307179586).mul(sqrt(max(det, 0))).lessThan(this.ssogMinContribution)
+            )
+          )
+        );
+        const eigenAvg = a.add(d).mul(0.5);
+        const eigenDelta = sqrt(max(0, eigenAvg.mul(eigenAvg).sub(det)));
+        const eigen1 = eigenAvg.add(eigenDelta);
+        const eigen2 = eigenAvg.sub(eigenDelta);
+        const eigenVec1 = select(
+          b.abs().greaterThan(1e-3),
+          normalize(vec2(b, eigen1.sub(a))),
+          select(
+            a.greaterThanEqual(d),
+            vec2(1, 0),
+            vec2(0, 1)
+          )
+        );
+        const eigenVec2 = vec2(eigenVec1.y, eigenVec1.x.negate());
+        const r1 = adjustedStdDev.mul(sqrt(eigen1));
+        const r2 = adjustedStdDev.mul(sqrt(eigen2));
+        const fillCap = min(
+          1024,
+          min(this.renderSize.x, this.renderSize.y)
+        );
+        const capScale = min(1, fillCap.div(max(r1, r2)));
+        const zStar = sqrt(
+          max(0, log(rgba.a.mul(255))).mul(2)
+        );
+        const quadScale = min(1, zStar.div(adjustedStdDev));
+        const scale1 = select(
+          fillOn,
+          r1.mul(capScale).mul(quadScale),
+          min(this.maxPixelRadius, r1)
+        );
+        const scale2 = select(
+          fillOn,
+          r2.mul(capScale).mul(quadScale),
+          min(this.maxPixelRadius, r2)
+        );
+        If(fillOn, () => {
+          vSplatUv.assign(
+            positionGeometry.xy.mul(adjustedStdDev.mul(quadScale))
+          );
+        });
+        rejected.assign(
+          rejected.or(
+            scale1.lessThan(this.minPixelRadius).and(scale2.lessThan(this.minPixelRadius))
+          )
+        );
+        const posXY = positionGeometry.xy;
+        const pixelOffset = eigenVec1.mul(scale1).mul(posXY.x).add(eigenVec2.mul(scale2).mul(posXY.y));
+        ndcOffset.assign(vec2(2).div(scaledRenderSize).mul(pixelOffset));
       });
-      rejected.assign(
-        rejected.or(
-          scale1.lessThan(this.minPixelRadius).and(scale2.lessThan(this.minPixelRadius))
-        )
-      );
-      const posXY = positionGeometry.xy;
-      const pixelOffset = eigenVec1.mul(scale1).mul(posXY.x).add(eigenVec2.mul(scale2).mul(posXY.y));
-      const ndcOffset = vec2(2).div(scaledRenderSize).mul(pixelOffset);
       const ndcCenter = clipCenter.xyz.div(clipCenter.w);
       const ndc = vec3(ndcCenter.xy.add(ndcOffset), ndcCenter.z);
       return select(
@@ -927,6 +933,7 @@ class WebGpuSplatBackend {
     mat.maxPixelRadius.value = spark.maxPixelRadius;
     mat.ssogFillV2.value = spark.ssogFillV2 ? 1 : 0;
     mat.ssogMinContribution.value = spark.ssogMinContribution;
+    mat.earlyExit.value = globalThis.__kcSplatEarlyExit === 0 ? 0 : 1;
     mat.pickMode.value = spark.pickMode ?? 0;
     mat.pickNear.value = spark.pickNear ?? 0;
     mat.pickFar.value = spark.pickFar ?? 1;

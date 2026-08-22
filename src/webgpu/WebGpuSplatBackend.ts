@@ -395,6 +395,17 @@ export class WebGpuSplatBackend {
     mat.maxPixelRadius.value = spark.maxPixelRadius;
     mat.ssogFillV2.value = spark.ssogFillV2 ? 1 : 0;
     mat.ssogMinContribution.value = spark.ssogMinContribution;
+    // [T1-3] vertex early-exit A/B gate. 1 = the shipped guarded body; 0
+    // makes the phase-2 guard uniformly true, i.e. the exact pre-T1-3
+    // straight-line shader, so the two can be flipped MID-SESSION with
+    // nothing else varying (the protocol that measured [ssog-11]). Read
+    // per frame, so `globalThis.__kcSplatEarlyExit = 0` from a remote
+    // inspector takes effect on the next frame; the viewer also maps
+    // `?splatearly=off` onto it for phones with no console.
+    mat.earlyExit.value =
+      (globalThis as { __kcSplatEarlyExit?: number }).__kcSplatEarlyExit === 0
+        ? 0
+        : 1;
     // [ssog-9] expected-depth pick mode + normalization window
     mat.pickMode.value = spark.pickMode ?? 0;
     mat.pickNear.value = spark.pickNear ?? 0;
