@@ -61,6 +61,7 @@ import {
   dot,
   exp,
   float,
+  fract,
   instanceIndex,
   int,
   ivec2,
@@ -145,8 +146,19 @@ export type SplatNodeMaterialOptions = {
   // ablation is a step change; if the cost is memory traffic or the draw
   // front-end, it barely moves - and the expensive rewrite would disappoint.
   //
-  // NOT pixel-correct. Diagnostic only.
-  vsMinimal?: boolean;
+  // Level 2 (?splatvsmin=2) goes one step further: it also drops the three
+  // per-vertex memory reads (order -> cut index -> packed texel) and the
+  // unpack, synthesising a centre arithmetically from `instanceIndex`. Level 1
+  // measured 125 -> 87 ms on the Pixel, i.e. the whole projection chain is
+  // only 30 % of the frame, so the remaining 87 ms is reads + unpack + the
+  // 1M-instance draw front-end. Level 2 splits those: if it stays near 87 ms
+  // with no reads and no maths at all, the cost is the front-end, and the
+  // thing to copy is PlayCanvas's 128-splats-per-instance batching rather
+  // than their compute projection.
+  //
+  // NOT pixel-correct. Diagnostic only. 0 = off, 1 = no projection, 2 = also
+  // no memory reads.
+  vsMinimal?: number;
 };
 
 export class SplatNodeMaterial extends MeshBasicNodeMaterial {
@@ -189,6 +201,11 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
   // result that moves WITH the radius is fill, while a result that is high at
   // every radius is the vertex body.
   vsMinPixelRadius = uniform(4.0);
+  // ?splatvsminext=N - half-extent of the cube the level-2 ablation scatters
+  // its synthesised centres through, in splat object space. Only needs to be
+  // roughly the scene's size so a comparable number of quads survive the
+  // frustum rejects and reach the rasteriser.
+  vsMinExtent = uniform(4.0);
   minAlpha = uniform(0.5 * (1.0 / 255.0));
   preBlurAmount = uniform(0.0);
   blurAmount = uniform(0.3);
@@ -215,7 +232,7 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
       paged = false,
       lodInflate = false,
       parityQuantize = true,
-      vsMinimal = false,
+      vsMinimal = 0,
     } = options;
 
     stripWebGLInternalFormat(packedTexture);
@@ -275,6 +292,69 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
     this.vertexNode = Fn(() => {
       const rejectPos = vec4(0.0, 0.0, 2.0, 1.0); // outside the frustum
       const rejected = bool(false).toVar();
+
+      // LEVEL 2 ABLATION (?splatvsmin=2): no memory reads at all. The centre
+      // is a cheap hash of instanceIndex scattered through a cube, so the
+      // draw submits exactly the same instance and vertex count through the
+      // front-end while touching no ordering buffer, no cut-index texture and
+      // no packed texture. Everything downstream is the level-1 fixed quad.
+      if (vsMinimal >= 2) {
+        const fi = float(instanceIndex);
+        const centerSynth = vec3(
+          fract(fi.mul(0.1031)),
+          fract(fi.mul(0.1030)),
+          fract(fi.mul(0.0973)),
+        )
+          .sub(0.5)
+          .mul(this.vsMinExtent);
+
+        const viewCenterSynth = quatVecTsl(
+          this.renderToViewQuat,
+          centerSynth.mul(this.renderToViewScale),
+        ).add(this.renderToViewPos);
+        rejected.assign(rejected.or(viewCenterSynth.z.greaterThanEqual(0.0)));
+        vViewZ.assign(viewCenterSynth.z);
+
+        const clipCenterSynth = cameraProjectionMatrix.mul(
+          vec4(viewCenterSynth, 1.0),
+        );
+        rejected.assign(
+          rejected.or(
+            clipCenterSynth.z.abs().greaterThanEqual(clipCenterSynth.w),
+          ),
+        );
+        const clipSynth = float(this.clipXY).mul(clipCenterSynth.w);
+        rejected.assign(
+          rejected
+            .or(clipCenterSynth.x.abs().greaterThan(clipSynth))
+            .or(clipCenterSynth.y.abs().greaterThan(clipSynth)),
+        );
+
+        const ndcOffsetSynth = vec2(0.0, 0.0).toVar();
+        If(rejected.not(), () => {
+          const adjS = float(uMaxStdDev);
+          vRgba.assign(vec4(0.5, 0.5, 0.5, 0.5));
+          vSplatUv.assign(positionGeometry.xy.mul(adjS));
+          vAdjustedStdDev.assign(adjS);
+          const rsS = vec2(this.renderSize).mul(this.focalAdjustment);
+          ndcOffsetSynth.assign(
+            vec2(2.0)
+              .div(rsS)
+              .mul(positionGeometry.xy.mul(this.vsMinPixelRadius)),
+          );
+        });
+
+        const ndcCenterSynth = clipCenterSynth.xyz.div(clipCenterSynth.w);
+        return select(
+          rejected,
+          rejectPos,
+          vec4(
+            ndcCenterSynth.xy.add(ndcOffsetSynth).mul(clipCenterSynth.w),
+            clipCenterSynth.z,
+            clipCenterSynth.w,
+          ),
+        );
+      }
 
       // order[instanceIndex] → slot; with a cut, slot resolves through the
       // cut-index texture (verbatim readIndex: ivec2((i>>2)&4095, i>>14),
@@ -354,7 +434,7 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
       const ndcOffset = vec2(0.0, 0.0).toVar();
 
       If(rejected.not().or(this.earlyExit.lessThan(0.5)), () => {
-        if (vsMinimal) {
+        if (vsMinimal >= 1) {
           // ABLATION (?splatvsmin=1): fixed-size quad, no projection maths.
           // `keepAlive` folds the otherwise-unused unpacked values into alpha
           // with zero weight, so the texel loads and the unpack survive

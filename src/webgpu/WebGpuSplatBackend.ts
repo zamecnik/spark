@@ -274,11 +274,12 @@ export class WebGpuSplatBackend {
   // Build-time diagnostic levers, read when the material is created, so the
   // app must set them BEFORE the scene loads (SplatView installs them next to
   // the sort throttle, well ahead of the first buildState).
-  //   vsMinimal      - ?splatvsmin=1, the vertex-stage ablation
+  //   vsMinimal      - ?splatvsmin=N, the vertex-stage ablation
+  //                    (1 = no projection maths, 2 = also no memory reads)
   //   parityQuantize - ?splatparity=off, drops the accumulator repack lattice
   //                    (3 log + 3 exp + ~7 round/clamp per drawn splat) which
   //                    the WebGL2 path does not do at all
-  vsMinimal = false;
+  vsMinimal = 0;
   parityQuantize = true;
 
   // Gate instrumentation (P2/P3 acceptance).
@@ -422,8 +423,14 @@ export class WebGpuSplatBackend {
     mat.pickFar.value = spark.pickFar ?? 1;
     // ?splatvsminpx=N - quad radius for the vsMinimal ablation, read per
     // frame so it can also be swept live from a remote inspector.
-    const vsPx = (globalThis as { __kcSplatVsMinPx?: number }).__kcSplatVsMinPx;
+    const g = globalThis as {
+      __kcSplatVsMinPx?: number;
+      __kcSplatVsMinExt?: number;
+    };
+    const vsPx = g.__kcSplatVsMinPx;
     mat.vsMinPixelRadius.value = typeof vsPx === "number" && vsPx > 0 ? vsPx : 4;
+    const vsExt = g.__kcSplatVsMinExt;
+    mat.vsMinExtent.value = typeof vsExt === "number" && vsExt > 0 ? vsExt : 4;
     mat.minAlpha.value = spark.minAlpha;
     mat.preBlurAmount.value = spark.preBlurAmount;
     mat.blurAmount.value = spark.blurAmount;
