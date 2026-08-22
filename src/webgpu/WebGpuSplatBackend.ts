@@ -271,6 +271,16 @@ export class WebGpuSplatBackend {
   // Testing hook (harness stale-order regression): freeze the order producer.
   freezeOrder = false;
 
+  // Build-time diagnostic levers, read when the material is created, so the
+  // app must set them BEFORE the scene loads (SplatView installs them next to
+  // the sort throttle, well ahead of the first buildState).
+  //   vsMinimal      - ?splatvsmin=1, the vertex-stage ablation
+  //   parityQuantize - ?splatparity=off, drops the accumulator repack lattice
+  //                    (3 log + 3 exp + ~7 round/clamp per drawn splat) which
+  //                    the WebGL2 path does not do at all
+  vsMinimal = false;
+  parityQuantize = true;
+
   // Gate instrumentation (P2/P3 acceptance).
   frames = 0;
   sorts = 0;
@@ -410,6 +420,10 @@ export class WebGpuSplatBackend {
     mat.pickMode.value = spark.pickMode ?? 0;
     mat.pickNear.value = spark.pickNear ?? 0;
     mat.pickFar.value = spark.pickFar ?? 1;
+    // ?splatvsminpx=N - quad radius for the vsMinimal ablation, read per
+    // frame so it can also be swept live from a remote inspector.
+    const vsPx = (globalThis as { __kcSplatVsMinPx?: number }).__kcSplatVsMinPx;
+    mat.vsMinPixelRadius.value = typeof vsPx === "number" && vsPx > 0 ? vsPx : 4;
     mat.minAlpha.value = spark.minAlpha;
     mat.preBlurAmount.value = spark.preBlurAmount;
     mat.blurAmount.value = spark.blurAmount;
@@ -694,6 +708,8 @@ export class WebGpuSplatBackend {
       sh3Texture: src.sh3,
       lodOpacity: src.encoding.lodOpacity ?? false,
       paged: pagedTiling,
+      parityQuantize: this.parityQuantize,
+      vsMinimal: this.vsMinimal,
     });
 
     if (this.state) {

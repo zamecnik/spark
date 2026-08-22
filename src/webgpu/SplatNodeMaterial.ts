@@ -131,6 +131,22 @@ export type SplatNodeMaterialOptions = {
   // Replicate the accumulator repack u8 lattice for rgba + scales (see
   // header). Default true.
   parityQuantize?: boolean;
+  // DIAGNOSTIC ABLATION (?splatvsmin=1). Keeps every texel load, the unpack
+  // and the phase-1 centre transform, but replaces the entire phase-2 body -
+  // SH, the parity lattice, RS.RS^T, the Jacobian, the 2D covariance and the
+  // eigen-decomposition - with a fixed-size screen-space quad.
+  //
+  // The point is to separate two explanations of the Adreno deficit that the
+  // measured data cannot tell apart: our WebGPU path runs the whole
+  // projection chain in the VERTEX stage, four times per splat (once per quad
+  // corner), where PlayCanvas runs it once per splat in a compute pass and
+  // draws 128 splats per instance from a tiny cache-reading shader. If the
+  // vertex arithmetic (or the register pressure it creates) is the cost, this
+  // ablation is a step change; if the cost is memory traffic or the draw
+  // front-end, it barely moves - and the expensive rewrite would disappoint.
+  //
+  // NOT pixel-correct. Diagnostic only.
+  vsMinimal?: boolean;
 };
 
 export class SplatNodeMaterial extends MeshBasicNodeMaterial {
@@ -168,6 +184,11 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
   // Diagnostic only - the two states are specified to be pixel-identical,
   // and the SSIM harness is what proves it.
   earlyExit = uniform(1.0);
+  // ?splatvsminpx=N - quad half-extent in pixels for the vsMinimal ablation.
+  // Tunable because fragment cost is the confound: sweep it (2/4/8) and a
+  // result that moves WITH the radius is fill, while a result that is high at
+  // every radius is the vertex body.
+  vsMinPixelRadius = uniform(4.0);
   minAlpha = uniform(0.5 * (1.0 / 255.0));
   preBlurAmount = uniform(0.0);
   blurAmount = uniform(0.3);
@@ -194,6 +215,7 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
       paged = false,
       lodInflate = false,
       parityQuantize = true,
+      vsMinimal = false,
     } = options;
 
     stripWebGLInternalFormat(packedTexture);
@@ -332,6 +354,34 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
       const ndcOffset = vec2(0.0, 0.0).toVar();
 
       If(rejected.not().or(this.earlyExit.lessThan(0.5)), () => {
+        if (vsMinimal) {
+          // ABLATION (?splatvsmin=1): fixed-size quad, no projection maths.
+          // `keepAlive` folds the otherwise-unused unpacked values into alpha
+          // with zero weight, so the texel loads and the unpack survive
+          // dead-code elimination - this ablation must remove the ARITHMETIC,
+          // not the memory traffic it would otherwise take with it.
+          const keepAlive = unpacked.scales.x
+            .add(unpacked.quaternion.x)
+            .mul(0.0);
+          rgba.assign(vec4(unpacked.rgba));
+          if (lodOpacity) {
+            rgba.a.assign(rgba.a.mul(2.0));
+          }
+          rgba.a.assign(rgba.a.add(keepAlive));
+          const adj = float(uMaxStdDev);
+          vRgba.assign(rgba);
+          vSplatUv.assign(positionGeometry.xy.mul(adj));
+          vAdjustedStdDev.assign(adj);
+          const scaledRenderSizeMin = vec2(this.renderSize).mul(
+            this.focalAdjustment,
+          );
+          ndcOffset.assign(
+            vec2(2.0)
+              .div(scaledRenderSizeMin)
+              .mul(positionGeometry.xy.mul(this.vsMinPixelRadius)),
+          );
+          return;
+        }
         scales.assign(vec3(unpacked.scales.mul(this.renderToViewScale)));
         rgba.assign(vec4(unpacked.rgba));
 
