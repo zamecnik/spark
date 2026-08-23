@@ -159,6 +159,17 @@ export type SplatNodeMaterialOptions = {
   // NOT pixel-correct. Diagnostic only. 0 = off, 1 = no projection, 2 = also
   // no memory reads.
   vsMinimal?: number;
+  // [dbg-adreno] N splats per instance (?splatbatch=N). Requires the mesh to
+  // carry a BatchedSplatGeometry(N); the shader reconstructs
+  //   splat = instanceIndex * N + position.z
+  // and rejects the tail overshoot of the last instance against the
+  // batchNumSplats uniform. Round-2 ablation left a 70 ms remainder on the
+  // Pixel with all arithmetic AND all reads removed - nothing in the frame
+  // but the 1M-instance submission - while our WebGL2 path issues the same
+  // 1M instances inside a 51 ms whole-job frame. PlayCanvas draws 128 splats
+  // per instance; this is that shape. Default 1 = the stock draw, and the
+  // emitted WGSL is byte-identical to today's in that case.
+  batchSize?: number;
 };
 
 export class SplatNodeMaterial extends MeshBasicNodeMaterial {
@@ -206,6 +217,10 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
   // roughly the scene's size so a comparable number of quads survive the
   // frustum rejects and reach the rasteriser.
   vsMinExtent = uniform(4.0);
+  // [dbg-adreno] live splat count for the batched draw's tail reject (float;
+  // exact for counts < 2^24, the keygen uses the same convention). Only read
+  // when batchSize > 1; the backend refreshes it every update().
+  batchNumSplats = uniform(0.0);
   minAlpha = uniform(0.5 * (1.0 / 255.0));
   preBlurAmount = uniform(0.0);
   blurAmount = uniform(0.3);
@@ -233,6 +248,7 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
       lodInflate = false,
       parityQuantize = true,
       vsMinimal = 0,
+      batchSize = 1,
     } = options;
 
     stripWebGLInternalFormat(packedTexture);
@@ -293,13 +309,31 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
       const rejectPos = vec4(0.0, 0.0, 2.0, 1.0); // outside the frustum
       const rejected = bool(false).toVar();
 
+      // [dbg-adreno] batched draw: with N splats per instance the draw index
+      // is instanceIndex*N + position.z (BatchedSplatGeometry carries the
+      // quad's batch-local index in z). The last instance overshoots numSplats
+      // by up to N-1 - those vertices are rejected against the batchNumSplats
+      // uniform and their load index clamped to 0, because order[] slots past
+      // numSplats hold sort padding that resolves to a REAL splat (page 0,
+      // slot 0) and would draw it N-1 extra times. batchSize 1 leaves this
+      // whole block out and the emitted WGSL is byte-identical to stock.
+      let drawIdx: TslNode = instanceIndex;
+      if (batchSize > 1) {
+        const rawIdx = uint(instanceIndex)
+          .mul(uint(batchSize))
+          .add(uint(positionGeometry.z));
+        const inRange = float(rawIdx).lessThan(this.batchNumSplats);
+        rejected.assign(inRange.not());
+        drawIdx = select(inRange, rawIdx, uint(0)).toVar("kcBatchIdx");
+      }
+
       // LEVEL 2 ABLATION (?splatvsmin=2): no memory reads at all. The centre
       // is a cheap hash of instanceIndex scattered through a cube, so the
       // draw submits exactly the same instance and vertex count through the
       // front-end while touching no ordering buffer, no cut-index texture and
       // no packed texture. Everything downstream is the level-1 fixed quad.
       if (vsMinimal >= 2) {
-        const fi = float(instanceIndex);
+        const fi = float(drawIdx);
         const centerSynth = vec3(
           fract(fi.mul(0.1031)),
           fract(fi.mul(0.1030)),
@@ -359,7 +393,7 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
       // order[instanceIndex] → slot; with a cut, slot resolves through the
       // cut-index texture (verbatim readIndex: ivec2((i>>2)&4095, i>>14),
       // component [i&3] via select-cascade — P0/S2 pattern)
-      const slot = orderNode.element(instanceIndex);
+      const slot = orderNode.element(drawIdx);
       let splatIndex: TslNode = slot;
       if (cutIndicesTexture) {
         const texel = textureLoad(

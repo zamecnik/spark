@@ -60,6 +60,7 @@ import {
   vec4,
 } from "three/tsl";
 import * as TSL from "three/tsl";
+import { BatchedSplatGeometry } from "./BatchedSplatGeometry";
 import {
   type TslNode,
   pagedSplatTexCoordTsl,
@@ -201,6 +202,11 @@ type MeshState = {
   boundsMax: THREE.Vector3;
   lastNumSplats: number;
   lastMappingVersion: number;
+  // instances actually submitted = ceil(numSplats / batchSize); re-asserted
+  // in applyPerFrame because SparkRenderer.onBeforeRender writes
+  // instanceCount = activeSplats (the SPLAT count) between update() and the
+  // render, which is only correct for batchSize 1.
+  drawInstances: number;
 };
 
 // fp16 → f32 (IEEE 754 half), for the CPU-side bounds scans
@@ -281,6 +287,11 @@ export class WebGpuSplatBackend {
   //                    the WebGL2 path does not do at all
   vsMinimal = 0;
   parityQuantize = true;
+  //   batchSize      - ?splatbatch=N, N splats per instance (PlayCanvas draws
+  //                    128). Swaps the mesh geometry to BatchedSplatGeometry
+  //                    at buildState and divides instanceCount by N. 1 = the
+  //                    stock draw, byte-identical WGSL.
+  batchSize = 1;
 
   // Gate instrumentation (P2/P3 acceptance).
   frames = 0;
@@ -319,6 +330,7 @@ export class WebGpuSplatBackend {
     if (!mesh || !src || src.numSplats === 0) {
       spark.activeSplats = 0;
       (spark.geometry as THREE.InstancedBufferGeometry).instanceCount = 0;
+      if (this.state) this.state.drawInstances = 0;
       return false;
     }
 
@@ -370,8 +382,17 @@ export class WebGpuSplatBackend {
     // activeSplats publication (app contract: overlays gate on it) + the
     // same-frame instanceCount (the order buffer is fresh this frame, P0/S4)
     spark.activeSplats = src.numSplats;
+    // [dbg-adreno] batched draw: N splats per instance -> ceil(n/N)
+    // instances. The material's tail reject reads batchNumSplats, refreshed
+    // here EVERY frame (uNumSplats only updates on sort frames).
+    const drawInstances =
+      this.batchSize > 1
+        ? Math.ceil(src.numSplats / this.batchSize)
+        : src.numSplats;
+    state.drawInstances = drawInstances;
+    state.material.batchNumSplats.value = src.numSplats;
     (spark.geometry as THREE.InstancedBufferGeometry).instanceCount =
-      src.numSplats;
+      drawInstances;
 
     // Raycast contract (fork plan §4.4/app-contract rows 15–17): stock feeds
     // SplatMesh.context from the accumulator scene-walk (SplatMesh.update),
@@ -399,6 +420,14 @@ export class WebGpuSplatBackend {
     const state = this.state;
     if (!state) return;
     const mat = state.material;
+
+    // [dbg-adreno] SparkRenderer.onBeforeRender sets instanceCount =
+    // activeSplats (the SPLAT count) before calling here; with batching the
+    // submitted count is ceil(n/N), so re-assert it right before the render.
+    if (this.batchSize > 1) {
+      (spark.geometry as THREE.InstancedBufferGeometry).instanceCount =
+        state.drawInstances;
+    }
 
     mat.renderSize.value.copy(spark.renderSize);
     mat.maxStdDev.value = spark.maxStdDev;
@@ -717,6 +746,7 @@ export class WebGpuSplatBackend {
       paged: pagedTiling,
       parityQuantize: this.parityQuantize,
       vsMinimal: this.vsMinimal,
+      batchSize: this.batchSize,
     });
 
     if (this.state) {
@@ -747,11 +777,23 @@ export class WebGpuSplatBackend {
       boundsMax: new Vector3(1, 1, 1),
       lastNumSplats: -1,
       lastMappingVersion: -1,
+      drawInstances: 0,
     };
     this.sortedOnce = false;
 
     // SparkRenderer (the Mesh) draws with the per-source material
     spark.material = material;
+
+    // [dbg-adreno] batched draw wants a geometry with N quads whose vertices
+    // carry the batch-local index in position.z. Swapped once, WebGPU only -
+    // the WebGL2 path never reaches buildState and keeps the shared 1-quad
+    // SplatGeometry.
+    if (
+      this.batchSize > 1 &&
+      !(spark.geometry instanceof BatchedSplatGeometry)
+    ) {
+      spark.geometry = new BatchedSplatGeometry(this.batchSize);
+    }
   }
 
   // (Re)compute object-space bounds for the CURRENT cut/source. Static
