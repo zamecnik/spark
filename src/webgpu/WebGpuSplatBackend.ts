@@ -46,27 +46,48 @@ import {
   Fn,
   If,
   Return,
+  bool,
   clamp,
+  exp,
   float,
   instanceIndex,
   instancedArray,
   int,
   ivec2,
+  log,
+  mat3,
+  max,
+  min,
+  normalize,
+  round,
   select,
+  sqrt,
   textureLoad,
+  transpose,
   uint,
   uniform,
+  vec2,
   vec3,
   vec4,
 } from "three/tsl";
 import * as TSL from "three/tsl";
 import { BatchedSplatGeometry } from "./BatchedSplatGeometry";
+
+// Duplicated from SplatNodeMaterial.ts / src/defines.ts (must match): the
+// projector kernel replicates the material's parity lattice byte-for-byte.
+const LN_SCALE_MIN = -12.0;
+const LN_SCALE_MAX = 9.0;
 import {
   type TslNode,
   pagedSplatTexCoordTsl,
+  quatQuatTsl,
+  quatVecTsl,
+  scaleQuaternionToMatrixColumnsTsl,
   splatTexCoordTsl,
+  unpackSplatEncodingTsl,
   stripWebGLInternalFormat,
 } from "./packedSplatsTsl";
+import { evaluatePackedShTsl } from "./shTsl";
 import { kcDisposeOldMaterial, kcRegrowLog } from "../kcRegrowDebug";
 import { type RadixSort, createRadixSort } from "./radixSort";
 import { SplatNodeMaterial } from "./SplatNodeMaterial";
@@ -207,6 +228,11 @@ type MeshState = {
   // instanceCount = activeSplats (the SPLAT count) between update() and the
   // render, which is only correct for batchSize 1.
   drawInstances: number;
+  // [proj] projector kernel + its projection-matrix uniform (compute passes
+  // cannot read the render context's cameraProjectionMatrix), null when the
+  // lever is off
+  projector: TslNode | null;
+  uProjection: { value: Matrix4 } | null;
 };
 
 // fp16 → f32 (IEEE 754 half), for the CPU-side bounds scans
@@ -292,6 +318,13 @@ export class WebGpuSplatBackend {
   //                    at buildState and divides instanceCount by N. 1 = the
   //                    stock draw, byte-identical WGSL.
   batchSize = 1;
+  //   projectorEnabled - ?splatproj=1: run the whole projection chain ONCE
+  //                    per splat in a compute pass (splatProjector) and turn
+  //                    the draw's vertex stage into a cache reader. Validated
+  //                    by measurement before being built (row 58: L1+batch =
+  //                    34 ms vs the batched baseline's 68 on the Pixel 4).
+  //                    Ignored while a vsMinimal ablation is active.
+  projectorEnabled = false;
 
   // Gate instrumentation (P2/P3 acceptance).
   frames = 0;
@@ -394,6 +427,17 @@ export class WebGpuSplatBackend {
     (spark.geometry as THREE.InstancedBufferGeometry).instanceCount =
       drawInstances;
 
+    // [proj] the projector re-runs EVERY rendered frame (its inputs include
+    // the camera), independent of the sort cadence. Uniforms are synced here
+    // because applyPerFrame runs later in the frame (onBeforeRender) and the
+    // compute below must not consume last frame's camera. uNumSplats is
+    // always current at this point: it only changes when cutChanged, which
+    // forces the sort branch above to run first.
+    if (state.projector && src.numSplats > 0) {
+      this.syncUniforms(spark, camera);
+      spark.renderer.compute([state.projector]);
+    }
+
     // Raycast contract (fork plan §4.4/app-contract rows 15–17): stock feeds
     // SplatMesh.context from the accumulator scene-walk (SplatMesh.update),
     // which never runs on this branch — without this, non-LOD raycasts
@@ -427,6 +471,27 @@ export class WebGpuSplatBackend {
     if (this.batchSize > 1) {
       (spark.geometry as THREE.InstancedBufferGeometry).instanceCount =
         state.drawInstances;
+    }
+
+    this.syncUniforms(spark, camera);
+  }
+
+  // Per-frame uniform sync, shared by applyPerFrame (onBeforeRender) and -
+  // when the projector is on - update(), because the projector compute is
+  // submitted from update() and must see THIS frame's camera, not last
+  // frame's. camera.updateMatrixWorld() + a manual inverse make the transform
+  // fresh regardless of which caller runs first (matrixWorldInverse is only
+  // refreshed inside renderer.render).
+  private syncUniforms(spark: SparkRendererLike, camera: THREE.Camera): void {
+    const state = this.state;
+    if (!state) return;
+    const mat = state.material;
+
+    camera.updateMatrixWorld();
+    if (state.uProjection) {
+      state.uProjection.value.copy(
+        (camera as THREE.PerspectiveCamera).projectionMatrix,
+      );
     }
 
     mat.renderSize.value.copy(spark.renderSize);
@@ -479,7 +544,8 @@ export class WebGpuSplatBackend {
     // object→view = view ← world ← object; SplatTransformer semantics allow
     // uniform scale only, so decompose to quat + pos + scalar scale.
     const objectToView = new Matrix4()
-      .copy(camera.matrixWorldInverse)
+      .copy(camera.matrixWorld)
+      .invert()
       .multiply(state.mesh.matrixWorld);
     const pos = new Vector3();
     const quat = new Quaternion();
@@ -735,6 +801,19 @@ export class WebGpuSplatBackend {
       .compute([Math.ceil(Math.max(1, capacity) / 256)], [256])
       .setName("splatKeygen");
 
+    // [proj] the projector cache: four vec4 arrays over the padded capacity,
+    // indexed by cut slot (the keygen's domain). ~64 B/splat - accepted for
+    // the lever build; stride-packing is a follow-up once the win is banked.
+    const projOn = this.projectorEnabled && this.vsMinimal === 0;
+    const projC = projOn
+      ? {
+          c0: instancedArray(Math.max(1, capacity), "vec4") as TslNode,
+          c1: instancedArray(Math.max(1, capacity), "vec4") as TslNode,
+          c2: instancedArray(Math.max(1, capacity), "vec4") as TslNode,
+          c3: instancedArray(Math.max(1, capacity), "vec4") as TslNode,
+        }
+      : null;
+
     const material = new SplatNodeMaterial({
       packedTexture,
       orderNode: radix.sortedValues,
@@ -747,7 +826,295 @@ export class WebGpuSplatBackend {
       parityQuantize: this.parityQuantize,
       vsMinimal: this.vsMinimal,
       batchSize: this.batchSize,
+      projCache: projC ?? undefined,
     });
+
+    // [proj] the projector kernel - a verbatim port of the material's vertex
+    // body (phase 1 + phase 2), run once per SLOT instead of four times per
+    // splat. It shares the material's uniform NODES so there is exactly one
+    // source of truth for every constant; the one thing it cannot share is
+    // cameraProjectionMatrix (a render-context node), so the projection
+    // matrix travels in uProjection, synced in syncUniforms().
+    let projector: TslNode | null = null;
+    let uProjection: { value: Matrix4 } | null = null;
+    if (projC) {
+      const uProj = uniform(new Matrix4());
+      uProjection = uProj as unknown as { value: Matrix4 };
+      const lodOpacity = src.encoding.lodOpacity ?? false;
+      const parityQuantize = this.parityQuantize;
+      const sh1 = src.sh1;
+      const sh2 = src.sh2;
+      const sh3 = src.sh3;
+      projector = (Fn(() => {
+        const i = instanceIndex;
+        If(i.greaterThanEqual(uint(Math.max(1, capacity))), () => {
+          Return();
+        });
+        If(float(i).greaterThanEqual(uNumSplats as TslNode), () => {
+          projC.c3.element(i).assign(vec4(0.0, 0.0, 0.0, 0.0));
+          Return();
+        });
+
+        // cut resolve + unpack - identical to the keygen/vertex path
+        let splatIndex: TslNode = i;
+        if (cutTexture) {
+          const texel = textureLoad(
+            cutTexture,
+            ivec2(
+              int(i.shiftRight(uint(2)).bitAnd(uint(4095))),
+              int(i.shiftRight(uint(14))),
+            ),
+          );
+          const comp = i.bitAnd(uint(3));
+          splatIndex = select(
+            comp.equal(uint(0)),
+            texel.x,
+            select(
+              comp.equal(uint(1)),
+              texel.y,
+              select(comp.equal(uint(2)), texel.z, texel.w),
+            ),
+          );
+        }
+        const texCoord = pagedTiling
+          ? pagedSplatTexCoordTsl(int(splatIndex))
+          : splatTexCoordTsl(int(splatIndex));
+        const packedData = textureLoad(packedTexture, texCoord.xy).depth(
+          texCoord.z,
+        );
+        const unpacked = unpackSplatEncodingTsl(
+          packedData,
+          material.rgbMinMaxLnScaleMinMax,
+        );
+        const center = unpacked.center;
+        const quaternion = unpacked.quaternion;
+
+        const rejected = bool(false).toVar();
+
+        // -- phase 1: centre rejects (verbatim) --------------------------
+        const viewCenter = quatVecTsl(
+          material.renderToViewQuat,
+          center.mul(material.renderToViewScale),
+        ).add(material.renderToViewPos);
+        rejected.assign(rejected.or(viewCenter.z.greaterThanEqual(0.0)));
+        const clipCenter = (uProj as TslNode).mul(vec4(viewCenter, 1.0));
+        rejected.assign(
+          rejected.or(clipCenter.z.abs().greaterThanEqual(clipCenter.w)),
+        );
+        const clip = float(material.clipXY).mul(clipCenter.w);
+        rejected.assign(
+          rejected
+            .or(clipCenter.x.abs().greaterThan(clip))
+            .or(clipCenter.y.abs().greaterThan(clip)),
+        );
+
+        // -- phase 2 (verbatim port; out-vars for the tail writes) --------
+        const rgba = vec4(0.0, 0.0, 0.0, 0.0).toVar();
+        const axis1 = vec2(0.0, 0.0).toVar();
+        const axis2 = vec2(0.0, 0.0).toVar();
+        const uvStd = float(0.0).toVar();
+        const adjOut = float(0.0).toVar();
+
+        If(rejected.not(), () => {
+          const scales = vec3(
+            unpacked.scales.mul(material.renderToViewScale),
+          ).toVar();
+          rgba.assign(vec4(unpacked.rgba));
+          if (lodOpacity) {
+            rgba.a.assign(rgba.a.mul(2.0));
+          }
+          if (sh1) {
+            const viewDir = normalize(center.sub(material.viewOrigin));
+            const shRgb = evaluatePackedShTsl({
+              coord: texCoord,
+              viewDir,
+              shMax: material.shMax,
+              sh1Texture: sh1,
+              sh2Texture: sh2,
+              sh3Texture: sh3,
+            });
+            rgba.assign(vec4(rgba.rgb.add(shRgb), rgba.a));
+          }
+          if (parityQuantize) {
+            const rgbQ = round(clamp(rgba.rgb.mul(255.0), 0.0, 255.0)).div(
+              255.0,
+            );
+            const aQ = round(clamp(rgba.a.mul(0.5).mul(255.0), 0.0, 255.0))
+              .div(255.0)
+              .mul(2.0);
+            rgba.assign(vec4(rgbQ, aQ));
+            const lnScaleScale = float(254.0 / (LN_SCALE_MAX - LN_SCALE_MIN));
+            const requantScale = (sc: TslNode) =>
+              select(
+                sc.equal(0.0),
+                float(0.0),
+                exp(
+                  round(
+                    clamp(
+                      sc.log().sub(LN_SCALE_MIN).mul(lnScaleScale),
+                      0.0,
+                      254.0,
+                    ),
+                  )
+                    .div(lnScaleScale)
+                    .add(LN_SCALE_MIN),
+                ),
+              );
+            scales.assign(
+              vec3(
+                requantScale(scales.x),
+                requantScale(scales.y),
+                requantScale(scales.z),
+              ),
+            );
+          }
+
+          const zeroScales = scales.equal(vec3(0.0));
+          rejected.assign(rejected.or(zeroScales.all()));
+          rejected.assign(
+            rejected
+              .or(rgba.a.equal(0.0))
+              .or(rgba.a.lessThan(material.minAlpha)),
+          );
+
+          const adjustedStdDev = float(material.maxStdDev).toVar();
+          If(rgba.a.greaterThan(1.0), () => {
+            rgba.a.assign(min(rgba.a.mul(4.0).sub(3.0), 5.0));
+            adjustedStdDev.assign(
+              float(material.maxStdDev).add(rgba.a.sub(1.0).mul(0.7)),
+            );
+          });
+
+          const viewQuaternion = quatQuatTsl(
+            material.renderToViewQuat,
+            quaternion,
+          );
+          const [rsC0, rsC1, rsC2] = scaleQuaternionToMatrixColumnsTsl(
+            scales,
+            viewQuaternion,
+          );
+          const RS = (mat3 as TslNode)(rsC0, rsC1, rsC2);
+          const cov3D = RS.mul(transpose(RS));
+
+          const scaledRenderSize = vec2(material.renderSize).mul(
+            material.focalAdjustment,
+          );
+          const focal = scaledRenderSize
+            .mul(0.5)
+            .mul(
+              vec2(
+                (uProj as TslNode).element(int(0)).element(int(0)),
+                (uProj as TslNode).element(int(1)).element(int(1)),
+              ),
+            );
+          const isOrthographic = (uProj as TslNode)
+            .element(int(2))
+            .element(int(3))
+            .notEqual(-1.0);
+          const invZ = float(1.0).div(viewCenter.z);
+          const J1 = focal.mul(invZ);
+          const J2 = J1.mul(viewCenter.xy).negate().mul(invZ);
+          const jC0 = select(
+            isOrthographic,
+            vec3(focal.x, 0.0, 0.0),
+            vec3(J1.x, 0.0, J2.x),
+          );
+          const jC1 = select(
+            isOrthographic,
+            vec3(0.0, focal.y, 0.0),
+            vec3(0.0, J1.y, J2.y),
+          );
+          const J = (mat3 as TslNode)(jC0, jC1, vec3(0.0, 0.0, 0.0));
+          const cov2D = transpose(J).mul(cov3D).mul(J);
+          const a = float(cov2D.element(int(0)).element(int(0))).toVar();
+          const d = float(cov2D.element(int(1)).element(int(1))).toVar();
+          const b = cov2D.element(int(0)).element(int(1));
+          a.addAssign(material.preBlurAmount);
+          d.addAssign(material.preBlurAmount);
+          const detOrig = a.mul(d).sub(b.mul(b));
+          a.addAssign(material.blurAmount);
+          d.addAssign(material.blurAmount);
+          const det = a.mul(d).sub(b.mul(b));
+          const blurAdjust = sqrt(max(0.0, detOrig.div(det)));
+          const rawAlpha = rgba.a.toVar("kcRawAlphaP");
+          rgba.a.assign(rgba.a.mul(blurAdjust));
+          rejected.assign(
+            rejected.or(rgba.a.lessThan(material.minAlpha)),
+          );
+
+          const fillOn = material.ssogFillV2.greaterThan(0.5);
+          rejected.assign(
+            rejected.or(fillOn.and(rawAlpha.lessThan(1.0 / 255.0))),
+          );
+          rejected.assign(
+            rejected.or(
+              fillOn.and(
+                rawAlpha
+                  .mul(6.2831853071795862)
+                  .mul(sqrt(max(det, 0.0)))
+                  .lessThan(material.ssogMinContribution),
+              ),
+            ),
+          );
+
+          const eigenAvg = a.add(d).mul(0.5);
+          const eigenDelta = sqrt(
+            max(0.0, eigenAvg.mul(eigenAvg).sub(det)),
+          );
+          const eigen1 = eigenAvg.add(eigenDelta);
+          const eigen2 = eigenAvg.sub(eigenDelta);
+          const eigenVec1 = select(
+            b.abs().greaterThan(0.001),
+            normalize(vec2(b, eigen1.sub(a))),
+            select(a.greaterThanEqual(d), vec2(1.0, 0.0), vec2(0.0, 1.0)),
+          );
+          const eigenVec2 = vec2(eigenVec1.y, eigenVec1.x.negate());
+          const r1 = adjustedStdDev.mul(sqrt(eigen1));
+          const r2 = adjustedStdDev.mul(sqrt(eigen2));
+          const fillCap = min(
+            1024.0,
+            min(material.renderSize.x, material.renderSize.y),
+          );
+          const capScale = min(1.0, fillCap.div(max(r1, r2)));
+          const zStar = sqrt(max(0.0, log(rgba.a.mul(255.0))).mul(2.0));
+          const quadScale = min(1.0, zStar.div(adjustedStdDev));
+          const scale1 = select(
+            fillOn,
+            r1.mul(capScale).mul(quadScale),
+            min(material.maxPixelRadius, r1),
+          );
+          const scale2 = select(
+            fillOn,
+            r2.mul(capScale).mul(quadScale),
+            min(material.maxPixelRadius, r2),
+          );
+          rejected.assign(
+            rejected.or(
+              scale1
+                .lessThan(material.minPixelRadius)
+                .and(scale2.lessThan(material.minPixelRadius)),
+            ),
+          );
+          axis1.assign(eigenVec1.mul(scale1));
+          axis2.assign(eigenVec2.mul(scale2));
+          uvStd.assign(
+            select(fillOn, adjustedStdDev.mul(quadScale), adjustedStdDev),
+          );
+          adjOut.assign(adjustedStdDev);
+        });
+
+        projC.c0.element(i).assign(clipCenter);
+        projC.c1.element(i).assign(vec4(axis1, axis2));
+        projC.c2.element(i).assign(rgba);
+        projC.c3
+          .element(i)
+          .assign(
+            vec4(uvStd, adjOut, viewCenter.z, select(rejected, 0.0, 1.0)),
+          );
+      })() as TslNode)
+        .compute([Math.ceil(Math.max(1, capacity) / 256)], [256])
+        .setName("splatProjector");
+    }
 
     if (this.state) {
       // P6 diagnosis lever: old-material dispose policy is runtime-
@@ -778,6 +1145,8 @@ export class WebGpuSplatBackend {
       lastNumSplats: -1,
       lastMappingVersion: -1,
       drawInstances: 0,
+      projector,
+      uProjection,
     };
     this.sortedOnce = false;
 

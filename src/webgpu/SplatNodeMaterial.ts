@@ -170,6 +170,21 @@ export type SplatNodeMaterialOptions = {
   // per instance; this is that shape. Default 1 = the stock draw, and the
   // emitted WGSL is byte-identical to today's in that case.
   batchSize?: number;
+
+  // [proj] Projector cache (?splatproj=1): when set, the whole projection
+  // chain has ALREADY run once per splat in a compute pass (the backend's
+  // splatProjector kernel, a verbatim port of the vertex body below), and
+  // this material's vertex stage becomes a READER - order lookup, four vec4
+  // cache loads, quad expand. Motivation is measured, not speculative: on the
+  // Pixel 4 (Adreno) the vertex stage re-ran the chain 4x per splat and the
+  // L1+batch ablation (row 58) put the once-per-splat version at 34 ms
+  // against the batched baseline's 68. Layout (indexed by CUT SLOT, the same
+  // domain the keygen iterates):
+  //   c0 = clip-space center (xyzw)
+  //   c1 = (axis1.xy, axis2.xy)  pixel-space eigen axes, scaleN * eigenVecN
+  //   c2 = rgba, final (post SH / parity / blur-adjust)
+  //   c3 = (uvStd, adjustedStdDev, viewZ, live 0|1)
+  projCache?: { c0: TslNode; c1: TslNode; c2: TslNode; c3: TslNode };
 };
 
 export class SplatNodeMaterial extends MeshBasicNodeMaterial {
@@ -249,6 +264,7 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
       parityQuantize = true,
       vsMinimal = 0,
       batchSize = 1,
+      projCache = undefined,
     } = options;
 
     stripWebGLInternalFormat(packedTexture);
@@ -305,6 +321,49 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
     // `earlyExit` = 0 makes the guard uniformly true, restoring the exact
     // pre-T1-3 straight-line body for an in-session A/B with nothing else
     // varying (WebGpuSplatBackend.applyPerFrame / __kcSplatEarlyExit).
+    if (projCache) {
+      // [proj] reader vertex stage - see the projCache option comment. The
+      // batch tail reject is replicated here because the projector indexes by
+      // slot and knows nothing about the draw's instance packing.
+      this.vertexNode = Fn(() => {
+        const rejectPos = vec4(0.0, 0.0, 2.0, 1.0);
+        const rejected = bool(false).toVar();
+        let drawIdx: TslNode = instanceIndex;
+        if (batchSize > 1) {
+          const rawIdx = uint(instanceIndex)
+            .mul(uint(batchSize))
+            .add(uint(positionGeometry.z));
+          const inRange = float(rawIdx).lessThan(this.batchNumSplats);
+          rejected.assign(inRange.not());
+          drawIdx = select(inRange, rawIdx, uint(0)).toVar("kcBatchIdx");
+        }
+        const slot = orderNode.element(drawIdx);
+        const c0 = projCache.c0.element(slot);
+        const c1 = projCache.c1.element(slot);
+        const c2 = projCache.c2.element(slot);
+        const c3 = projCache.c3.element(slot);
+        rejected.assign(rejected.or(c3.w.lessThan(0.5)));
+
+        vRgba.assign(c2);
+        vSplatUv.assign(positionGeometry.xy.mul(c3.x));
+        vAdjustedStdDev.assign(c3.y);
+        vViewZ.assign(c3.z);
+
+        const scaledRenderSize = vec2(this.renderSize).mul(
+          this.focalAdjustment,
+        );
+        const pixelOffset = c1.xy
+          .mul(positionGeometry.x)
+          .add(c1.zw.mul(positionGeometry.y));
+        const ndcOffset = vec2(2.0).div(scaledRenderSize).mul(pixelOffset);
+        const ndcCenter = c0.xyz.div(c0.w);
+        return select(
+          rejected,
+          rejectPos,
+          vec4(ndcCenter.xy.add(ndcOffset).mul(c0.w), c0.z, c0.w),
+        );
+      })();
+    } else
     this.vertexNode = Fn(() => {
       const rejectPos = vec4(0.0, 0.0, 2.0, 1.0); // outside the frustum
       const rejected = bool(false).toVar();
