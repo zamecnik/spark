@@ -326,6 +326,15 @@ export class WebGpuSplatBackend {
   //                    34 ms vs the batched baseline's 68 on the Pixel 4).
   //                    Ignored while a vsMinimal ablation is active.
   projectorEnabled = false;
+  //   sortBits       - ?sortbits=N (4..16, multiple of 4): radix passes =
+  //                    N/4. Rows 76/77 priced the 16-bit 4-pass radix at
+  //                    ~46 ms of the 74 ms Pixel orbit frame, so passes are
+  //                    the currency: 12 bits = 3 passes (4096 depth buckets),
+  //                    8 = 2 passes (256 buckets). Key quantization follows
+  //                    the bit width, so precision loss is bucket coarsening,
+  //                    never wrong bits. Diagnostic ladder first; whether a
+  //                    reduced width SHIPS is a visual call on device.
+  sortBits = 16;
 
   // Gate instrumentation (P2/P3 acceptance).
   frames = 0;
@@ -738,10 +747,18 @@ export class WebGpuSplatBackend {
     if (cutTexture) stripWebGLInternalFormat(cutTexture);
 
     const keysNode = instancedArray(Math.max(1, capacity), "uint");
+    // [bits] pass count and key quantization both follow sortBits (the radix
+    // sorts the LOW sortBits bits, so keys must quantize into exactly that
+    // range - and the padding key must be its max, not a wider 0xffff).
+    const sortBits =
+      this.sortBits >= 4 && this.sortBits <= 16 && this.sortBits % 4 === 0
+        ? this.sortBits
+        : 16;
+    const quantMax = 2 ** sortBits - 1;
     const radix = createRadixSort({
       keysNode,
       count: Math.max(1, capacity),
-      numBits: 16,
+      numBits: sortBits,
     });
 
     const uNumSplats = uniform(0); // float; exact for counts < 2^24
@@ -759,7 +776,7 @@ export class WebGpuSplatBackend {
       // padding slots (zero-padded traverse output!) → max key; bounded by
       // the numSplats UNIFORM, never a texel sentinel
       If(float(i).greaterThanEqual(uNumSplats as TslNode), () => {
-        keysNode.element(i).assign(uint(0xffff));
+        keysNode.element(i).assign(uint(quantMax));
         Return();
       });
 
@@ -810,7 +827,7 @@ export class WebGpuSplatBackend {
               1.0,
             ),
           )
-          .mul(65535.0),
+          .mul(quantMax),
       );
       keysNode.element(i).assign(q);
     })() as TslNode)
@@ -876,7 +893,7 @@ export class WebGpuSplatBackend {
           // [fuse] padding slots take the max key, exactly as the standalone
           // keygen pads - ascending radix sorts them to the tail
           If(float(uWK as TslNode).greaterThan(0.5), () => {
-            keysNode.element(i).assign(uint(0xffff));
+            keysNode.element(i).assign(uint(quantMax));
           });
           Return();
         });
@@ -1158,7 +1175,7 @@ export class WebGpuSplatBackend {
                   1.0,
                 ),
               )
-              .mul(65535.0),
+              .mul(quantMax),
           );
           keysNode.element(i).assign(qk);
         });
