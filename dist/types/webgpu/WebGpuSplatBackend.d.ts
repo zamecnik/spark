@@ -8,7 +8,7 @@ type LodInstanceLike = {
 };
 type SparkRendererLike = THREE.Mesh & {
     renderer: {
-        compute(nodes: TslNode | TslNode[]): void;
+        compute(nodes: TslNode | TslNode[], dispatchSize?: unknown): void;
     };
     activeSplats: number;
     sortRadial?: boolean;
@@ -34,6 +34,14 @@ export declare class WebGpuSplatBackend {
     placeholderMaterial: THREE.Material;
     sortRadial: boolean;
     freezeOrder: boolean;
+    vsMinimal: number;
+    parityQuantize: boolean;
+    batchSize: number;
+    projectorEnabled: boolean;
+    sortBits: number;
+    sortDigits: number;
+    sortTpw: number;
+    sortVisible: boolean;
     frames: number;
     sorts: number;
     lastSortFrame: number;
@@ -49,6 +57,7 @@ export declare class WebGpuSplatBackend {
         viewChanged: boolean;
     }): boolean;
     applyPerFrame(spark: SparkRendererLike, camera: THREE.Camera): void;
+    private syncUniforms;
     getState(): {
         kind: SourceKind;
         numSplats: number;
@@ -57,6 +66,7 @@ export declare class WebGpuSplatBackend {
         material: SplatNodeMaterial;
         sortedValues: TslNode;
         keysNode: TslNode;
+        visCountAttr: THREE.BufferAttribute | null;
     } | null;
     private findSplatMesh;
     private currentEncoding;

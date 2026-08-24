@@ -1,6 +1,7 @@
 import * as TSL from "three/tsl";
-import { uint, float, vec2, max, select, normalize, vec3, vec4, ivec3, int, exp, textureLoad, uniform, varyingProperty, Fn, bool, instanceIndex, ivec2, cameraProjectionMatrix, If, round, clamp, min, pow, positionGeometry, mat3, transpose, sqrt, log, dot, Discard, mix, instancedArray, workgroupArray, workgroupId, invocationLocalIndex, workgroupBarrier, atomicStore, atomicAdd, atomicLoad, atomicOr, Return } from "three/tsl";
-import { MeshBasicNodeMaterial, Vector2, Vector4, Vector3, DoubleSide, CustomBlending, AddEquation, OneFactor, OneMinusSrcAlphaFactor, Matrix4, Quaternion } from "three/webgpu";
+import { uint, float, vec2, max, select, normalize, vec3, vec4, ivec3, int, exp, textureLoad, uniform, varyingProperty, Fn, bool, instanceIndex, positionGeometry, If, fract, cameraProjectionMatrix, ivec2, round, clamp, min, pow, mat3, transpose, sqrt, log, dot, Discard, mix, instancedArray, Return, atomicStore, workgroupArray, workgroupId, invocationLocalIndex, workgroupBarrier, storage, atomicAdd, atomicLoad, atomicOr } from "three/tsl";
+import { MeshBasicNodeMaterial, Vector2, Vector4, Vector3, DoubleSide, CustomBlending, AddEquation, OneFactor, OneMinusSrcAlphaFactor, Matrix4, Quaternion, IndirectStorageBufferAttribute } from "three/webgpu";
+import * as THREE from "three";
 import { d as kcDisposeOldMaterial, b as kcRegrowLog } from "./kcRegrowDebug-gV7aMG4z.js";
 const unpackHalf2x16$1 = TSL.unpackHalf2x16;
 const SPLAT_TEX_WIDTH_BITS = 11;
@@ -211,8 +212,8 @@ function evaluatePackedShTsl({
   }
   return rgb;
 }
-const LN_SCALE_MIN = -12;
-const LN_SCALE_MAX = 9;
+const LN_SCALE_MIN$1 = -12;
+const LN_SCALE_MAX$1 = 9;
 class SplatNodeMaterial extends MeshBasicNodeMaterial {
   constructor(options) {
     super();
@@ -230,6 +231,9 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
     this.pickNear = uniform(0);
     this.pickFar = uniform(1);
     this.earlyExit = uniform(1);
+    this.vsMinPixelRadius = uniform(4);
+    this.vsMinExtent = uniform(4);
+    this.batchNumSplats = uniform(0);
     this.minAlpha = uniform(0.5 * (1 / 255));
     this.preBlurAmount = uniform(0);
     this.blurAmount = uniform(0.3);
@@ -237,7 +241,7 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
     this.clipXY = uniform(1.4);
     this.focalAdjustment = uniform(1);
     this.rgbMinMaxLnScaleMinMax = uniform(
-      new Vector4(0, 1, LN_SCALE_MIN, LN_SCALE_MAX)
+      new Vector4(0, 1, LN_SCALE_MIN$1, LN_SCALE_MAX$1)
     );
     this.shMax = uniform(new Vector3(1, 1, 1));
     const {
@@ -250,7 +254,11 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
       lodOpacity = false,
       paged = false,
       lodInflate = false,
-      parityQuantize = true
+      parityQuantize = true,
+      vsMinimal = 0,
+      batchSize = 1,
+      projCache = void 0,
+      visCountNode = void 0
     } = options;
     stripWebGLInternalFormat(packedTexture);
     if (cutIndicesTexture) stripWebGLInternalFormat(cutIndicesTexture);
@@ -264,235 +272,388 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
     const uMaxStdDev = this.maxStdDev;
     const uMinAlpha = this.minAlpha;
     const uFalloff = this.falloff;
-    this.vertexNode = Fn(() => {
-      const rejectPos = vec4(0, 0, 2, 1);
-      const rejected = bool(false).toVar();
-      const slot = orderNode.element(instanceIndex);
-      let splatIndex = slot;
-      if (cutIndicesTexture) {
-        const texel = textureLoad(
-          cutIndicesTexture,
-          ivec2(
-            int(slot.shiftRight(uint(2)).bitAnd(uint(4095))),
-            int(slot.shiftRight(uint(14)))
-          )
-        );
-        const comp = slot.bitAnd(uint(3));
-        splatIndex = select(
-          comp.equal(uint(0)),
-          texel.x,
-          select(
-            comp.equal(uint(1)),
-            texel.y,
-            select(comp.equal(uint(2)), texel.z, texel.w)
-          )
-        );
-      }
-      const texCoord = paged ? pagedSplatTexCoordTsl(int(splatIndex)) : splatTexCoordTsl(int(splatIndex));
-      const packedData = textureLoad(packedTexture, texCoord.xy).depth(
-        texCoord.z
-      );
-      const unpacked = unpackSplatEncodingTsl(
-        packedData,
-        this.rgbMinMaxLnScaleMinMax
-      );
-      const center = unpacked.center;
-      const quaternion = unpacked.quaternion;
-      const viewCenter = quatVecTsl(
-        this.renderToViewQuat,
-        center.mul(this.renderToViewScale)
-      ).add(this.renderToViewPos);
-      rejected.assign(rejected.or(viewCenter.z.greaterThanEqual(0)));
-      vViewZ.assign(viewCenter.z);
-      const clipCenter = cameraProjectionMatrix.mul(vec4(viewCenter, 1));
-      rejected.assign(
-        rejected.or(clipCenter.z.abs().greaterThanEqual(clipCenter.w))
-      );
-      const clip = float(this.clipXY).mul(clipCenter.w);
-      rejected.assign(
-        rejected.or(clipCenter.x.abs().greaterThan(clip)).or(clipCenter.y.abs().greaterThan(clip))
-      );
-      const scales = vec3(0, 0, 0).toVar();
-      const rgba = vec4(0, 0, 0, 0).toVar();
-      const ndcOffset = vec2(0, 0).toVar();
-      If(rejected.not().or(this.earlyExit.lessThan(0.5)), () => {
-        scales.assign(vec3(unpacked.scales.mul(this.renderToViewScale)));
-        rgba.assign(vec4(unpacked.rgba));
-        if (lodOpacity) {
-          rgba.a.assign(rgba.a.mul(2));
+    if (projCache && visCountNode) {
+      this.vertexNode = Fn(() => {
+        const rejectPos = vec4(0, 0, 2, 1);
+        const rejected = bool(false).toVar();
+        let drawIdx = instanceIndex;
+        if (batchSize > 1) {
+          const rawIdx = uint(instanceIndex).mul(uint(batchSize)).add(uint(positionGeometry.z));
+          const inRange = float(rawIdx).lessThan(this.batchNumSplats);
+          rejected.assign(inRange.not());
+          drawIdx = select(inRange, rawIdx, uint(0)).toVar("kcBatchIdx");
         }
-        if (sh1Texture) {
-          const viewDir = normalize(center.sub(this.viewOrigin));
-          const shRgb = evaluatePackedShTsl({
-            coord: texCoord,
-            viewDir,
-            shMax: this.shMax,
-            sh1Texture,
-            sh2Texture,
-            sh3Texture
-          });
-          rgba.assign(vec4(rgba.rgb.add(shRgb), rgba.a));
-        }
-        if (parityQuantize) {
-          const rgbQ = round(clamp(rgba.rgb.mul(255), 0, 255)).div(255);
-          const aQ = round(clamp(rgba.a.mul(0.5).mul(255), 0, 255)).div(255).mul(2);
-          rgba.assign(vec4(rgbQ, aQ));
-          const lnScaleScale = float(254 / (LN_SCALE_MAX - LN_SCALE_MIN));
-          const requantScale = (s) => select(
-            s.equal(0),
-            float(0),
-            exp(
-              round(
-                clamp(
-                  s.log().sub(LN_SCALE_MIN).mul(lnScaleScale),
-                  0,
-                  254
-                )
-              ).div(lnScaleScale).add(LN_SCALE_MIN)
-            )
-          );
-          scales.assign(
-            vec3(
-              requantScale(scales.x),
-              requantScale(scales.y),
-              requantScale(scales.z)
-            )
-          );
-        }
-        const zeroScales = scales.equal(vec3(0));
-        rejected.assign(rejected.or(zeroScales.all()));
         rejected.assign(
-          rejected.or(rgba.a.equal(0)).or(rgba.a.lessThan(uMinAlpha))
+          rejected.or(
+            uint(drawIdx).greaterThanEqual(
+              visCountNode.element(uint(0))
+            )
+          )
         );
-        const adjustedStdDev = float(uMaxStdDev).toVar();
-        If(rgba.a.greaterThan(1), () => {
-          rgba.a.assign(min(rgba.a.mul(4).sub(3), 5));
-          if (lodInflate) {
-            const opacity = exp(
-              rgba.a.mul(rgba.a).sub(1).div(2.718281828459045)
+        const c0 = vec4(0, 0, 0, 0).toVar();
+        const c1 = vec4(0, 0, 0, 0).toVar();
+        const c2 = vec4(0, 0, 0, 0).toVar();
+        const c3 = vec4(0, 0, 0, 0).toVar();
+        If(rejected.not(), () => {
+          const slot = orderNode.element(drawIdx);
+          c0.assign(projCache.c0.element(slot));
+          c1.assign(projCache.c1.element(slot));
+          c2.assign(projCache.c2.element(slot));
+          c3.assign(projCache.c3.element(slot));
+        });
+        rejected.assign(rejected.or(c3.w.lessThan(0.5)));
+        vRgba.assign(c2);
+        vSplatUv.assign(positionGeometry.xy.mul(c3.x));
+        vAdjustedStdDev.assign(c3.y);
+        vViewZ.assign(c3.z);
+        const scaledRenderSize = vec2(this.renderSize).mul(
+          this.focalAdjustment
+        );
+        const pixelOffset = c1.xy.mul(positionGeometry.x).add(c1.zw.mul(positionGeometry.y));
+        const ndcOffset = vec2(2).div(scaledRenderSize).mul(pixelOffset);
+        const ndcCenter = c0.xyz.div(c0.w);
+        return select(
+          rejected,
+          rejectPos,
+          vec4(ndcCenter.xy.add(ndcOffset).mul(c0.w), c0.z, c0.w)
+        );
+      })();
+    } else if (projCache) {
+      this.vertexNode = Fn(() => {
+        const rejectPos = vec4(0, 0, 2, 1);
+        const rejected = bool(false).toVar();
+        let drawIdx = instanceIndex;
+        if (batchSize > 1) {
+          const rawIdx = uint(instanceIndex).mul(uint(batchSize)).add(uint(positionGeometry.z));
+          const inRange = float(rawIdx).lessThan(this.batchNumSplats);
+          rejected.assign(inRange.not());
+          drawIdx = select(inRange, rawIdx, uint(0)).toVar("kcBatchIdx");
+        }
+        const slot = orderNode.element(drawIdx);
+        const c0 = projCache.c0.element(slot);
+        const c1 = projCache.c1.element(slot);
+        const c2 = projCache.c2.element(slot);
+        const c3 = projCache.c3.element(slot);
+        rejected.assign(rejected.or(c3.w.lessThan(0.5)));
+        vRgba.assign(c2);
+        vSplatUv.assign(positionGeometry.xy.mul(c3.x));
+        vAdjustedStdDev.assign(c3.y);
+        vViewZ.assign(c3.z);
+        const scaledRenderSize = vec2(this.renderSize).mul(
+          this.focalAdjustment
+        );
+        const pixelOffset = c1.xy.mul(positionGeometry.x).add(c1.zw.mul(positionGeometry.y));
+        const ndcOffset = vec2(2).div(scaledRenderSize).mul(pixelOffset);
+        const ndcCenter = c0.xyz.div(c0.w);
+        return select(
+          rejected,
+          rejectPos,
+          vec4(ndcCenter.xy.add(ndcOffset).mul(c0.w), c0.z, c0.w)
+        );
+      })();
+    } else
+      this.vertexNode = Fn(() => {
+        const rejectPos = vec4(0, 0, 2, 1);
+        const rejected = bool(false).toVar();
+        let drawIdx = instanceIndex;
+        if (batchSize > 1) {
+          const rawIdx = uint(instanceIndex).mul(uint(batchSize)).add(uint(positionGeometry.z));
+          const inRange = float(rawIdx).lessThan(this.batchNumSplats);
+          rejected.assign(inRange.not());
+          drawIdx = select(inRange, rawIdx, uint(0)).toVar("kcBatchIdx");
+        }
+        if (vsMinimal >= 2) {
+          const fi = float(drawIdx);
+          const centerSynth = vec3(
+            fract(fi.mul(0.1031)),
+            fract(fi.mul(0.103)),
+            fract(fi.mul(0.0973))
+          ).sub(0.5).mul(this.vsMinExtent);
+          const viewCenterSynth = quatVecTsl(
+            this.renderToViewQuat,
+            centerSynth.mul(this.renderToViewScale)
+          ).add(this.renderToViewPos);
+          rejected.assign(rejected.or(viewCenterSynth.z.greaterThanEqual(0)));
+          vViewZ.assign(viewCenterSynth.z);
+          const clipCenterSynth = cameraProjectionMatrix.mul(
+            vec4(viewCenterSynth, 1)
+          );
+          rejected.assign(
+            rejected.or(
+              clipCenterSynth.z.abs().greaterThanEqual(clipCenterSynth.w)
+            )
+          );
+          const clipSynth = float(this.clipXY).mul(clipCenterSynth.w);
+          rejected.assign(
+            rejected.or(clipCenterSynth.x.abs().greaterThan(clipSynth)).or(clipCenterSynth.y.abs().greaterThan(clipSynth))
+          );
+          const ndcOffsetSynth = vec2(0, 0).toVar();
+          If(rejected.not(), () => {
+            const adjS = float(uMaxStdDev);
+            vRgba.assign(vec4(0.5, 0.5, 0.5, 0.5));
+            vSplatUv.assign(positionGeometry.xy.mul(adjS));
+            vAdjustedStdDev.assign(adjS);
+            const rsS = vec2(this.renderSize).mul(this.focalAdjustment);
+            ndcOffsetSynth.assign(
+              vec2(2).div(rsS).mul(positionGeometry.xy.mul(this.vsMinPixelRadius))
             );
-            const rescale = pow(opacity, 1 / 3);
-            scales.assign(scales.mul(rescale));
-            rgba.a.assign(1);
-          }
-          adjustedStdDev.assign(uMaxStdDev.add(rgba.a.sub(1).mul(0.7)));
-        });
-        vRgba.assign(rgba);
-        vSplatUv.assign(positionGeometry.xy.mul(adjustedStdDev));
-        const viewQuaternion = quatQuatTsl(this.renderToViewQuat, quaternion);
-        const [rsC0, rsC1, rsC2] = scaleQuaternionToMatrixColumnsTsl(
-          scales,
-          viewQuaternion
-        );
-        const RS = mat3(rsC0, rsC1, rsC2);
-        const cov3D = RS.mul(transpose(RS));
-        const scaledRenderSize = vec2(this.renderSize).mul(this.focalAdjustment);
-        const focal = scaledRenderSize.mul(0.5).mul(
-          vec2(
-            cameraProjectionMatrix.element(int(0)).element(int(0)),
-            cameraProjectionMatrix.element(int(1)).element(int(1))
-          )
-        );
-        const isOrthographic = cameraProjectionMatrix.element(int(2)).element(int(3)).notEqual(-1);
-        const invZ = float(1).div(viewCenter.z);
-        const J1 = focal.mul(invZ);
-        const J2 = J1.mul(viewCenter.xy).negate().mul(invZ);
-        const jC0 = select(
-          isOrthographic,
-          vec3(focal.x, 0, 0),
-          vec3(J1.x, 0, J2.x)
-        );
-        const jC1 = select(
-          isOrthographic,
-          vec3(0, focal.y, 0),
-          vec3(0, J1.y, J2.y)
-        );
-        const J = mat3(jC0, jC1, vec3(0, 0, 0));
-        const cov2D = transpose(J).mul(cov3D).mul(J);
-        const a = float(cov2D.element(int(0)).element(int(0))).toVar();
-        const d = float(cov2D.element(int(1)).element(int(1))).toVar();
-        const b = cov2D.element(int(0)).element(int(1));
-        a.addAssign(this.preBlurAmount);
-        d.addAssign(this.preBlurAmount);
-        const fullBlurAmount = this.blurAmount;
-        const detOrig = a.mul(d).sub(b.mul(b));
-        a.addAssign(fullBlurAmount);
-        d.addAssign(fullBlurAmount);
-        const det = a.mul(d).sub(b.mul(b));
-        const blurAdjust = sqrt(max(0, detOrig.div(det)));
-        const rawAlpha = rgba.a.toVar("kcRawAlpha");
-        rgba.a.assign(rgba.a.mul(blurAdjust));
-        rejected.assign(rejected.or(rgba.a.lessThan(uMinAlpha)));
-        vRgba.a.assign(rgba.a);
-        vAdjustedStdDev.assign(adjustedStdDev);
-        const fillOn = this.ssogFillV2.greaterThan(0.5);
-        rejected.assign(
-          rejected.or(fillOn.and(rawAlpha.lessThan(1 / 255)))
-        );
-        rejected.assign(
-          rejected.or(
-            fillOn.and(
-              rawAlpha.mul(6.283185307179586).mul(sqrt(max(det, 0))).lessThan(this.ssogMinContribution)
+          });
+          const ndcCenterSynth = clipCenterSynth.xyz.div(clipCenterSynth.w);
+          return select(
+            rejected,
+            rejectPos,
+            vec4(
+              ndcCenterSynth.xy.add(ndcOffsetSynth).mul(clipCenterSynth.w),
+              clipCenterSynth.z,
+              clipCenterSynth.w
             )
-          )
-        );
-        const eigenAvg = a.add(d).mul(0.5);
-        const eigenDelta = sqrt(max(0, eigenAvg.mul(eigenAvg).sub(det)));
-        const eigen1 = eigenAvg.add(eigenDelta);
-        const eigen2 = eigenAvg.sub(eigenDelta);
-        const eigenVec1 = select(
-          b.abs().greaterThan(1e-3),
-          normalize(vec2(b, eigen1.sub(a))),
-          select(
-            a.greaterThanEqual(d),
-            vec2(1, 0),
-            vec2(0, 1)
-          )
-        );
-        const eigenVec2 = vec2(eigenVec1.y, eigenVec1.x.negate());
-        const r1 = adjustedStdDev.mul(sqrt(eigen1));
-        const r2 = adjustedStdDev.mul(sqrt(eigen2));
-        const fillCap = min(
-          1024,
-          min(this.renderSize.x, this.renderSize.y)
-        );
-        const capScale = min(1, fillCap.div(max(r1, r2)));
-        const zStar = sqrt(
-          max(0, log(rgba.a.mul(255))).mul(2)
-        );
-        const quadScale = min(1, zStar.div(adjustedStdDev));
-        const scale1 = select(
-          fillOn,
-          r1.mul(capScale).mul(quadScale),
-          min(this.maxPixelRadius, r1)
-        );
-        const scale2 = select(
-          fillOn,
-          r2.mul(capScale).mul(quadScale),
-          min(this.maxPixelRadius, r2)
-        );
-        If(fillOn, () => {
-          vSplatUv.assign(
-            positionGeometry.xy.mul(adjustedStdDev.mul(quadScale))
           );
-        });
-        rejected.assign(
-          rejected.or(
-            scale1.lessThan(this.minPixelRadius).and(scale2.lessThan(this.minPixelRadius))
-          )
+        }
+        const slot = orderNode.element(drawIdx);
+        let splatIndex = slot;
+        if (cutIndicesTexture) {
+          const texel = textureLoad(
+            cutIndicesTexture,
+            ivec2(
+              int(slot.shiftRight(uint(2)).bitAnd(uint(4095))),
+              int(slot.shiftRight(uint(14)))
+            )
+          );
+          const comp = slot.bitAnd(uint(3));
+          splatIndex = select(
+            comp.equal(uint(0)),
+            texel.x,
+            select(
+              comp.equal(uint(1)),
+              texel.y,
+              select(comp.equal(uint(2)), texel.z, texel.w)
+            )
+          );
+        }
+        const texCoord = paged ? pagedSplatTexCoordTsl(int(splatIndex)) : splatTexCoordTsl(int(splatIndex));
+        const packedData = textureLoad(packedTexture, texCoord.xy).depth(
+          texCoord.z
         );
-        const posXY = positionGeometry.xy;
-        const pixelOffset = eigenVec1.mul(scale1).mul(posXY.x).add(eigenVec2.mul(scale2).mul(posXY.y));
-        ndcOffset.assign(vec2(2).div(scaledRenderSize).mul(pixelOffset));
-      });
-      const ndcCenter = clipCenter.xyz.div(clipCenter.w);
-      const ndc = vec3(ndcCenter.xy.add(ndcOffset), ndcCenter.z);
-      return select(
-        rejected,
-        rejectPos,
-        vec4(ndc.xy.mul(clipCenter.w), clipCenter.z, clipCenter.w)
-      );
-    })();
+        const unpacked = unpackSplatEncodingTsl(
+          packedData,
+          this.rgbMinMaxLnScaleMinMax
+        );
+        const center = unpacked.center;
+        const quaternion = unpacked.quaternion;
+        const viewCenter = quatVecTsl(
+          this.renderToViewQuat,
+          center.mul(this.renderToViewScale)
+        ).add(this.renderToViewPos);
+        rejected.assign(rejected.or(viewCenter.z.greaterThanEqual(0)));
+        vViewZ.assign(viewCenter.z);
+        const clipCenter = cameraProjectionMatrix.mul(vec4(viewCenter, 1));
+        rejected.assign(
+          rejected.or(clipCenter.z.abs().greaterThanEqual(clipCenter.w))
+        );
+        const clip = float(this.clipXY).mul(clipCenter.w);
+        rejected.assign(
+          rejected.or(clipCenter.x.abs().greaterThan(clip)).or(clipCenter.y.abs().greaterThan(clip))
+        );
+        const scales = vec3(0, 0, 0).toVar();
+        const rgba = vec4(0, 0, 0, 0).toVar();
+        const ndcOffset = vec2(0, 0).toVar();
+        If(rejected.not().or(this.earlyExit.lessThan(0.5)), () => {
+          if (vsMinimal >= 1) {
+            const keepAlive = unpacked.scales.x.add(unpacked.quaternion.x).mul(0);
+            rgba.assign(vec4(unpacked.rgba));
+            if (lodOpacity) {
+              rgba.a.assign(rgba.a.mul(2));
+            }
+            rgba.a.assign(rgba.a.add(keepAlive));
+            const adj = float(uMaxStdDev);
+            vRgba.assign(rgba);
+            vSplatUv.assign(positionGeometry.xy.mul(adj));
+            vAdjustedStdDev.assign(adj);
+            const scaledRenderSizeMin = vec2(this.renderSize).mul(
+              this.focalAdjustment
+            );
+            ndcOffset.assign(
+              vec2(2).div(scaledRenderSizeMin).mul(positionGeometry.xy.mul(this.vsMinPixelRadius))
+            );
+            return;
+          }
+          scales.assign(vec3(unpacked.scales.mul(this.renderToViewScale)));
+          rgba.assign(vec4(unpacked.rgba));
+          if (lodOpacity) {
+            rgba.a.assign(rgba.a.mul(2));
+          }
+          if (sh1Texture) {
+            const viewDir = normalize(center.sub(this.viewOrigin));
+            const shRgb = evaluatePackedShTsl({
+              coord: texCoord,
+              viewDir,
+              shMax: this.shMax,
+              sh1Texture,
+              sh2Texture,
+              sh3Texture
+            });
+            rgba.assign(vec4(rgba.rgb.add(shRgb), rgba.a));
+          }
+          if (parityQuantize) {
+            const rgbQ = round(clamp(rgba.rgb.mul(255), 0, 255)).div(255);
+            const aQ = round(clamp(rgba.a.mul(0.5).mul(255), 0, 255)).div(255).mul(2);
+            rgba.assign(vec4(rgbQ, aQ));
+            const lnScaleScale = float(254 / (LN_SCALE_MAX$1 - LN_SCALE_MIN$1));
+            const requantScale = (s) => select(
+              s.equal(0),
+              float(0),
+              exp(
+                round(
+                  clamp(
+                    s.log().sub(LN_SCALE_MIN$1).mul(lnScaleScale),
+                    0,
+                    254
+                  )
+                ).div(lnScaleScale).add(LN_SCALE_MIN$1)
+              )
+            );
+            scales.assign(
+              vec3(
+                requantScale(scales.x),
+                requantScale(scales.y),
+                requantScale(scales.z)
+              )
+            );
+          }
+          const zeroScales = scales.equal(vec3(0));
+          rejected.assign(rejected.or(zeroScales.all()));
+          rejected.assign(
+            rejected.or(rgba.a.equal(0)).or(rgba.a.lessThan(uMinAlpha))
+          );
+          const adjustedStdDev = float(uMaxStdDev).toVar();
+          If(rgba.a.greaterThan(1), () => {
+            rgba.a.assign(min(rgba.a.mul(4).sub(3), 5));
+            if (lodInflate) {
+              const opacity = exp(
+                rgba.a.mul(rgba.a).sub(1).div(2.718281828459045)
+              );
+              const rescale = pow(opacity, 1 / 3);
+              scales.assign(scales.mul(rescale));
+              rgba.a.assign(1);
+            }
+            adjustedStdDev.assign(uMaxStdDev.add(rgba.a.sub(1).mul(0.7)));
+          });
+          vRgba.assign(rgba);
+          vSplatUv.assign(positionGeometry.xy.mul(adjustedStdDev));
+          const viewQuaternion = quatQuatTsl(this.renderToViewQuat, quaternion);
+          const [rsC0, rsC1, rsC2] = scaleQuaternionToMatrixColumnsTsl(
+            scales,
+            viewQuaternion
+          );
+          const RS = mat3(rsC0, rsC1, rsC2);
+          const cov3D = RS.mul(transpose(RS));
+          const scaledRenderSize = vec2(this.renderSize).mul(this.focalAdjustment);
+          const focal = scaledRenderSize.mul(0.5).mul(
+            vec2(
+              cameraProjectionMatrix.element(int(0)).element(int(0)),
+              cameraProjectionMatrix.element(int(1)).element(int(1))
+            )
+          );
+          const isOrthographic = cameraProjectionMatrix.element(int(2)).element(int(3)).notEqual(-1);
+          const invZ = float(1).div(viewCenter.z);
+          const J1 = focal.mul(invZ);
+          const J2 = J1.mul(viewCenter.xy).negate().mul(invZ);
+          const jC0 = select(
+            isOrthographic,
+            vec3(focal.x, 0, 0),
+            vec3(J1.x, 0, J2.x)
+          );
+          const jC1 = select(
+            isOrthographic,
+            vec3(0, focal.y, 0),
+            vec3(0, J1.y, J2.y)
+          );
+          const J = mat3(jC0, jC1, vec3(0, 0, 0));
+          const cov2D = transpose(J).mul(cov3D).mul(J);
+          const a = float(cov2D.element(int(0)).element(int(0))).toVar();
+          const d = float(cov2D.element(int(1)).element(int(1))).toVar();
+          const b = cov2D.element(int(0)).element(int(1));
+          a.addAssign(this.preBlurAmount);
+          d.addAssign(this.preBlurAmount);
+          const fullBlurAmount = this.blurAmount;
+          const detOrig = a.mul(d).sub(b.mul(b));
+          a.addAssign(fullBlurAmount);
+          d.addAssign(fullBlurAmount);
+          const det = a.mul(d).sub(b.mul(b));
+          const blurAdjust = sqrt(max(0, detOrig.div(det)));
+          const rawAlpha = rgba.a.toVar("kcRawAlpha");
+          rgba.a.assign(rgba.a.mul(blurAdjust));
+          rejected.assign(rejected.or(rgba.a.lessThan(uMinAlpha)));
+          vRgba.a.assign(rgba.a);
+          vAdjustedStdDev.assign(adjustedStdDev);
+          const fillOn = this.ssogFillV2.greaterThan(0.5);
+          rejected.assign(
+            rejected.or(fillOn.and(rawAlpha.lessThan(1 / 255)))
+          );
+          rejected.assign(
+            rejected.or(
+              fillOn.and(
+                rawAlpha.mul(6.283185307179586).mul(sqrt(max(det, 0))).lessThan(this.ssogMinContribution)
+              )
+            )
+          );
+          const eigenAvg = a.add(d).mul(0.5);
+          const eigenDelta = sqrt(max(0, eigenAvg.mul(eigenAvg).sub(det)));
+          const eigen1 = eigenAvg.add(eigenDelta);
+          const eigen2 = eigenAvg.sub(eigenDelta);
+          const eigenVec1 = select(
+            b.abs().greaterThan(1e-3),
+            normalize(vec2(b, eigen1.sub(a))),
+            select(
+              a.greaterThanEqual(d),
+              vec2(1, 0),
+              vec2(0, 1)
+            )
+          );
+          const eigenVec2 = vec2(eigenVec1.y, eigenVec1.x.negate());
+          const r1 = adjustedStdDev.mul(sqrt(eigen1));
+          const r2 = adjustedStdDev.mul(sqrt(eigen2));
+          const fillCap = min(
+            1024,
+            min(this.renderSize.x, this.renderSize.y)
+          );
+          const capScale = min(1, fillCap.div(max(r1, r2)));
+          const zStar = sqrt(
+            max(0, log(rgba.a.mul(255))).mul(2)
+          );
+          const quadScale = min(1, zStar.div(adjustedStdDev));
+          const scale1 = select(
+            fillOn,
+            r1.mul(capScale).mul(quadScale),
+            min(this.maxPixelRadius, r1)
+          );
+          const scale2 = select(
+            fillOn,
+            r2.mul(capScale).mul(quadScale),
+            min(this.maxPixelRadius, r2)
+          );
+          If(fillOn, () => {
+            vSplatUv.assign(
+              positionGeometry.xy.mul(adjustedStdDev.mul(quadScale))
+            );
+          });
+          rejected.assign(
+            rejected.or(
+              scale1.lessThan(this.minPixelRadius).and(scale2.lessThan(this.minPixelRadius))
+            )
+          );
+          const posXY = positionGeometry.xy;
+          const pixelOffset = eigenVec1.mul(scale1).mul(posXY.x).add(eigenVec2.mul(scale2).mul(posXY.y));
+          ndcOffset.assign(vec2(2).div(scaledRenderSize).mul(pixelOffset));
+        });
+        const ndcCenter = clipCenter.xyz.div(clipCenter.w);
+        const ndc = vec3(ndcCenter.xy.add(ndcOffset), ndcCenter.z);
+        return select(
+          rejected,
+          rejectPos,
+          vec4(ndc.xy.mul(clipCenter.w), clipCenter.z, clipCenter.w)
+        );
+      })();
     this.fragmentNode = Fn(() => {
       const rgba = vec4(vRgba).toVar();
       const z2 = dot(vSplatUv, vSplatUv);
@@ -570,18 +731,30 @@ function referenceAlphaChain(u8, lodOpacity, {
 const countOneBits = TSL.countOneBits;
 const TPW = 256;
 const EPT = 8;
-const EPW = TPW * EPT;
-const BUCKETS = 16;
 const SCAN_ITEMS = 512;
 const pad = (n, m) => Math.ceil(n / m) * m;
 function createRadixSort({
   keysNode,
   count,
-  numBits = 16
+  numBits = 16,
+  digitBits = 4,
+  reorderThreads = 256,
+  valuesNode,
+  indirect
 }) {
-  if (numBits % 4 !== 0) throw new Error("numBits must be a multiple of 4");
-  const numPasses = numBits / 4;
-  const wgCount = Math.max(1, Math.ceil(count / EPW));
+  if (digitBits !== 4 && digitBits !== 8)
+    throw new Error("digitBits must be 4 or 8");
+  if (numBits % digitBits !== 0)
+    throw new Error("numBits must be a multiple of digitBits");
+  if (![64, 128, 256].includes(reorderThreads))
+    throw new Error("reorderThreads must be 64, 128 or 256");
+  const BUCKETS = 1 << digitBits;
+  const numPasses = numBits / digitBits;
+  const RT = reorderThreads;
+  const WORDS = RT / 32;
+  const EPW_R = RT * EPT;
+  const DPT = Math.ceil(BUCKETS / RT);
+  const wgCount = Math.max(1, Math.ceil(count / EPW_R));
   const blockSumCount = BUCKETS * wgCount;
   const blockSums = instancedArray(pad(blockSumCount, SCAN_ITEMS), "uint");
   const keysA = instancedArray(count, "uint");
@@ -611,23 +784,29 @@ function createRadixSort({
     return Fn(() => {
       const TID = invocationLocalIndex;
       const WGID = workgroupId.x;
-      const WID = WGID.mul(uint(EPW));
-      If(TID.lessThan(uint(BUCKETS)), () => {
-        atomicStore(hist.element(TID), uint(0));
-      });
+      const WID = WGID.mul(uint(EPW_R));
+      for (let k = 0; k < DPT; k++) {
+        const dg = TID.add(uint(k * RT));
+        If(dg.lessThan(uint(BUCKETS)), () => {
+          atomicStore(hist.element(dg), uint(0));
+        });
+      }
       workgroupBarrier();
       for (let r = 0; r < EPT; r++) {
-        const GID = WID.add(uint(r * TPW)).add(TID);
+        const GID = WID.add(uint(r * RT)).add(TID);
         If(GID.lessThan(uint(count)), () => {
-          const digit = srcKeys.element(GID).shiftRight(uint(bit)).bitAnd(uint(15));
+          const digit = srcKeys.element(GID).shiftRight(uint(bit)).bitAnd(uint(BUCKETS - 1));
           atomicAdd(hist.element(digit), uint(1));
         });
       }
       workgroupBarrier();
-      If(TID.lessThan(uint(BUCKETS)), () => {
-        blockSums.element(TID.mul(uint(wgCount)).add(WGID)).assign(atomicLoad(hist.element(TID)));
-      });
-    })().compute([wgCount], [TPW]).setName(`radixHist_bit${bit}`);
+      for (let k = 0; k < DPT; k++) {
+        const dg = TID.add(uint(k * RT));
+        If(dg.lessThan(uint(BUCKETS)), () => {
+          blockSums.element(dg.mul(uint(wgCount)).add(WGID)).assign(atomicLoad(hist.element(dg)));
+        });
+      }
+    })().compute([wgCount], [RT]).setName(`radixHist_bit${bit}`);
   };
   const makeScan = (level, idx) => {
     const temp = workgroupArray("uint", SCAN_ITEMS * 2);
@@ -703,42 +882,50 @@ function createRadixSort({
     })().compute([level.wgs], [TPW]).setName(`radixScanAdd_L${idx}`);
   };
   const makeReorder = (inKeys, outKeys, inVals, outVals, bit, isFirst, isLast) => {
-    const masks = workgroupArray("uint", 128).setAtomic(true);
+    const masks = workgroupArray("uint", BUCKETS * WORDS).setAtomic(
+      true
+    );
     const offsets = workgroupArray("uint", BUCKETS);
     return Fn(() => {
       const TID = invocationLocalIndex;
       const WGID = workgroupId.x;
-      const WID = WGID.mul(uint(EPW));
+      const WID = WGID.mul(uint(EPW_R));
       const wordIdx = TID.shiftRight(uint(5)).toVar();
       const bitIdx = TID.bitAnd(uint(31)).toVar();
-      If(TID.lessThan(uint(BUCKETS)), () => {
-        offsets.element(TID).assign(uint(0));
-      });
-      If(TID.lessThan(uint(128)), () => {
-        atomicStore(masks.element(TID), uint(0));
-      });
+      for (let k = 0; k < DPT; k++) {
+        const dg = TID.add(uint(k * RT));
+        If(dg.lessThan(uint(BUCKETS)), () => {
+          offsets.element(dg).assign(uint(0));
+          for (let w = 0; w < WORDS; w++) {
+            atomicStore(
+              masks.element(dg.mul(uint(WORDS)).add(uint(w))),
+              uint(0)
+            );
+          }
+        });
+      }
       workgroupBarrier();
       for (let round2 = 0; round2 < EPT; round2++) {
-        const GID = WID.add(uint(round2 * TPW)).add(TID).toVar();
+        const GID = WID.add(uint(round2 * RT)).add(TID).toVar();
         const isValid = GID.lessThan(uint(count)).toVar();
         const k = select(isValid, inKeys.element(GID), uint(0)).toVar();
         const digit = select(
           isValid,
-          k.shiftRight(uint(bit)).bitAnd(uint(15)),
-          uint(16)
+          k.shiftRight(uint(bit)).bitAnd(uint(BUCKETS - 1)),
+          uint(BUCKETS)
         ).toVar();
-        const v = (isFirst ? GID : select(isValid, inVals.element(GID), uint(0))).toVar();
+        const v = (isFirst ? valuesNode ? select(isValid, valuesNode.element(GID), uint(0)) : GID : select(isValid, inVals.element(GID), uint(0))).toVar();
         If(isValid, () => {
           atomicOr(
-            masks.element(digit.mul(uint(8)).add(wordIdx)),
+            masks.element(digit.mul(uint(WORDS)).add(wordIdx)),
             uint(1).shiftLeft(bitIdx)
           );
         });
         workgroupBarrier();
         If(isValid, () => {
-          const base = digit.mul(uint(8)).toVar();
+          const base = digit.mul(uint(WORDS)).toVar();
           const localPrefix = offsets.element(digit).toVar();
-          for (let w = 0; w < 7; w++) {
+          for (let w = 0; w < WORDS - 1; w++) {
             If(uint(w).lessThan(wordIdx), () => {
               localPrefix.addAssign(
                 countOneBits(atomicLoad(masks.element(base.add(uint(w)))))
@@ -759,40 +946,94 @@ function createRadixSort({
         });
         if (round2 < EPT - 1) {
           workgroupBarrier();
-          If(TID.lessThan(uint(BUCKETS)), () => {
-            const cnt = uint(0).toVar();
-            for (let w = 0; w < 8; w++) {
-              const idx = TID.mul(uint(8)).add(uint(w));
-              cnt.addAssign(countOneBits(atomicLoad(masks.element(idx))));
-              atomicStore(masks.element(idx), uint(0));
-            }
-            offsets.element(TID).addAssign(cnt);
-          });
+          for (let k2 = 0; k2 < DPT; k2++) {
+            const dg = TID.add(uint(k2 * RT));
+            If(dg.lessThan(uint(BUCKETS)), () => {
+              const cnt = uint(0).toVar();
+              for (let w = 0; w < WORDS; w++) {
+                const idx = dg.mul(uint(WORDS)).add(uint(w));
+                cnt.addAssign(countOneBits(atomicLoad(masks.element(idx))));
+                atomicStore(masks.element(idx), uint(0));
+              }
+              offsets.element(dg).addAssign(cnt);
+            });
+          }
           workgroupBarrier();
         }
       }
-    })().compute([wgCount], [TPW]).setName(`radixReorder_bit${bit}`);
+    })().compute([wgCount], [RT]).setName(`radixReorder_bit${bit}`);
+  };
+  const makeArgs = () => {
+    if (!indirect) return null;
+    const dispatchStore = storage(
+      // biome-ignore lint/suspicious/noExplicitAny: structural three attribute
+      indirect.dispatchAttr,
+      "uint",
+      3
+    );
+    const vis = indirect.visCountNode;
+    return Fn(() => {
+      If(instanceIndex.greaterThanEqual(uint(1)), () => {
+        Return();
+      });
+      const v = vis.element(uint(0)).toVar();
+      dispatchStore.element(uint(0)).assign(v.add(uint(EPW_R - 1)).div(uint(EPW_R)));
+      dispatchStore.element(uint(1)).assign(uint(1));
+      dispatchStore.element(uint(2)).assign(uint(1));
+    })().compute([1], [1]).setName("radixIndirectArgs");
+  };
+  const makeClearBlockSums = () => {
+    const n = pad(blockSumCount, SCAN_ITEMS);
+    return Fn(() => {
+      const i = instanceIndex;
+      If(i.greaterThanEqual(uint(n)), () => {
+        Return();
+      });
+      blockSums.element(i).assign(uint(0));
+    })().compute([Math.ceil(n / 256)], [256]).setName("radixClearBlockSums");
   };
   const scanNodes = levels.map((level, i) => makeScan(level, i));
   const addNodes = levels.map(
     (level, i) => level.wgs > 1 ? makeAddBlock(level, i) : null
   );
+  const argsNode = makeArgs();
+  const clearNode = indirect ? makeClearBlockSums() : null;
   const steps = [];
+  const groups = indirect ? [] : null;
   let curKeys = keysNode;
   let curVals = valsA;
   let nxtKeys = keysA;
   let nxtVals = valsB;
   for (let pass = 0; pass < numPasses; pass++) {
-    const bit = pass * 4;
+    const bit = pass * digitBits;
     const isFirst = pass === 0;
     const isLast = pass === numPasses - 1;
-    steps.push(makeHistogram(curKeys, bit));
-    for (let i = 0; i < levels.length; i++) steps.push(scanNodes[i]);
+    const hist = makeHistogram(curKeys, bit);
+    const scanChain = [];
+    for (let i = 0; i < levels.length; i++) scanChain.push(scanNodes[i]);
     for (let i = levels.length - 1; i >= 0; i--) {
       const addNode = addNodes[i];
-      if (addNode) steps.push(addNode);
+      if (addNode) scanChain.push(addNode);
     }
-    steps.push(makeReorder(curKeys, nxtKeys, curVals, nxtVals, bit, isFirst, isLast));
+    const reorder = makeReorder(
+      curKeys,
+      nxtKeys,
+      curVals,
+      nxtVals,
+      bit,
+      isFirst,
+      isLast
+    );
+    steps.push(hist, ...scanChain, reorder);
+    if (groups && argsNode && clearNode) {
+      groups.push({
+        nodes: isFirst ? [argsNode, clearNode] : [clearNode],
+        indirect: false
+      });
+      groups.push({ nodes: [hist], indirect: true });
+      groups.push({ nodes: scanChain, indirect: false });
+      groups.push({ nodes: [reorder], indirect: true });
+    }
     if (!isLast) {
       curKeys = nxtKeys;
       nxtKeys = curKeys === keysA ? keysB : keysA;
@@ -804,11 +1045,68 @@ function createRadixSort({
   const sortedValues = (numPasses - 1) % 2 === 1 ? valsA : valsB;
   return {
     steps,
+    groups,
     sortedValues,
     wgCount,
-    dispatchesPerSort: steps.length
+    dispatchesPerSort: groups ? groups.reduce((a, g) => a + g.nodes.length, 0) : steps.length
   };
 }
+function createVisibleClear({
+  keysNode,
+  count,
+  quantMax,
+  visCountNode
+}) {
+  return Fn(() => {
+    const i = instanceIndex;
+    If(i.greaterThanEqual(uint(Math.max(1, count))), () => {
+      Return();
+    });
+    keysNode.element(i).assign(uint(quantMax));
+    If(i.equal(uint(0)), () => {
+      atomicStore(visCountNode.element(uint(0)), uint(0));
+    });
+  })().compute([Math.ceil(Math.max(1, count) / 256)], [256]).setName("visibleClear");
+}
+class BatchedSplatGeometry extends THREE.InstancedBufferGeometry {
+  constructor(batchSize) {
+    super();
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 4096) {
+      throw new Error(`BatchedSplatGeometry: bad batchSize ${batchSize}`);
+    }
+    this.batchSize = batchSize;
+    const verts = new Float32Array(batchSize * 4 * 3);
+    const use32 = batchSize * 4 > 65535;
+    const idx = use32 ? new Uint32Array(batchSize * 6) : new Uint16Array(batchSize * 6);
+    for (let q = 0; q < batchSize; q++) {
+      const v = q * 12;
+      verts[v + 0] = -1;
+      verts[v + 1] = -1;
+      verts[v + 2] = q;
+      verts[v + 3] = 1;
+      verts[v + 4] = -1;
+      verts[v + 5] = q;
+      verts[v + 6] = 1;
+      verts[v + 7] = 1;
+      verts[v + 8] = q;
+      verts[v + 9] = -1;
+      verts[v + 10] = 1;
+      verts[v + 11] = q;
+      const i = q * 6;
+      const b = q * 4;
+      idx[i + 0] = b;
+      idx[i + 1] = b + 1;
+      idx[i + 2] = b + 2;
+      idx[i + 3] = b;
+      idx[i + 4] = b + 2;
+      idx[i + 5] = b + 3;
+    }
+    this.setAttribute("position", new THREE.BufferAttribute(verts, 3));
+    this.setIndex(new THREE.BufferAttribute(idx, 1));
+  }
+}
+const LN_SCALE_MIN = -12;
+const LN_SCALE_MAX = 9;
 const unpackHalf2x16 = TSL.unpackHalf2x16;
 function fromHalf(h) {
   const s = (h & 32768) >> 15;
@@ -856,6 +1154,14 @@ class WebGpuSplatBackend {
   constructor() {
     this.sortRadial = true;
     this.freezeOrder = false;
+    this.vsMinimal = 0;
+    this.parityQuantize = true;
+    this.batchSize = 1;
+    this.projectorEnabled = false;
+    this.sortBits = 16;
+    this.sortDigits = 4;
+    this.sortTpw = 256;
+    this.sortVisible = false;
     this.frames = 0;
     this.sorts = 0;
     this.lastSortFrame = -1;
@@ -879,6 +1185,7 @@ class WebGpuSplatBackend {
     if (!mesh || !src || src.numSplats === 0) {
       spark.activeSplats = 0;
       spark.geometry.instanceCount = 0;
+      if (this.state) this.state.drawInstances = 0;
       return false;
     }
     this.sortRadial = spark.sortRadial ?? true;
@@ -891,14 +1198,14 @@ class WebGpuSplatBackend {
     }
     const state = this.state;
     const cutChanged = src.numSplats !== state.lastNumSplats || src.mappingVersion !== state.lastMappingVersion;
+    const wantSort = !this.freezeOrder && (viewChanged || rebuilt || cutChanged || !this.sortedOnce);
     let didSort = false;
-    if (!this.freezeOrder && (viewChanged || rebuilt || cutChanged || !this.sortedOnce)) {
+    if (wantSort) {
       if (rebuilt || cutChanged) {
         this.updateBounds(state, src);
       }
       state.uNumSplats.value = src.numSplats;
       this.updateKeygenUniforms(state, camera);
-      spark.renderer.compute([state.keygen, ...state.radix.steps]);
       this.sortedOnce = true;
       this.sorts++;
       this.lastSortFrame = this.frames;
@@ -907,7 +1214,29 @@ class WebGpuSplatBackend {
       state.lastMappingVersion = src.mappingVersion;
     }
     spark.activeSplats = src.numSplats;
-    spark.geometry.instanceCount = src.numSplats;
+    const drawInstances = this.batchSize > 1 ? Math.ceil(src.numSplats / this.batchSize) : src.numSplats;
+    state.drawInstances = drawInstances;
+    state.material.batchNumSplats.value = src.numSplats;
+    spark.geometry.instanceCount = drawInstances;
+    if (state.projector && src.numSplats > 0) {
+      this.syncUniforms(spark, camera);
+      if (state.uWriteKeys) state.uWriteKeys.value = wantSort ? 1 : 0;
+      if (wantSort && state.uWriteKeys && state.visGroups) {
+        spark.renderer.compute([state.visPrePass, state.projector]);
+        for (const g of state.visGroups) {
+          spark.renderer.compute(
+            g.nodes,
+            g.indirect ? state.visDispatchAttr : null
+          );
+        }
+      } else {
+        spark.renderer.compute(
+          wantSort && state.uWriteKeys ? [state.projector, ...state.radix.steps] : [state.projector]
+        );
+      }
+    } else if (wantSort) {
+      spark.renderer.compute([state.keygen, ...state.radix.steps]);
+    }
     const ctx = mesh.context;
     if (ctx) {
       if (src.kind === "static" && ctx.numSplats) {
@@ -926,7 +1255,28 @@ class WebGpuSplatBackend {
   applyPerFrame(spark, camera) {
     const state = this.state;
     if (!state) return;
+    state.material;
+    if (this.batchSize > 1) {
+      spark.geometry.instanceCount = state.drawInstances;
+    }
+    this.syncUniforms(spark, camera);
+  }
+  // Per-frame uniform sync, shared by applyPerFrame (onBeforeRender) and -
+  // when the projector is on - update(), because the projector compute is
+  // submitted from update() and must see THIS frame's camera, not last
+  // frame's. camera.updateMatrixWorld() + a manual inverse make the transform
+  // fresh regardless of which caller runs first (matrixWorldInverse is only
+  // refreshed inside renderer.render).
+  syncUniforms(spark, camera) {
+    const state = this.state;
+    if (!state) return;
     const mat = state.material;
+    camera.updateMatrixWorld();
+    if (state.uProjection) {
+      state.uProjection.value.copy(
+        camera.projectionMatrix
+      );
+    }
     mat.renderSize.value.copy(spark.renderSize);
     mat.maxStdDev.value = spark.maxStdDev;
     mat.minPixelRadius.value = spark.minPixelRadius;
@@ -937,6 +1287,11 @@ class WebGpuSplatBackend {
     mat.pickMode.value = spark.pickMode ?? 0;
     mat.pickNear.value = spark.pickNear ?? 0;
     mat.pickFar.value = spark.pickFar ?? 1;
+    const g = globalThis;
+    const vsPx = g.__kcSplatVsMinPx;
+    mat.vsMinPixelRadius.value = typeof vsPx === "number" && vsPx > 0 ? vsPx : 4;
+    const vsExt = g.__kcSplatVsMinExt;
+    mat.vsMinExtent.value = typeof vsExt === "number" && vsExt > 0 ? vsExt : 4;
     mat.minAlpha.value = spark.minAlpha;
     mat.preBlurAmount.value = spark.preBlurAmount;
     mat.blurAmount.value = spark.blurAmount;
@@ -951,7 +1306,7 @@ class WebGpuSplatBackend {
       enc.lnScaleMax ?? 9
     );
     mat.shMax.value.set(enc.sh1Max ?? 1, enc.sh2Max ?? 1, enc.sh3Max ?? 1);
-    const objectToView = new Matrix4().copy(camera.matrixWorldInverse).multiply(state.mesh.matrixWorld);
+    const objectToView = new Matrix4().copy(camera.matrixWorld).invert().multiply(state.mesh.matrixWorld);
     const pos = new Vector3();
     const quat = new Quaternion();
     const scl = new Vector3();
@@ -963,7 +1318,9 @@ class WebGpuSplatBackend {
     const camWorld = camera.getWorldPosition(new Vector3());
     mat.viewOrigin.value.copy(camWorld.applyMatrix4(worldToObject));
   }
-  // Debug/test access (harness reads the permutation + material).
+  // Debug/test access (harness reads the permutation + material;
+  // SplatMeasure reads visCountAttr ONCE per phase boundary via
+  // renderer.getArrayBufferAsync — never per frame).
   getState() {
     const s = this.state;
     if (!s) return null;
@@ -974,7 +1331,8 @@ class WebGpuSplatBackend {
       numShBound: s.sh3 ? 3 : s.sh2 ? 2 : s.sh1 ? 1 : 0,
       material: s.material,
       sortedValues: s.radix.sortedValues,
-      keysNode: s.keysNode
+      keysNode: s.keysNode,
+      visCountAttr: s.visCountAttr
     };
   }
   findSplatMesh(scene) {
@@ -1087,11 +1445,52 @@ class WebGpuSplatBackend {
     stripWebGLInternalFormat(packedTexture);
     if (cutTexture) stripWebGLInternalFormat(cutTexture);
     const keysNode = instancedArray(Math.max(1, capacity), "uint");
+    const sortBits = this.sortBits >= 4 && this.sortBits <= 16 && this.sortBits % 4 === 0 ? this.sortBits : 16;
+    const quantMax = 2 ** sortBits - 1;
+    const digitBits = this.sortDigits === 8 && sortBits % 8 === 0 ? 8 : 4;
+    const reorderThreads = [64, 128, 256].includes(this.sortTpw) ? this.sortTpw : 256;
+    const projOn = this.projectorEnabled && this.vsMinimal === 0;
+    const visOn = projOn && this.sortVisible;
+    let visCountAtomic = null;
+    let visCountRead = null;
+    let compactVals = null;
+    let visDispatchAttr = null;
+    let visCountAttr = null;
+    if (visOn) {
+      visCountAtomic = instancedArray(1, "uint").toAtomic();
+      visCountAttr = visCountAtomic.value;
+      visCountRead = storage(
+        // biome-ignore lint/suspicious/noExplicitAny: shared attribute view
+        visCountAttr,
+        "uint",
+        1
+      );
+      compactVals = instancedArray(Math.max(1, capacity), "uint");
+      visDispatchAttr = new IndirectStorageBufferAttribute(
+        new Uint32Array([0, 1, 1]),
+        3
+      );
+    }
     const radix = createRadixSort({
       keysNode,
       count: Math.max(1, capacity),
-      numBits: 16
+      numBits: sortBits,
+      digitBits,
+      reorderThreads,
+      ...visOn && visCountRead && compactVals ? {
+        valuesNode: compactVals,
+        indirect: {
+          visCountNode: visCountRead,
+          dispatchAttr: visDispatchAttr
+        }
+      } : {}
     });
+    const visPrePass = visOn ? createVisibleClear({
+      keysNode,
+      count: Math.max(1, capacity),
+      quantMax,
+      visCountNode: visCountAtomic
+    }) : null;
     const uNumSplats = uniform(0);
     const uMeshToWorld = uniform(new Matrix4());
     const uCameraPos = uniform(new Vector3());
@@ -1104,7 +1503,7 @@ class WebGpuSplatBackend {
         Return();
       });
       If(float(i).greaterThanEqual(uNumSplats), () => {
-        keysNode.element(i).assign(uint(65535));
+        keysNode.element(i).assign(uint(quantMax));
         Return();
       });
       let splatIndex = i;
@@ -1140,10 +1539,16 @@ class WebGpuSplatBackend {
             0,
             1
           )
-        ).mul(65535)
+        ).mul(quantMax)
       );
       keysNode.element(i).assign(q);
     })().compute([Math.ceil(Math.max(1, capacity) / 256)], [256]).setName("splatKeygen");
+    const projC = projOn ? {
+      c0: instancedArray(Math.max(1, capacity), "vec4"),
+      c1: instancedArray(Math.max(1, capacity), "vec4"),
+      c2: instancedArray(Math.max(1, capacity), "vec4"),
+      c3: instancedArray(Math.max(1, capacity), "vec4")
+    } : null;
     const material = new SplatNodeMaterial({
       packedTexture,
       orderNode: radix.sortedValues,
@@ -1152,8 +1557,287 @@ class WebGpuSplatBackend {
       sh2Texture: src.sh2,
       sh3Texture: src.sh3,
       lodOpacity: src.encoding.lodOpacity ?? false,
-      paged: pagedTiling
+      paged: pagedTiling,
+      parityQuantize: this.parityQuantize,
+      vsMinimal: this.vsMinimal,
+      batchSize: this.batchSize,
+      projCache: projC ?? void 0,
+      visCountNode: visOn && visCountRead ? visCountRead : void 0
     });
+    let projector = null;
+    let uProjection = null;
+    let uWriteKeys = null;
+    if (projC) {
+      const uProj = uniform(new Matrix4());
+      uProjection = uProj;
+      const uWK = uniform(0);
+      uWriteKeys = uWK;
+      const lodOpacity = src.encoding.lodOpacity ?? false;
+      const parityQuantize = this.parityQuantize;
+      const sh1 = src.sh1;
+      const sh2 = src.sh2;
+      const sh3 = src.sh3;
+      projector = Fn(() => {
+        const i = instanceIndex;
+        If(i.greaterThanEqual(uint(Math.max(1, capacity))), () => {
+          Return();
+        });
+        If(float(i).greaterThanEqual(uNumSplats), () => {
+          projC.c3.element(i).assign(vec4(0, 0, 0, 0));
+          if (!visOn) {
+            If(float(uWK).greaterThan(0.5), () => {
+              keysNode.element(i).assign(uint(quantMax));
+            });
+          }
+          Return();
+        });
+        let splatIndex = i;
+        if (cutTexture) {
+          const texel = textureLoad(
+            cutTexture,
+            ivec2(
+              int(i.shiftRight(uint(2)).bitAnd(uint(4095))),
+              int(i.shiftRight(uint(14)))
+            )
+          );
+          const comp = i.bitAnd(uint(3));
+          splatIndex = select(
+            comp.equal(uint(0)),
+            texel.x,
+            select(
+              comp.equal(uint(1)),
+              texel.y,
+              select(comp.equal(uint(2)), texel.z, texel.w)
+            )
+          );
+        }
+        const texCoord = pagedTiling ? pagedSplatTexCoordTsl(int(splatIndex)) : splatTexCoordTsl(int(splatIndex));
+        const packedData = textureLoad(packedTexture, texCoord.xy).depth(
+          texCoord.z
+        );
+        const unpacked = unpackSplatEncodingTsl(
+          packedData,
+          material.rgbMinMaxLnScaleMinMax
+        );
+        const center = unpacked.center;
+        const quaternion = unpacked.quaternion;
+        const rejected = bool(false).toVar();
+        const viewCenter = quatVecTsl(
+          material.renderToViewQuat,
+          center.mul(material.renderToViewScale)
+        ).add(material.renderToViewPos);
+        rejected.assign(rejected.or(viewCenter.z.greaterThanEqual(0)));
+        const clipCenter = uProj.mul(vec4(viewCenter, 1));
+        rejected.assign(
+          rejected.or(clipCenter.z.abs().greaterThanEqual(clipCenter.w))
+        );
+        const clip = float(material.clipXY).mul(clipCenter.w);
+        rejected.assign(
+          rejected.or(clipCenter.x.abs().greaterThan(clip)).or(clipCenter.y.abs().greaterThan(clip))
+        );
+        const rgba = vec4(0, 0, 0, 0).toVar();
+        const axis1 = vec2(0, 0).toVar();
+        const axis2 = vec2(0, 0).toVar();
+        const uvStd = float(0).toVar();
+        const adjOut = float(0).toVar();
+        If(rejected.not(), () => {
+          const scales = vec3(
+            unpacked.scales.mul(material.renderToViewScale)
+          ).toVar();
+          rgba.assign(vec4(unpacked.rgba));
+          if (lodOpacity) {
+            rgba.a.assign(rgba.a.mul(2));
+          }
+          if (sh1) {
+            const viewDir = normalize(center.sub(material.viewOrigin));
+            const shRgb = evaluatePackedShTsl({
+              coord: texCoord,
+              viewDir,
+              shMax: material.shMax,
+              sh1Texture: sh1,
+              sh2Texture: sh2,
+              sh3Texture: sh3
+            });
+            rgba.assign(vec4(rgba.rgb.add(shRgb), rgba.a));
+          }
+          if (parityQuantize) {
+            const rgbQ = round(clamp(rgba.rgb.mul(255), 0, 255)).div(
+              255
+            );
+            const aQ = round(clamp(rgba.a.mul(0.5).mul(255), 0, 255)).div(255).mul(2);
+            rgba.assign(vec4(rgbQ, aQ));
+            const lnScaleScale = float(254 / (LN_SCALE_MAX - LN_SCALE_MIN));
+            const requantScale = (sc) => select(
+              sc.equal(0),
+              float(0),
+              exp(
+                round(
+                  clamp(
+                    sc.log().sub(LN_SCALE_MIN).mul(lnScaleScale),
+                    0,
+                    254
+                  )
+                ).div(lnScaleScale).add(LN_SCALE_MIN)
+              )
+            );
+            scales.assign(
+              vec3(
+                requantScale(scales.x),
+                requantScale(scales.y),
+                requantScale(scales.z)
+              )
+            );
+          }
+          const zeroScales = scales.equal(vec3(0));
+          rejected.assign(rejected.or(zeroScales.all()));
+          rejected.assign(
+            rejected.or(rgba.a.equal(0)).or(rgba.a.lessThan(material.minAlpha))
+          );
+          const adjustedStdDev = float(material.maxStdDev).toVar();
+          If(rgba.a.greaterThan(1), () => {
+            rgba.a.assign(min(rgba.a.mul(4).sub(3), 5));
+            adjustedStdDev.assign(
+              float(material.maxStdDev).add(rgba.a.sub(1).mul(0.7))
+            );
+          });
+          const viewQuaternion = quatQuatTsl(
+            material.renderToViewQuat,
+            quaternion
+          );
+          const [rsC0, rsC1, rsC2] = scaleQuaternionToMatrixColumnsTsl(
+            scales,
+            viewQuaternion
+          );
+          const RS = mat3(rsC0, rsC1, rsC2);
+          const cov3D = RS.mul(transpose(RS));
+          const scaledRenderSize = vec2(material.renderSize).mul(
+            material.focalAdjustment
+          );
+          const focal = scaledRenderSize.mul(0.5).mul(
+            vec2(
+              uProj.element(int(0)).element(int(0)),
+              uProj.element(int(1)).element(int(1))
+            )
+          );
+          const isOrthographic = uProj.element(int(2)).element(int(3)).notEqual(-1);
+          const invZ = float(1).div(viewCenter.z);
+          const J1 = focal.mul(invZ);
+          const J2 = J1.mul(viewCenter.xy).negate().mul(invZ);
+          const jC0 = select(
+            isOrthographic,
+            vec3(focal.x, 0, 0),
+            vec3(J1.x, 0, J2.x)
+          );
+          const jC1 = select(
+            isOrthographic,
+            vec3(0, focal.y, 0),
+            vec3(0, J1.y, J2.y)
+          );
+          const J = mat3(jC0, jC1, vec3(0, 0, 0));
+          const cov2D = transpose(J).mul(cov3D).mul(J);
+          const a = float(cov2D.element(int(0)).element(int(0))).toVar();
+          const d = float(cov2D.element(int(1)).element(int(1))).toVar();
+          const b = cov2D.element(int(0)).element(int(1));
+          a.addAssign(material.preBlurAmount);
+          d.addAssign(material.preBlurAmount);
+          const detOrig = a.mul(d).sub(b.mul(b));
+          a.addAssign(material.blurAmount);
+          d.addAssign(material.blurAmount);
+          const det = a.mul(d).sub(b.mul(b));
+          const blurAdjust = sqrt(max(0, detOrig.div(det)));
+          const rawAlpha = rgba.a.toVar("kcRawAlphaP");
+          rgba.a.assign(rgba.a.mul(blurAdjust));
+          rejected.assign(
+            rejected.or(rgba.a.lessThan(material.minAlpha))
+          );
+          const fillOn = material.ssogFillV2.greaterThan(0.5);
+          rejected.assign(
+            rejected.or(fillOn.and(rawAlpha.lessThan(1 / 255)))
+          );
+          rejected.assign(
+            rejected.or(
+              fillOn.and(
+                rawAlpha.mul(6.283185307179586).mul(sqrt(max(det, 0))).lessThan(material.ssogMinContribution)
+              )
+            )
+          );
+          const eigenAvg = a.add(d).mul(0.5);
+          const eigenDelta = sqrt(
+            max(0, eigenAvg.mul(eigenAvg).sub(det))
+          );
+          const eigen1 = eigenAvg.add(eigenDelta);
+          const eigen2 = eigenAvg.sub(eigenDelta);
+          const eigenVec1 = select(
+            b.abs().greaterThan(1e-3),
+            normalize(vec2(b, eigen1.sub(a))),
+            select(a.greaterThanEqual(d), vec2(1, 0), vec2(0, 1))
+          );
+          const eigenVec2 = vec2(eigenVec1.y, eigenVec1.x.negate());
+          const r1 = adjustedStdDev.mul(sqrt(eigen1));
+          const r2 = adjustedStdDev.mul(sqrt(eigen2));
+          const fillCap = min(
+            1024,
+            min(material.renderSize.x, material.renderSize.y)
+          );
+          const capScale = min(1, fillCap.div(max(r1, r2)));
+          const zStar = sqrt(max(0, log(rgba.a.mul(255))).mul(2));
+          const quadScale = min(1, zStar.div(adjustedStdDev));
+          const scale1 = select(
+            fillOn,
+            r1.mul(capScale).mul(quadScale),
+            min(material.maxPixelRadius, r1)
+          );
+          const scale2 = select(
+            fillOn,
+            r2.mul(capScale).mul(quadScale),
+            min(material.maxPixelRadius, r2)
+          );
+          rejected.assign(
+            rejected.or(
+              scale1.lessThan(material.minPixelRadius).and(scale2.lessThan(material.minPixelRadius))
+            )
+          );
+          axis1.assign(eigenVec1.mul(scale1));
+          axis2.assign(eigenVec2.mul(scale2));
+          uvStd.assign(
+            select(fillOn, adjustedStdDev.mul(quadScale), adjustedStdDev)
+          );
+          adjOut.assign(adjustedStdDev);
+        });
+        If(float(uWK).greaterThan(0.5), () => {
+          const metric = sortRadial ? viewCenter.length() : viewCenter.z.negate().add(100);
+          const qk = uint(
+            float(1).sub(
+              clamp(
+                metric.sub(uDistRange.x).div(
+                  uDistRange.y.sub(uDistRange.x)
+                ),
+                0,
+                1
+              )
+            ).mul(quantMax)
+          );
+          if (visOn && visCountAtomic && compactVals) {
+            If(rejected.not(), () => {
+              const j = atomicAdd(
+                visCountAtomic.element(uint(0)),
+                uint(1)
+              ).toVar();
+              keysNode.element(j).assign(qk);
+              compactVals.element(j).assign(i);
+            });
+          } else {
+            keysNode.element(i).assign(qk);
+          }
+        });
+        projC.c0.element(i).assign(clipCenter);
+        projC.c1.element(i).assign(vec4(axis1, axis2));
+        projC.c2.element(i).assign(rgba);
+        projC.c3.element(i).assign(
+          vec4(uvStd, adjOut, viewCenter.z, select(rejected, 0, 1))
+        );
+      })().compute([Math.ceil(Math.max(1, capacity) / 256)], [256]).setName("splatProjector");
+    }
     if (this.state) {
       kcDisposeOldMaterial(spark.renderer, this.state.material);
     }
@@ -1179,10 +1863,21 @@ class WebGpuSplatBackend {
       boundsMin: new Vector3(0, 0, 0),
       boundsMax: new Vector3(1, 1, 1),
       lastNumSplats: -1,
-      lastMappingVersion: -1
+      lastMappingVersion: -1,
+      drawInstances: 0,
+      projector,
+      uProjection,
+      uWriteKeys,
+      visPrePass,
+      visGroups: radix.groups,
+      visDispatchAttr,
+      visCountAttr
     };
     this.sortedOnce = false;
     spark.material = material;
+    if (this.batchSize > 1 && !(spark.geometry instanceof BatchedSplatGeometry)) {
+      spark.geometry = new BatchedSplatGeometry(this.batchSize);
+    }
   }
   // (Re)compute object-space bounds for the CURRENT cut/source. Static
   // sources scan the whole packedArray once; cut sources sample the cut
@@ -1278,6 +1973,7 @@ export {
   SplatNodeMaterial,
   WebGpuSplatBackend,
   createRadixSort,
+  createVisibleClear,
   decodeQuatOctXy88R8Tsl,
   evaluatePackedSH1Tsl,
   evaluatePackedSH2Tsl,

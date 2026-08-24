@@ -12,6 +12,15 @@ export type SplatNodeMaterialOptions = {
     paged?: boolean;
     lodInflate?: boolean;
     parityQuantize?: boolean;
+    vsMinimal?: number;
+    batchSize?: number;
+    projCache?: {
+        c0: TslNode;
+        c1: TslNode;
+        c2: TslNode;
+        c3: TslNode;
+    };
+    visCountNode?: TslNode;
 };
 export declare class SplatNodeMaterial extends MeshBasicNodeMaterial {
     renderSize: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<Vector2>>;
@@ -28,6 +37,9 @@ export declare class SplatNodeMaterial extends MeshBasicNodeMaterial {
     pickNear: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
     pickFar: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
     earlyExit: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
+    vsMinPixelRadius: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
+    vsMinExtent: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
+    batchNumSplats: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
     minAlpha: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
     preBlurAmount: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;
     blurAmount: import('three/tsl').ShaderNodeObject<import('three/webgpu').UniformNode<number>>;

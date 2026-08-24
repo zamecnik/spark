@@ -185,6 +185,18 @@ export type SplatNodeMaterialOptions = {
   //   c2 = rgba, final (post SH / parity / blur-adjust)
   //   c3 = (uvStd, adjustedStdDev, viewZ, live 0|1)
   projCache?: { c0: TslNode; c1: TslNode; c2: TslNode; c3: TslNode };
+
+  // [vc] visible-count sort (?splatvis=1, projCache-only): a PLAIN u32
+  // storage node over the 1-element GPU visible counter the projector's
+  // compact append filled (three downgrades it to read-only in the vertex
+  // stage, which WebGPU requires). When present, the reader vertex stage
+  // rejects drawIdx >= visCount BEFORE any storage read — order[] positions
+  // past visCount hold stale values from earlier sorts and must never be
+  // dereferenced — and the whole cache read is guarded so tail lanes cost
+  // one storage read + compare instead of an order lookup + four cache
+  // loads. Stacks with (does not replace) the batch tail reject. Absent =
+  // byte-identical WGSL to the stock reader.
+  visCountNode?: TslNode;
 };
 
 export class SplatNodeMaterial extends MeshBasicNodeMaterial {
@@ -265,6 +277,7 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
       vsMinimal = 0,
       batchSize = 1,
       projCache = undefined,
+      visCountNode = undefined,
     } = options;
 
     stripWebGLInternalFormat(packedTexture);
@@ -321,7 +334,70 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
     // `earlyExit` = 0 makes the guard uniformly true, restoring the exact
     // pre-T1-3 straight-line body for an in-session A/B with nothing else
     // varying (WebGpuSplatBackend.applyPerFrame / __kcSplatEarlyExit).
-    if (projCache) {
+    if (projCache && visCountNode) {
+      // [vc] guarded reader variant of the projCache vertex stage below —
+      // kept as a SEPARATE body (the vsMinimal precedent) so the lever-off
+      // reader's emitted WGSL stays byte-identical. Differences from the
+      // twin: (1) drawIdx >= visCount joins `rejected` FIRST, (2) the order
+      // lookup + four cache loads move inside If(rejected.not()) with the
+      // module-scope-var pattern the [T1-3] header note blesses, so tail
+      // lanes (rejected splats no longer in the compact prefix, plus the
+      // batch overshoot) never touch storage. Rejected lanes read the vars'
+      // zero values; c0.w = 0 makes the final math produce garbage that the
+      // select never emits (rejectPos wins), exactly like phase-2 rejects
+      // in the main path.
+      this.vertexNode = Fn(() => {
+        const rejectPos = vec4(0.0, 0.0, 2.0, 1.0);
+        const rejected = bool(false).toVar();
+        let drawIdx: TslNode = instanceIndex;
+        if (batchSize > 1) {
+          const rawIdx = uint(instanceIndex)
+            .mul(uint(batchSize))
+            .add(uint(positionGeometry.z));
+          const inRange = float(rawIdx).lessThan(this.batchNumSplats);
+          rejected.assign(inRange.not());
+          drawIdx = select(inRange, rawIdx, uint(0)).toVar("kcBatchIdx");
+        }
+        rejected.assign(
+          rejected.or(
+            uint(drawIdx).greaterThanEqual(
+              visCountNode.element(uint(0)),
+            ),
+          ),
+        );
+        const c0 = vec4(0.0, 0.0, 0.0, 0.0).toVar();
+        const c1 = vec4(0.0, 0.0, 0.0, 0.0).toVar();
+        const c2 = vec4(0.0, 0.0, 0.0, 0.0).toVar();
+        const c3 = vec4(0.0, 0.0, 0.0, 0.0).toVar();
+        If(rejected.not(), () => {
+          const slot = orderNode.element(drawIdx);
+          c0.assign(projCache.c0.element(slot));
+          c1.assign(projCache.c1.element(slot));
+          c2.assign(projCache.c2.element(slot));
+          c3.assign(projCache.c3.element(slot));
+        });
+        rejected.assign(rejected.or(c3.w.lessThan(0.5)));
+
+        vRgba.assign(c2);
+        vSplatUv.assign(positionGeometry.xy.mul(c3.x));
+        vAdjustedStdDev.assign(c3.y);
+        vViewZ.assign(c3.z);
+
+        const scaledRenderSize = vec2(this.renderSize).mul(
+          this.focalAdjustment,
+        );
+        const pixelOffset = c1.xy
+          .mul(positionGeometry.x)
+          .add(c1.zw.mul(positionGeometry.y));
+        const ndcOffset = vec2(2.0).div(scaledRenderSize).mul(pixelOffset);
+        const ndcCenter = c0.xyz.div(c0.w);
+        return select(
+          rejected,
+          rejectPos,
+          vec4(ndcCenter.xy.add(ndcOffset).mul(c0.w), c0.z, c0.w),
+        );
+      })();
+    } else if (projCache) {
       // [proj] reader vertex stage - see the projCache option comment. The
       // batch tail reject is replicated here because the projector indexes by
       // slot and knows nothing about the draw's instance packing.

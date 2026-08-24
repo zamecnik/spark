@@ -2,5 +2,5 @@ export { SPLAT_TEX_LAYER_BITS, SPLAT_TEX_MASK, SPLAT_TEX_WIDTH_BITS, type TslNod
 export { evaluatePackedSH1Tsl, evaluatePackedSH2Tsl, evaluatePackedSH3Tsl, evaluatePackedShTsl, } from './shTsl';
 export { SplatNodeMaterial, type SplatNodeMaterialOptions, } from './SplatNodeMaterial';
 export { type AlphaChainResult, referenceAlphaChain, roundEven, stockNetAlpha, } from './alphaReference';
-export { type RadixSort, createRadixSort } from './radixSort';
+export { type RadixSort, type RadixSortGroup, createRadixSort, createVisibleClear, } from './radixSort';
 export { WebGpuSplatBackend } from './WebGpuSplatBackend';

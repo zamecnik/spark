@@ -36,5 +36,10 @@ export {
   roundEven,
   stockNetAlpha,
 } from "./alphaReference";
-export { type RadixSort, createRadixSort } from "./radixSort";
+export {
+  type RadixSort,
+  type RadixSortGroup,
+  createRadixSort,
+  createVisibleClear,
+} from "./radixSort";
 export { WebGpuSplatBackend } from "./WebGpuSplatBackend";

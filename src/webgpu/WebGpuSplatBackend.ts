@@ -37,6 +37,7 @@
 
 import type * as THREE from "three";
 import {
+  IndirectStorageBufferAttribute,
   Matrix4,
   MeshBasicNodeMaterial,
   Quaternion,
@@ -46,6 +47,7 @@ import {
   Fn,
   If,
   Return,
+  atomicAdd,
   bool,
   clamp,
   exp,
@@ -62,6 +64,7 @@ import {
   round,
   select,
   sqrt,
+  storage,
   textureLoad,
   transpose,
   uint,
@@ -89,7 +92,12 @@ import {
 } from "./packedSplatsTsl";
 import { evaluatePackedShTsl } from "./shTsl";
 import { kcDisposeOldMaterial, kcRegrowLog } from "../kcRegrowDebug";
-import { type RadixSort, createRadixSort } from "./radixSort";
+import {
+  type RadixSort,
+  type RadixSortGroup,
+  createRadixSort,
+  createVisibleClear,
+} from "./radixSort";
 import { SplatNodeMaterial } from "./SplatNodeMaterial";
 
 // biome-ignore lint/suspicious/noExplicitAny: r180 type decls lack this export
@@ -161,7 +169,12 @@ type LodInstanceLike = {
 };
 
 type SparkRendererLike = THREE.Mesh & {
-  renderer: { compute(nodes: TslNode | TslNode[]): void };
+  // dispatchSize: an IndirectStorageBufferAttribute makes three dispatch the
+  // whole call indirectly (r185 WebGPUBackend.compute) — [vc] uses it for the
+  // hist/reorder groups; null/omitted keeps each node's baked size.
+  renderer: {
+    compute(nodes: TslNode | TslNode[], dispatchSize?: unknown): void;
+  };
   activeSplats: number;
   sortRadial?: boolean;
   maxStdDev: number;
@@ -234,6 +247,15 @@ type MeshState = {
   projector: TslNode | null;
   uProjection: { value: Matrix4 } | null;
   uWriteKeys: { value: number } | null;
+  // [vc] visible-count sort state (?splatvis=1, requires the projector):
+  // sort-frame pre-clear kernel, the radix's grouped dispatch plan, the
+  // indirect dispatch-args attribute, and the 1-element visCount attribute
+  // (exposed for the SplatMeasure phase-boundary readback). All null when
+  // the lever is off.
+  visPrePass: TslNode | null;
+  visGroups: RadixSortGroup[] | null;
+  visDispatchAttr: unknown;
+  visCountAttr: THREE.BufferAttribute | null;
 };
 
 // fp16 → f32 (IEEE 754 half), for the CPU-side bounds scans
@@ -349,6 +371,21 @@ export class WebGpuSplatBackend {
   //                    (words = threads/32): 128 -> 4 KB, 64 -> 2 KB, testing
   //                    the occupancy hypothesis on device.
   sortTpw = 256;
+  //   sortVisible    - ?splatvis=1: cull + compact in the projector (it
+  //                    already computes `rejected` per splat), radix over the
+  //                    visible prefix only, hist/reorder dispatched
+  //                    INDIRECTLY from the GPU visCount (the CPU never reads
+  //                    it back in the render loop). Rows 82/83 killed the
+  //                    2-pass kernel on Adreno, leaving the sort DOMAIN as
+  //                    the last orbit lever: radix cost scales ~46*f ms with
+  //                    the visible fraction f (f~0.5 projects orbit ~51 ms
+  //                    on the proven 4-pass kernel). Requires the projector
+  //                    (ignored without it / under a vsmin ablation); OFF by
+  //                    default until the phone verdict. Ties among equal
+  //                    16-bit keys reorder run-to-run (nondeterministic
+  //                    atomic append order) — the accepted keygen-fusion
+  //                    diff class, NOT byte-identical.
+  sortVisible = false;
 
   // Gate instrumentation (P2/P3 acceptance).
   frames = 0;
@@ -466,11 +503,30 @@ export class WebGpuSplatBackend {
       // for ~45 ms/frame of chain cost) and the radix follows in the SAME
       // submission; non-sort frames skip both the key writes and the radix.
       if (state.uWriteKeys) state.uWriteKeys.value = wantSort ? 1 : 0;
-      spark.renderer.compute(
-        wantSort && state.uWriteKeys
-          ? [state.projector, ...state.radix.steps]
-          : [state.projector],
-      );
+      if (wantSort && state.uWriteKeys && state.visGroups) {
+        // [vc] compact sort: pre-clear (keys→quantMax, visCount→0) then the
+        // appending projector ride ONE pass; the radix follows as the
+        // grouped plan, because three applies a per-call dispatchSize to
+        // every node of a compute() call — indirect hist/reorder and
+        // baked-size clears/scans can never share one. Queue order
+        // preserves sequencing across the calls. Non-sort frames (below)
+        // run the projector alone with uWriteKeys=0, so order[] and
+        // visCount stay a consistent stale pair — the freezeOrder/?gpusort
+        // contract unchanged.
+        spark.renderer.compute([state.visPrePass as TslNode, state.projector]);
+        for (const g of state.visGroups) {
+          spark.renderer.compute(
+            g.nodes,
+            g.indirect ? state.visDispatchAttr : null,
+          );
+        }
+      } else {
+        spark.renderer.compute(
+          wantSort && state.uWriteKeys
+            ? [state.projector, ...state.radix.steps]
+            : [state.projector],
+        );
+      }
     } else if (wantSort) {
       // projector disabled (desktop default / ?splatproj=0): the standalone
       // keygen path, unchanged.
@@ -603,7 +659,9 @@ export class WebGpuSplatBackend {
     mat.viewOrigin.value.copy(camWorld.applyMatrix4(worldToObject));
   }
 
-  // Debug/test access (harness reads the permutation + material).
+  // Debug/test access (harness reads the permutation + material;
+  // SplatMeasure reads visCountAttr ONCE per phase boundary via
+  // renderer.getArrayBufferAsync — never per frame).
   getState(): {
     kind: SourceKind;
     numSplats: number;
@@ -612,6 +670,7 @@ export class WebGpuSplatBackend {
     material: SplatNodeMaterial;
     sortedValues: TslNode;
     keysNode: TslNode;
+    visCountAttr: THREE.BufferAttribute | null;
   } | null {
     const s = this.state;
     if (!s) return null;
@@ -623,6 +682,7 @@ export class WebGpuSplatBackend {
       material: s.material,
       sortedValues: s.radix.sortedValues,
       keysNode: s.keysNode,
+      visCountAttr: s.visCountAttr,
     };
   }
 
@@ -774,13 +834,62 @@ export class WebGpuSplatBackend {
     const reorderThreads = [64, 128, 256].includes(this.sortTpw)
       ? this.sortTpw
       : 256;
+
+    // [vc] visible-count sort (?splatvis=1): the projector culls + compacts,
+    // so it must be running (and not replaced by a vsmin ablation).
+    const projOn = this.projectorEnabled && this.vsMinimal === 0;
+    const visOn = projOn && this.sortVisible;
+    let visCountAtomic: TslNode | null = null;
+    let visCountRead: TslNode | null = null;
+    let compactVals: TslNode | null = null;
+    let visDispatchAttr: unknown = null;
+    let visCountAttr: THREE.BufferAttribute | null = null;
+    if (visOn) {
+      // one buffer, two shader-side views: the ATOMIC node for the
+      // projector's atomicAdd append + the pre-pass atomicStore reset, and a
+      // PLAIN u32 node for the args kernel and the material's vertex-stage
+      // tail reject (WGSL forbids atomic types in read-only storage, and
+      // three downgrades all non-compute storage to read-only).
+      visCountAtomic = instancedArray(1, "uint").toAtomic() as TslNode;
+      visCountAttr = (visCountAtomic as unknown as { value: THREE.BufferAttribute })
+        .value;
+      visCountRead = storage(
+        // biome-ignore lint/suspicious/noExplicitAny: shared attribute view
+        visCountAttr as any,
+        "uint",
+        1,
+      ) as unknown as TslNode;
+      compactVals = instancedArray(Math.max(1, capacity), "uint") as TslNode;
+      visDispatchAttr = new IndirectStorageBufferAttribute(
+        new Uint32Array([0, 1, 1]),
+        3,
+      );
+    }
+
     const radix = createRadixSort({
       keysNode,
       count: Math.max(1, capacity),
       numBits: sortBits,
       digitBits,
       reorderThreads,
+      ...(visOn && visCountRead && compactVals
+        ? {
+            valuesNode: compactVals,
+            indirect: {
+              visCountNode: visCountRead,
+              dispatchAttr: visDispatchAttr,
+            },
+          }
+        : {}),
     });
+    const visPrePass = visOn
+      ? createVisibleClear({
+          keysNode,
+          count: Math.max(1, capacity),
+          quantMax,
+          visCountNode: visCountAtomic as TslNode,
+        })
+      : null;
 
     const uNumSplats = uniform(0); // float; exact for counts < 2^24
     const uMeshToWorld = uniform(new Matrix4());
@@ -858,7 +967,6 @@ export class WebGpuSplatBackend {
     // [proj] the projector cache: four vec4 arrays over the padded capacity,
     // indexed by cut slot (the keygen's domain). ~64 B/splat - accepted for
     // the lever build; stride-packing is a follow-up once the win is banked.
-    const projOn = this.projectorEnabled && this.vsMinimal === 0;
     const projC = projOn
       ? {
           c0: instancedArray(Math.max(1, capacity), "vec4") as TslNode,
@@ -881,6 +989,7 @@ export class WebGpuSplatBackend {
       vsMinimal: this.vsMinimal,
       batchSize: this.batchSize,
       projCache: projC ?? undefined,
+      visCountNode: visOn && visCountRead ? visCountRead : undefined,
     });
 
     // [proj] the projector kernel - a verbatim port of the material's vertex
@@ -912,10 +1021,14 @@ export class WebGpuSplatBackend {
         If(float(i).greaterThanEqual(uNumSplats as TslNode), () => {
           projC.c3.element(i).assign(vec4(0.0, 0.0, 0.0, 0.0));
           // [fuse] padding slots take the max key, exactly as the standalone
-          // keygen pads - ascending radix sorts them to the tail
-          If(float(uWK as TslNode).greaterThan(0.5), () => {
-            keysNode.element(i).assign(uint(quantMax));
-          });
+          // keygen pads - ascending radix sorts them to the tail. [vc] with
+          // the compact sort the pre-pass clear already set EVERY key slot
+          // to quantMax and padding slots never append, so no write here.
+          if (!visOn) {
+            If(float(uWK as TslNode).greaterThan(0.5), () => {
+              keysNode.element(i).assign(uint(quantMax));
+            });
+          }
           Return();
         });
 
@@ -1198,7 +1311,28 @@ export class WebGpuSplatBackend {
               )
               .mul(quantMax),
           );
-          keysNode.element(i).assign(qk);
+          if (visOn && visCountAtomic && compactVals) {
+            // [vc] compact append: only NON-rejected splats enter the sort
+            // domain. atomicAdd hands each visible splat a unique compact
+            // position j (storage atomics rig-proven, poc/webgpu-sort stage
+            // 3); the key moves from slot-indexed to compact-indexed and the
+            // slot id travels in compactVals[j], so sortedValues keeps slot
+            // semantics downstream. Append order is nondeterministic — ties
+            // among equal quantized keys reorder run-to-run (the accepted
+            // keygen-fusion diff class). Rejected splats never append; the
+            // draw's visCount tail reject keeps them out of the raster,
+            // where today they cost vertex work before self-rejecting.
+            If(rejected.not(), () => {
+              const j = atomicAdd(
+                (visCountAtomic as TslNode).element(uint(0)),
+                uint(1),
+              ).toVar();
+              keysNode.element(j).assign(qk);
+              (compactVals as TslNode).element(j).assign(i);
+            });
+          } else {
+            keysNode.element(i).assign(qk);
+          }
         });
 
         projC.c0.element(i).assign(clipCenter);
@@ -1246,6 +1380,10 @@ export class WebGpuSplatBackend {
       projector,
       uProjection,
       uWriteKeys,
+      visPrePass,
+      visGroups: radix.groups,
+      visDispatchAttr,
+      visCountAttr,
     };
     this.sortedOnce = false;
 

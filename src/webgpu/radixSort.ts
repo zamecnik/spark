@@ -24,13 +24,16 @@
 import {
   Fn,
   If,
+  Return,
   atomicAdd,
   atomicLoad,
   atomicOr,
   atomicStore,
   instancedArray,
+  instanceIndex,
   invocationLocalIndex,
   select,
+  storage,
   uint,
   workgroupArray,
   workgroupBarrier,
@@ -54,9 +57,21 @@ const SCAN_ITEMS = 512; // Blelloch scan: 2 items per thread
 
 const pad = (n: number, m: number) => Math.ceil(n / m) * m;
 
+// [vc] One submission unit of the indirect dispatch plan. `indirect: true`
+// nodes must be dispatched with the caller's IndirectStorageBufferAttribute
+// as the per-call dispatchSize; three applies a passed dispatchSize to EVERY
+// node of one renderer.compute() call, so indirect and baked-size steps can
+// never share a call — hence the grouping.
+export type RadixSortGroup = { nodes: TslNode[]; indirect: boolean };
+
 export type RadixSort = {
-  // ordered ComputeNodes — dispatch all, in order, per sort
+  // ordered ComputeNodes — dispatch all, in order, per sort. When `indirect`
+  // was requested this flat list is INCOMPLETE (no args conversion, no
+  // per-pass blockSums clears) — dispatch via `groups` instead.
   steps: TslNode[];
+  // [vc] non-null iff `indirect` was requested: the full dispatch plan, in
+  // submission order (renderer.compute(g.nodes, g.indirect ? attr : null)).
+  groups: RadixSortGroup[] | null;
   // storage node holding the permutation after the run
   sortedValues: TslNode;
   wgCount: number;
@@ -69,6 +84,8 @@ export function createRadixSort({
   numBits = 16,
   digitBits = 4,
   reorderThreads = 256,
+  valuesNode,
+  indirect,
 }: {
   keysNode: TslNode;
   count: number;
@@ -91,6 +108,35 @@ export function createRadixSort({
   // words/digit = threads/32, so 128 threads = 4 KB masks, 64 = 2 KB, at the
   // price of more workgroups (EPW = threads x EPT). Same permutation always.
   reorderThreads?: number;
+  // [vc] pass-0 value seed: vals start as valuesNode[GID] instead of the
+  // identity GID. The visible-count compaction writes compact (key, slot)
+  // pairs, so the value carried through the sort must be the SLOT id stored
+  // at the compact position, not the compact position itself — downstream
+  // consumers of sortedValues keep slot semantics unchanged.
+  valuesNode?: TslNode;
+  // [vc] GPU-driven dispatch domain (rows 82/83: the last orbit lever is
+  // sorting the visible prefix only; radix cost scales ~46*f ms with the
+  // visible fraction f). `visCountNode` is a PLAIN (non-atomic) u32 storage
+  // node over the 1-element visible-count buffer the producer's atomicAdd
+  // filled; `dispatchAttr` is an IndirectStorageBufferAttribute([x,1,1])
+  // this factory's 1-thread args kernel converts visCount into
+  // (ceil(vis/EPW_R)). hist and reorder are then dispatched indirectly over
+  // exactly the compact prefix; the Blelloch scans keep their baked sizes —
+  // correct BECAUSE blockSums columns of never-dispatched workgroups are
+  // zeroed, which must happen before EVERY pass, not once per sort: the
+  // scans convert blockSums counts to prefix sums IN PLACE, so after pass 0
+  // the undispatched columns hold stale prefix values that would corrupt
+  // pass 1's scan (caught in design review; the rig's second-run and
+  // multi-pass cases pin it).
+  // Element guards stay capacity-baked: the caller pre-clears the key
+  // buffer to quantMax, so tail elements inside the dispatched overshoot
+  // sort harmlessly to the end and lose ties to real entries by stability.
+  indirect?: {
+    visCountNode: TslNode;
+    // IndirectStorageBufferAttribute (structural: this module only imports
+    // from three/tsl; the caller constructs it from three/webgpu)
+    dispatchAttr: unknown;
+  };
 }): RadixSort {
   if (digitBits !== 4 && digitBits !== 8)
     throw new Error("digitBits must be 4 or 8");
@@ -346,9 +392,15 @@ export function createRadixSort({
           uint(BUCKETS),
         ).toVar();
         // pre-fetch value before the barrier (reference does this for
-        // latency overlap)
+        // latency overlap). [vc] with a valuesNode, pass 0 seeds from it
+        // (compact slot ids) instead of the identity GID; same select-guard
+        // shape as the inVals read (out-of-range lanes never scatter).
         const v = (
-          isFirst ? GID : select(isValid, inVals.element(GID), uint(0))
+          isFirst
+            ? valuesNode
+              ? select(isValid, valuesNode.element(GID), uint(0))
+              : GID
+            : select(isValid, inVals.element(GID), uint(0))
         ).toVar();
 
         If(isValid, () => {
@@ -409,6 +461,49 @@ export function createRadixSort({
       .setName(`radixReorder_bit${bit}`);
   };
 
+  // ---- [vc] indirect-dispatch support kernels -----------------------------
+
+  // visCount → [ceil(vis / EPW_R), 1, 1] in the caller's indirect buffer.
+  // One thread; runs after the producer filled visCount, before pass 0.
+  const makeArgs = () => {
+    if (!indirect) return null;
+    const dispatchStore = storage(
+      // biome-ignore lint/suspicious/noExplicitAny: structural three attribute
+      indirect.dispatchAttr as any,
+      "uint",
+      3,
+    ) as unknown as TslNode;
+    const vis = indirect.visCountNode;
+    return (Fn(() => {
+      If(instanceIndex.greaterThanEqual(uint(1)), () => {
+        Return();
+      });
+      const v = vis.element(uint(0)).toVar();
+      dispatchStore
+        .element(uint(0))
+        .assign(v.add(uint(EPW_R - 1)).div(uint(EPW_R)));
+      dispatchStore.element(uint(1)).assign(uint(1));
+      dispatchStore.element(uint(2)).assign(uint(1));
+    })() as TslNode)
+      .compute([1], [1])
+      .setName("radixIndirectArgs");
+  };
+
+  // Zero blockSums. Runs before EVERY pass's histogram (see the `indirect`
+  // option comment: the in-place scans dirty the undispatched columns).
+  const makeClearBlockSums = () => {
+    const n = pad(blockSumCount, SCAN_ITEMS);
+    return (Fn(() => {
+      const i = instanceIndex;
+      If(i.greaterThanEqual(uint(n)), () => {
+        Return();
+      });
+      blockSums.element(i).assign(uint(0));
+    })() as TslNode)
+      .compute([Math.ceil(n / 256)], [256])
+      .setName("radixClearBlockSums");
+  };
+
   // ---- assemble pass sequence (mirrors ComputeRadixSortMultipass._execute) --
 
   // scan/add nodes operate in place on the same buffers → build once, reuse
@@ -417,8 +512,11 @@ export function createRadixSort({
   const addNodes = levels.map((level, i) =>
     level.wgs > 1 ? makeAddBlock(level, i) : null,
   );
+  const argsNode = makeArgs();
+  const clearNode = indirect ? makeClearBlockSums() : null;
 
   const steps: TslNode[] = [];
+  const groups: RadixSortGroup[] | null = indirect ? [] : null;
   let curKeys = keysNode;
   let curVals: TslNode = valsA; // dummy on pass 0 (isFirst → v = GID)
   let nxtKeys: TslNode = keysA;
@@ -429,13 +527,35 @@ export function createRadixSort({
     const isFirst = pass === 0;
     const isLast = pass === numPasses - 1;
 
-    steps.push(makeHistogram(curKeys, bit));
-    for (let i = 0; i < levels.length; i++) steps.push(scanNodes[i]);
+    const hist = makeHistogram(curKeys, bit);
+    const scanChain: TslNode[] = [];
+    for (let i = 0; i < levels.length; i++) scanChain.push(scanNodes[i]);
     for (let i = levels.length - 1; i >= 0; i--) {
       const addNode = addNodes[i];
-      if (addNode) steps.push(addNode);
+      if (addNode) scanChain.push(addNode);
     }
-    steps.push(makeReorder(curKeys, nxtKeys, curVals, nxtVals, bit, isFirst, isLast));
+    const reorder = makeReorder(
+      curKeys,
+      nxtKeys,
+      curVals,
+      nxtVals,
+      bit,
+      isFirst,
+      isLast,
+    );
+
+    steps.push(hist, ...scanChain, reorder);
+    if (groups && argsNode && clearNode) {
+      // clear BEFORE each hist (never-dispatched columns must read 0 in the
+      // scan); the args conversion rides the first baked group.
+      groups.push({
+        nodes: isFirst ? [argsNode, clearNode] : [clearNode],
+        indirect: false,
+      });
+      groups.push({ nodes: [hist], indirect: true });
+      groups.push({ nodes: scanChain, indirect: false });
+      groups.push({ nodes: [reorder], indirect: true });
+    }
 
     if (!isLast) {
       curKeys = nxtKeys;
@@ -451,8 +571,46 @@ export function createRadixSort({
 
   return {
     steps,
+    groups,
     sortedValues,
     wgCount,
-    dispatchesPerSort: steps.length,
+    dispatchesPerSort: groups
+      ? groups.reduce((a, g) => a + g.nodes.length, 0)
+      : steps.length,
   };
+}
+
+// [vc] Sort-frame pre-clear for the visible-count compaction, shared by the
+// backend and the milestone-vc rig (what ships is what is tested): every key
+// slot takes quantMax — so the tail of the dispatched overshoot sorts
+// harmlessly to the end and loses quantMax ties to real (earlier-indexed)
+// compact entries by LSD stability — and thread 0 zeroes the atomic visible
+// counter the producer's atomicAdd appends against. Must be dispatched
+// BEFORE the producer in the same (or an earlier) submission.
+export function createVisibleClear({
+  keysNode,
+  count,
+  quantMax,
+  visCountNode,
+}: {
+  keysNode: TslNode;
+  count: number;
+  // 2^sortBits - 1 — MUST match the key quantization width (a 0xffff pad
+  // under a reduced ?sortbits width would still sort last only by accident).
+  quantMax: number;
+  // the ATOMIC storage node view of the 1-element counter (atomicStore).
+  visCountNode: TslNode;
+}): TslNode {
+  return (Fn(() => {
+    const i = instanceIndex;
+    If(i.greaterThanEqual(uint(Math.max(1, count))), () => {
+      Return();
+    });
+    keysNode.element(i).assign(uint(quantMax));
+    If(i.equal(uint(0)), () => {
+      atomicStore(visCountNode.element(uint(0)), uint(0));
+    });
+  })() as TslNode)
+    .compute([Math.ceil(Math.max(1, count) / 256)], [256])
+    .setName("visibleClear");
 }
