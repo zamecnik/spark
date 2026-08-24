@@ -233,6 +233,7 @@ type MeshState = {
   // lever is off
   projector: TslNode | null;
   uProjection: { value: Matrix4 } | null;
+  uWriteKeys: { value: number } | null;
 };
 
 // fp16 → f32 (IEEE 754 half), for the CPU-side bounds scans
@@ -393,17 +394,19 @@ export class WebGpuSplatBackend {
       src.numSplats !== state.lastNumSplats ||
       src.mappingVersion !== state.lastMappingVersion;
 
-    let didSort = false;
-    if (
+    // [fuse] the sort DECISION is made here; the dispatches are submitted
+    // below, merged with the projector when it is enabled, so the fused key
+    // write and the radix ride one submission in guaranteed order.
+    const wantSort =
       !this.freezeOrder &&
-      (viewChanged || rebuilt || cutChanged || !this.sortedOnce)
-    ) {
+      (viewChanged || rebuilt || cutChanged || !this.sortedOnce);
+    let didSort = false;
+    if (wantSort) {
       if (rebuilt || cutChanged) {
         this.updateBounds(state, src);
       }
       (state.uNumSplats as { value: number }).value = src.numSplats;
       this.updateKeygenUniforms(state, camera);
-      spark.renderer.compute([state.keygen, ...state.radix.steps]);
       this.sortedOnce = true;
       this.sorts++;
       this.lastSortFrame = this.frames;
@@ -435,7 +438,20 @@ export class WebGpuSplatBackend {
     // forces the sort branch above to run first.
     if (state.projector && src.numSplats > 0) {
       this.syncUniforms(spark, camera);
-      spark.renderer.compute([state.projector]);
+      // [fuse] on sort frames the projector writes the keys inline (round-7:
+      // the standalone keygen duplicated its cut resolve + fetch + transform
+      // for ~45 ms/frame of chain cost) and the radix follows in the SAME
+      // submission; non-sort frames skip both the key writes and the radix.
+      if (state.uWriteKeys) state.uWriteKeys.value = wantSort ? 1 : 0;
+      spark.renderer.compute(
+        wantSort && state.uWriteKeys
+          ? [state.projector, ...state.radix.steps]
+          : [state.projector],
+      );
+    } else if (wantSort) {
+      // projector disabled (desktop default / ?splatproj=0): the standalone
+      // keygen path, unchanged.
+      spark.renderer.compute([state.keygen, ...state.radix.steps]);
     }
 
     // Raycast contract (fork plan §4.4/app-contract rows 15–17): stock feeds
@@ -837,9 +853,14 @@ export class WebGpuSplatBackend {
     // matrix travels in uProjection, synced in syncUniforms().
     let projector: TslNode | null = null;
     let uProjection: { value: Matrix4 } | null = null;
+    let uWriteKeys: { value: number } | null = null;
     if (projC) {
       const uProj = uniform(new Matrix4());
       uProjection = uProj as unknown as { value: Matrix4 };
+      // [fuse] sort-key output gate: 1 on frames update() will also submit
+      // the radix, 0 otherwise, so rest frames pay no key-write bandwidth.
+      const uWK = uniform(0);
+      uWriteKeys = uWK as unknown as { value: number };
       const lodOpacity = src.encoding.lodOpacity ?? false;
       const parityQuantize = this.parityQuantize;
       const sh1 = src.sh1;
@@ -852,6 +873,11 @@ export class WebGpuSplatBackend {
         });
         If(float(i).greaterThanEqual(uNumSplats as TslNode), () => {
           projC.c3.element(i).assign(vec4(0.0, 0.0, 0.0, 0.0));
+          // [fuse] padding slots take the max key, exactly as the standalone
+          // keygen pads - ascending radix sorts them to the tail
+          If(float(uWK as TslNode).greaterThan(0.5), () => {
+            keysNode.element(i).assign(uint(0xffff));
+          });
           Return();
         });
 
@@ -1103,6 +1129,40 @@ export class WebGpuSplatBackend {
           adjOut.assign(adjustedStdDev);
         });
 
+        // [fuse] KEY GENERATION, fused (round-7 matrix: the standalone
+        // keygen+radix chain was ~45 of the 74 ms orbit frame, and keygen
+        // duplicated this kernel's cut resolve + texel fetch + transform
+        // every sort frame). The metrics are EXACT ports to view space:
+        // the camera transform is rigid, so |viewCenter| equals the world
+        // distance keygen computed via uMeshToWorld/uCameraPos, and
+        // getWorldDirection is the camera forward axis, so
+        // dot(world-camPos, camDir) == -viewCenter.z. Same uDistRange
+        // normalization, same 16-bit inverted quantization, same padding -
+        // the radix consumes these keys byte-for-byte like keygen's.
+        // Keys are written for EVERY live slot regardless of `rejected`,
+        // exactly as keygen keyed every slot.
+        If(float(uWK as TslNode).greaterThan(0.5), () => {
+          const metric = sortRadial
+            ? viewCenter.length()
+            : viewCenter.z.negate().add(100.0);
+          const qk = uint(
+            float(1.0)
+              .sub(
+                clamp(
+                  metric
+                    .sub((uDistRange as TslNode).x)
+                    .div(
+                      (uDistRange as TslNode).y.sub((uDistRange as TslNode).x),
+                    ),
+                  0.0,
+                  1.0,
+                ),
+              )
+              .mul(65535.0),
+          );
+          keysNode.element(i).assign(qk);
+        });
+
         projC.c0.element(i).assign(clipCenter);
         projC.c1.element(i).assign(vec4(axis1, axis2));
         projC.c2.element(i).assign(rgba);
@@ -1147,6 +1207,7 @@ export class WebGpuSplatBackend {
       drawInstances: 0,
       projector,
       uProjection,
+      uWriteKeys,
     };
     this.sortedOnce = false;
 
