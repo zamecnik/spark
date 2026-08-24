@@ -42,6 +42,7 @@ export declare class WebGpuSplatBackend {
     sortDigits: number;
     sortTpw: number;
     sortVisible: boolean;
+    cachePack: number;
     frames: number;
     sorts: number;
     lastSortFrame: number;

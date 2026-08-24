@@ -102,6 +102,10 @@ import { SplatNodeMaterial } from "./SplatNodeMaterial";
 
 // biome-ignore lint/suspicious/noExplicitAny: r180 type decls lack this export
 const unpackHalf2x16: (node: unknown) => any = (TSL as any).unpackHalf2x16;
+// biome-ignore lint/suspicious/noExplicitAny: r180 type decls lack this export
+const packHalf2x16: (node: unknown) => any = (TSL as any).packHalf2x16;
+// biome-ignore lint/suspicious/noExplicitAny: r180 type decls lack this export
+const uvec4: (...a: unknown[]) => any = (TSL as any).uvec4;
 
 // Structural views of the Spark types this module touches (it deliberately
 // imports nothing from the core bundle so the webgpu entry stays
@@ -386,6 +390,36 @@ export class WebGpuSplatBackend {
   //                    atomic append order) — the accepted keygen-fusion
   //                    diff class, NOT byte-identical.
   sortVisible = false;
+  //   cachePack      - ?splatpack=1|2: projector-cache slimming ladder
+  //                    (round 14; requires the projector; independent of
+  //                    sortVisible). The cache is 64 B/splat over padded
+  //                    capacity (~74 MB at 1.16M), fully rewritten every
+  //                    rendered frame and read 4x per drawn splat.
+  //                    1 = WRITE GUARD: rejected slots write only c3 (the
+  //                    live flag) instead of all four vec4s -
+  //                    output-IDENTICAL by construction (both reader
+  //                    variants load c0..c2 of a dead slot but discard on
+  //                    the live flag before any use), so its desktop gate
+  //                    is scene-0-px. Bandwidth saving materialises only
+  //                    where rejection is clumpy in slot order (cut order
+  //                    is leaf/block-coherent, so it should be) - which is
+  //                    why this is a measured lever, not a free default.
+  //                    2 = guard + the 32 B PACKED layout: p0 = fp32 clip
+  //                    center (position precision holds), p1 = uvec4 of
+  //                    [packHalf2x16(axis1), packHalf2x16(scale2, alpha),
+  //                    rgb8 | live<<24, packHalf2x16(uvStd, adjStdDev)].
+  //                    axis2 is DERIVED in the reader (perp(axis1)*scale2 -
+  //                    eigenvectors are orthogonal), viewZ from
+  //                    -clipCenter.w (perspective w = -viewZ; pick mode
+  //                    under an ORTHOGRAPHIC camera is unsupported on this
+  //                    path). rgb u8 is EXACT under the default parity
+  //                    lattice (?splatparity=off would re-quantize - that
+  //                    diagnostic is documented-dead). fp16 costs <=2^-11
+  //                    relative on axes/alpha/uvStd - sub-pixel /
+  //                    sub-u8-step. Halves footprint (74 -> 37 MB) AND
+  //                    write+read bandwidth. Default 0 until the round-14
+  //                    phone verdict.
+  cachePack = 0;
 
   // Gate instrumentation (P2/P3 acceptance).
   frames = 0;
@@ -964,17 +998,30 @@ export class WebGpuSplatBackend {
       .compute([Math.ceil(Math.max(1, capacity) / 256)], [256])
       .setName("splatKeygen");
 
-    // [proj] the projector cache: four vec4 arrays over the padded capacity,
-    // indexed by cut slot (the keygen's domain). ~64 B/splat - accepted for
-    // the lever build; stride-packing is a follow-up once the win is banked.
-    const projC = projOn
-      ? {
-          c0: instancedArray(Math.max(1, capacity), "vec4") as TslNode,
-          c1: instancedArray(Math.max(1, capacity), "vec4") as TslNode,
-          c2: instancedArray(Math.max(1, capacity), "vec4") as TslNode,
-          c3: instancedArray(Math.max(1, capacity), "vec4") as TslNode,
-        }
-      : null;
+    // [proj] the projector cache, indexed by cut slot (the keygen's domain).
+    // [pack] level 0/1: four vec4 arrays (64 B/splat; level 1 only changes
+    // the projector's write pattern, the layout and readers are identical).
+    // Level 2: fp32 clip center + one packed uvec4 (32 B/splat).
+    const packLevel =
+      projOn && (this.cachePack === 1 || this.cachePack === 2)
+        ? this.cachePack
+        : 0;
+    const projC =
+      projOn && packLevel < 2
+        ? {
+            c0: instancedArray(Math.max(1, capacity), "vec4") as TslNode,
+            c1: instancedArray(Math.max(1, capacity), "vec4") as TslNode,
+            c2: instancedArray(Math.max(1, capacity), "vec4") as TslNode,
+            c3: instancedArray(Math.max(1, capacity), "vec4") as TslNode,
+          }
+        : null;
+    const projP =
+      projOn && packLevel === 2
+        ? {
+            p0: instancedArray(Math.max(1, capacity), "vec4") as TslNode,
+            p1: instancedArray(Math.max(1, capacity), "uvec4") as TslNode,
+          }
+        : null;
 
     const material = new SplatNodeMaterial({
       packedTexture,
@@ -989,6 +1036,7 @@ export class WebGpuSplatBackend {
       vsMinimal: this.vsMinimal,
       batchSize: this.batchSize,
       projCache: projC ?? undefined,
+      projPacked: projP ?? undefined,
       visCountNode: visOn && visCountRead ? visCountRead : undefined,
     });
 
@@ -1001,7 +1049,7 @@ export class WebGpuSplatBackend {
     let projector: TslNode | null = null;
     let uProjection: { value: Matrix4 } | null = null;
     let uWriteKeys: { value: number } | null = null;
-    if (projC) {
+    if (projC || projP) {
       const uProj = uniform(new Matrix4());
       uProjection = uProj as unknown as { value: Matrix4 };
       // [fuse] sort-key output gate: 1 on frames update() will also submit
@@ -1019,7 +1067,12 @@ export class WebGpuSplatBackend {
           Return();
         });
         If(float(i).greaterThanEqual(uNumSplats as TslNode), () => {
-          projC.c3.element(i).assign(vec4(0.0, 0.0, 0.0, 0.0));
+          // padding slots carry only the dead flag - c3.w = 0 / p1 live bit 0
+          if (projC) {
+            projC.c3.element(i).assign(vec4(0.0, 0.0, 0.0, 0.0));
+          } else if (projP) {
+            projP.p1.element(i).assign(uvec4(uint(0), uint(0), uint(0), uint(0)));
+          }
           // [fuse] padding slots take the max key, exactly as the standalone
           // keygen pads - ascending radix sorts them to the tail. [vc] with
           // the compact sort the pre-pass clear already set EVERY key slot
@@ -1091,6 +1144,11 @@ export class WebGpuSplatBackend {
         const axis2 = vec2(0.0, 0.0).toVar();
         const uvStd = float(0.0).toVar();
         const adjOut = float(0.0).toVar();
+        // [pack] level 2 stores scale2 instead of axis2 (the reader derives
+        // axis2 = perp(normalize(axis1)) * scale2 - eigenvectors are
+        // orthogonal by construction). Declared only on that level so the
+        // level-0/1 WGSL stays byte-identical to the shipped kernel.
+        const scl2 = projP ? float(0.0).toVar() : null;
 
         If(rejected.not(), () => {
           const scales = vec3(
@@ -1274,6 +1332,7 @@ export class WebGpuSplatBackend {
           );
           axis1.assign(eigenVec1.mul(scale1));
           axis2.assign(eigenVec2.mul(scale2));
+          if (scl2) scl2.assign(scale2);
           uvStd.assign(
             select(fillOn, adjustedStdDev.mul(quadScale), adjustedStdDev),
           );
@@ -1335,14 +1394,56 @@ export class WebGpuSplatBackend {
           }
         });
 
-        projC.c0.element(i).assign(clipCenter);
-        projC.c1.element(i).assign(vec4(axis1, axis2));
-        projC.c2.element(i).assign(rgba);
-        projC.c3
-          .element(i)
-          .assign(
-            vec4(uvStd, adjOut, viewCenter.z, select(rejected, 0.0, 1.0)),
-          );
+        if (projC && packLevel === 0) {
+          // level 0: the shipped unconditional writes, byte-identical WGSL
+          projC.c0.element(i).assign(clipCenter);
+          projC.c1.element(i).assign(vec4(axis1, axis2));
+          projC.c2.element(i).assign(rgba);
+          projC.c3
+            .element(i)
+            .assign(
+              vec4(uvStd, adjOut, viewCenter.z, select(rejected, 0.0, 1.0)),
+            );
+        } else if (projC) {
+          // [pack] level 1 write guard: a rejected slot's c0..c2 are loaded
+          // by the readers but discarded on c3.w before any use (stale
+          // values are as good as zeros there), so only the flag word needs
+          // writing - 64 -> 16 B per rejected slot per frame.
+          If(rejected.not(), () => {
+            projC.c0.element(i).assign(clipCenter);
+            projC.c1.element(i).assign(vec4(axis1, axis2));
+            projC.c2.element(i).assign(rgba);
+          });
+          projC.c3
+            .element(i)
+            .assign(
+              vec4(uvStd, adjOut, viewCenter.z, select(rejected, 0.0, 1.0)),
+            );
+        } else if (projP) {
+          // [pack] level 2: 32 B packed layout (see the cachePack comment).
+          // rgb re-derives the parity-lattice integers exactly
+          // (round(round(x*255)/255*255) == round(x*255)); alpha is fp16
+          // (post-blurAdjust, continuous); live rides bit 24 of the rgb
+          // word; viewZ is NOT stored (reader uses -p0.w, perspective).
+          If(rejected.not(), () => {
+            const w4 = packHalf2x16(axis1);
+            const w5 = packHalf2x16(vec2(scl2 as TslNode, rgba.a));
+            const r8 = uint(round(clamp(rgba.r.mul(255.0), 0.0, 255.0)));
+            const g8 = uint(round(clamp(rgba.g.mul(255.0), 0.0, 255.0)));
+            const b8 = uint(round(clamp(rgba.b.mul(255.0), 0.0, 255.0)));
+            const w6 = r8
+              .bitOr(g8.shiftLeft(uint(8)))
+              .bitOr(b8.shiftLeft(uint(16)))
+              .bitOr(uint(1).shiftLeft(uint(24)));
+            const w7 = packHalf2x16(vec2(uvStd, adjOut));
+            projP.p0.element(i).assign(clipCenter);
+            projP.p1.element(i).assign(uvec4(w4, w5, w6, w7));
+          }).Else(() => {
+            projP.p1
+              .element(i)
+              .assign(uvec4(uint(0), uint(0), uint(0), uint(0)));
+          });
+        }
       })() as TslNode)
         .compute([Math.ceil(Math.max(1, capacity) / 256)], [256])
         .setName("splatProjector");

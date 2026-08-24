@@ -85,6 +85,7 @@ import {
   vec3,
   vec4,
 } from "three/tsl";
+import * as TSL from "three/tsl";
 import {
   type TslNode,
   pagedSplatTexCoordTsl,
@@ -96,6 +97,11 @@ import {
   unpackSplatEncodingTsl,
 } from "./packedSplatsTsl";
 import { evaluatePackedShTsl } from "./shTsl";
+
+// biome-ignore lint/suspicious/noExplicitAny: r180 type decls lack this export
+const unpackHalf2x16: (node: unknown) => any = (TSL as any).unpackHalf2x16;
+// biome-ignore lint/suspicious/noExplicitAny: r180 type decls lack this export
+const uvec4: (...a: unknown[]) => any = (TSL as any).uvec4;
 
 // Duplicated from src/defines.ts (must match): src/webgpu/ is deliberately
 // self-contained so the webgpu entry produces no shared chunks with the main
@@ -185,6 +191,20 @@ export type SplatNodeMaterialOptions = {
   //   c2 = rgba, final (post SH / parity / blur-adjust)
   //   c3 = (uvStd, adjustedStdDev, viewZ, live 0|1)
   projCache?: { c0: TslNode; c1: TslNode; c2: TslNode; c3: TslNode };
+
+  // [pack] level-2 packed projector cache (?splatpack=2) - 32 B/splat,
+  // mutually exclusive with projCache:
+  //   p0 = clip-space center, fp32 (position precision holds)
+  //   p1 = uvec4: [packHalf2x16(axis1.xy),
+  //                packHalf2x16(scale2, alpha),
+  //                r8 | g8<<8 | b8<<16 | live<<24,
+  //                packHalf2x16(uvStd, adjustedStdDev)]
+  // The reader derives axis2 = perp(normalize(axis1)) * scale2 (the eigen
+  // axes are orthogonal; a zero axis1 means scale1 = 0 >= scale2 so axis2
+  // is zero too, guarded against normalize(0)) and vViewZ = -p0.w (the
+  // perspective projection's w = -viewZ; pick mode under an orthographic
+  // camera is unsupported on this path - documented in FORK-CHANGES).
+  projPacked?: { p0: TslNode; p1: TslNode };
 
   // [vc] visible-count sort (?splatvis=1, projCache-only): a PLAIN u32
   // storage node over the 1-element GPU visible counter the projector's
@@ -277,6 +297,7 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
       vsMinimal = 0,
       batchSize = 1,
       projCache = undefined,
+      projPacked = undefined,
       visCountNode = undefined,
     } = options;
 
@@ -334,7 +355,87 @@ export class SplatNodeMaterial extends MeshBasicNodeMaterial {
     // `earlyExit` = 0 makes the guard uniformly true, restoring the exact
     // pre-T1-3 straight-line body for an in-session A/B with nothing else
     // varying (WebGpuSplatBackend.applyPerFrame / __kcSplatEarlyExit).
-    if (projCache && visCountNode) {
+    if (projPacked) {
+      // [pack] packed-cache reader (?splatpack=2) - one body for both the
+      // vis and non-vis flavors (compile-time branches keep the emitted
+      // WGSL minimal for each). Same structure as the projCache readers:
+      // batch tail reject, optional visCount tail reject BEFORE any storage
+      // read (vis flavor guards the loads; non-vis loads unconditionally
+      // like the stock reader), live flag from p1 bit 24, then unpack +
+      // axis2/viewZ derivation per the projPacked option comment.
+      this.vertexNode = Fn(() => {
+        const rejectPos = vec4(0.0, 0.0, 2.0, 1.0);
+        const rejected = bool(false).toVar();
+        let drawIdx: TslNode = instanceIndex;
+        if (batchSize > 1) {
+          const rawIdx = uint(instanceIndex)
+            .mul(uint(batchSize))
+            .add(uint(positionGeometry.z));
+          const inRange = float(rawIdx).lessThan(this.batchNumSplats);
+          rejected.assign(inRange.not());
+          drawIdx = select(inRange, rawIdx, uint(0)).toVar("kcBatchIdx");
+        }
+        if (visCountNode) {
+          rejected.assign(
+            rejected.or(
+              uint(drawIdx).greaterThanEqual(visCountNode.element(uint(0))),
+            ),
+          );
+        }
+        const p0 = vec4(0.0, 0.0, 0.0, 0.0).toVar();
+        const p1 = (uvec4(uint(0), uint(0), uint(0), uint(0)) as TslNode).toVar();
+        const loadCache = () => {
+          const slot = orderNode.element(drawIdx);
+          p0.assign(projPacked.p0.element(slot));
+          p1.assign(projPacked.p1.element(slot));
+        };
+        if (visCountNode) {
+          If(rejected.not(), loadCache);
+        } else {
+          loadCache();
+        }
+        rejected.assign(
+          rejected.or(
+            p1.z.shiftRight(uint(24)).bitAnd(uint(1)).equal(uint(0)),
+          ),
+        );
+
+        const axis1 = unpackHalf2x16(p1.x);
+        const sa = unpackHalf2x16(p1.y); // (scale2, alpha)
+        const rgb = vec3(
+          float(p1.z.bitAnd(uint(255))),
+          float(p1.z.shiftRight(uint(8)).bitAnd(uint(255))),
+          float(p1.z.shiftRight(uint(16)).bitAnd(uint(255))),
+        ).div(255.0);
+        const ua = unpackHalf2x16(p1.w); // (uvStd, adjustedStdDev)
+        const len = axis1.length();
+        const n = select(
+          len.greaterThan(0.0),
+          axis1.div(len),
+          vec2(0.0, 0.0),
+        );
+        const axis2 = vec2(n.y, n.x.negate()).mul(sa.x);
+
+        vRgba.assign(vec4(rgb, sa.y));
+        vSplatUv.assign(positionGeometry.xy.mul(ua.x));
+        vAdjustedStdDev.assign(ua.y);
+        vViewZ.assign(p0.w.negate());
+
+        const scaledRenderSize = vec2(this.renderSize).mul(
+          this.focalAdjustment,
+        );
+        const pixelOffset = axis1
+          .mul(positionGeometry.x)
+          .add(axis2.mul(positionGeometry.y));
+        const ndcOffset = vec2(2.0).div(scaledRenderSize).mul(pixelOffset);
+        const ndcCenter = p0.xyz.div(p0.w);
+        return select(
+          rejected,
+          rejectPos,
+          vec4(ndcCenter.xy.add(ndcOffset).mul(p0.w), p0.z, p0.w),
+        );
+      })();
+    } else if (projCache && visCountNode) {
       // [vc] guarded reader variant of the projCache vertex stage below —
       // kept as a SEPARATE body (the vsMinimal precedent) so the lever-off
       // reader's emitted WGSL stays byte-identical. Differences from the

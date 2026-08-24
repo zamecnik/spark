@@ -3,7 +3,7 @@ import { uint, float, vec2, max, select, normalize, vec3, vec4, ivec3, int, exp,
 import { MeshBasicNodeMaterial, Vector2, Vector4, Vector3, DoubleSide, CustomBlending, AddEquation, OneFactor, OneMinusSrcAlphaFactor, Matrix4, Quaternion, IndirectStorageBufferAttribute } from "three/webgpu";
 import * as THREE from "three";
 import { d as kcDisposeOldMaterial, b as kcRegrowLog } from "./kcRegrowDebug-gV7aMG4z.js";
-const unpackHalf2x16$1 = TSL.unpackHalf2x16;
+const unpackHalf2x16$2 = TSL.unpackHalf2x16;
 const SPLAT_TEX_WIDTH_BITS = 11;
 const SPLAT_TEX_LAYER_BITS = 22;
 const SPLAT_TEX_MASK = 2047;
@@ -53,8 +53,8 @@ function unpackSplatEncodingTsl(packedData, rgbMinMaxLnScaleMinMax) {
   const uA = float(word0.shiftRight(uint(24)).bitAnd(uint(255)));
   const rgb = vec3(uR, uG, uB).div(255).mul(rgbMax.sub(rgbMin)).add(rgbMin);
   const rgba = vec4(rgb, uA.div(255));
-  const xy = unpackHalf2x16$1(word1);
-  const zw = unpackHalf2x16$1(word2.bitAnd(uint(65535)));
+  const xy = unpackHalf2x16$2(word1);
+  const zw = unpackHalf2x16$2(word2.bitAnd(uint(65535)));
   const center = vec3(xy.x, xy.y, zw.x);
   const uSx = word3.bitAnd(uint(255));
   const uSy = word3.shiftRight(uint(8)).bitAnd(uint(255));
@@ -212,6 +212,8 @@ function evaluatePackedShTsl({
   }
   return rgb;
 }
+const unpackHalf2x16$1 = TSL.unpackHalf2x16;
+const uvec4$1 = TSL.uvec4;
 const LN_SCALE_MIN$1 = -12;
 const LN_SCALE_MAX$1 = 9;
 class SplatNodeMaterial extends MeshBasicNodeMaterial {
@@ -258,6 +260,7 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
       vsMinimal = 0,
       batchSize = 1,
       projCache = void 0,
+      projPacked = void 0,
       visCountNode = void 0
     } = options;
     stripWebGLInternalFormat(packedTexture);
@@ -272,7 +275,73 @@ class SplatNodeMaterial extends MeshBasicNodeMaterial {
     const uMaxStdDev = this.maxStdDev;
     const uMinAlpha = this.minAlpha;
     const uFalloff = this.falloff;
-    if (projCache && visCountNode) {
+    if (projPacked) {
+      this.vertexNode = Fn(() => {
+        const rejectPos = vec4(0, 0, 2, 1);
+        const rejected = bool(false).toVar();
+        let drawIdx = instanceIndex;
+        if (batchSize > 1) {
+          const rawIdx = uint(instanceIndex).mul(uint(batchSize)).add(uint(positionGeometry.z));
+          const inRange = float(rawIdx).lessThan(this.batchNumSplats);
+          rejected.assign(inRange.not());
+          drawIdx = select(inRange, rawIdx, uint(0)).toVar("kcBatchIdx");
+        }
+        if (visCountNode) {
+          rejected.assign(
+            rejected.or(
+              uint(drawIdx).greaterThanEqual(visCountNode.element(uint(0)))
+            )
+          );
+        }
+        const p0 = vec4(0, 0, 0, 0).toVar();
+        const p1 = uvec4$1(uint(0), uint(0), uint(0), uint(0)).toVar();
+        const loadCache = () => {
+          const slot = orderNode.element(drawIdx);
+          p0.assign(projPacked.p0.element(slot));
+          p1.assign(projPacked.p1.element(slot));
+        };
+        if (visCountNode) {
+          If(rejected.not(), loadCache);
+        } else {
+          loadCache();
+        }
+        rejected.assign(
+          rejected.or(
+            p1.z.shiftRight(uint(24)).bitAnd(uint(1)).equal(uint(0))
+          )
+        );
+        const axis1 = unpackHalf2x16$1(p1.x);
+        const sa = unpackHalf2x16$1(p1.y);
+        const rgb = vec3(
+          float(p1.z.bitAnd(uint(255))),
+          float(p1.z.shiftRight(uint(8)).bitAnd(uint(255))),
+          float(p1.z.shiftRight(uint(16)).bitAnd(uint(255)))
+        ).div(255);
+        const ua = unpackHalf2x16$1(p1.w);
+        const len = axis1.length();
+        const n = select(
+          len.greaterThan(0),
+          axis1.div(len),
+          vec2(0, 0)
+        );
+        const axis2 = vec2(n.y, n.x.negate()).mul(sa.x);
+        vRgba.assign(vec4(rgb, sa.y));
+        vSplatUv.assign(positionGeometry.xy.mul(ua.x));
+        vAdjustedStdDev.assign(ua.y);
+        vViewZ.assign(p0.w.negate());
+        const scaledRenderSize = vec2(this.renderSize).mul(
+          this.focalAdjustment
+        );
+        const pixelOffset = axis1.mul(positionGeometry.x).add(axis2.mul(positionGeometry.y));
+        const ndcOffset = vec2(2).div(scaledRenderSize).mul(pixelOffset);
+        const ndcCenter = p0.xyz.div(p0.w);
+        return select(
+          rejected,
+          rejectPos,
+          vec4(ndcCenter.xy.add(ndcOffset).mul(p0.w), p0.z, p0.w)
+        );
+      })();
+    } else if (projCache && visCountNode) {
       this.vertexNode = Fn(() => {
         const rejectPos = vec4(0, 0, 2, 1);
         const rejected = bool(false).toVar();
@@ -1108,6 +1177,8 @@ class BatchedSplatGeometry extends THREE.InstancedBufferGeometry {
 const LN_SCALE_MIN = -12;
 const LN_SCALE_MAX = 9;
 const unpackHalf2x16 = TSL.unpackHalf2x16;
+const packHalf2x16 = TSL.packHalf2x16;
+const uvec4 = TSL.uvec4;
 function fromHalf(h) {
   const s = (h & 32768) >> 15;
   const e = (h & 31744) >> 10;
@@ -1162,6 +1233,7 @@ class WebGpuSplatBackend {
     this.sortDigits = 4;
     this.sortTpw = 256;
     this.sortVisible = false;
+    this.cachePack = 0;
     this.frames = 0;
     this.sorts = 0;
     this.lastSortFrame = -1;
@@ -1543,11 +1615,16 @@ class WebGpuSplatBackend {
       );
       keysNode.element(i).assign(q);
     })().compute([Math.ceil(Math.max(1, capacity) / 256)], [256]).setName("splatKeygen");
-    const projC = projOn ? {
+    const packLevel = projOn && (this.cachePack === 1 || this.cachePack === 2) ? this.cachePack : 0;
+    const projC = projOn && packLevel < 2 ? {
       c0: instancedArray(Math.max(1, capacity), "vec4"),
       c1: instancedArray(Math.max(1, capacity), "vec4"),
       c2: instancedArray(Math.max(1, capacity), "vec4"),
       c3: instancedArray(Math.max(1, capacity), "vec4")
+    } : null;
+    const projP = projOn && packLevel === 2 ? {
+      p0: instancedArray(Math.max(1, capacity), "vec4"),
+      p1: instancedArray(Math.max(1, capacity), "uvec4")
     } : null;
     const material = new SplatNodeMaterial({
       packedTexture,
@@ -1562,12 +1639,13 @@ class WebGpuSplatBackend {
       vsMinimal: this.vsMinimal,
       batchSize: this.batchSize,
       projCache: projC ?? void 0,
+      projPacked: projP ?? void 0,
       visCountNode: visOn && visCountRead ? visCountRead : void 0
     });
     let projector = null;
     let uProjection = null;
     let uWriteKeys = null;
-    if (projC) {
+    if (projC || projP) {
       const uProj = uniform(new Matrix4());
       uProjection = uProj;
       const uWK = uniform(0);
@@ -1583,7 +1661,11 @@ class WebGpuSplatBackend {
           Return();
         });
         If(float(i).greaterThanEqual(uNumSplats), () => {
-          projC.c3.element(i).assign(vec4(0, 0, 0, 0));
+          if (projC) {
+            projC.c3.element(i).assign(vec4(0, 0, 0, 0));
+          } else if (projP) {
+            projP.p1.element(i).assign(uvec4(uint(0), uint(0), uint(0), uint(0)));
+          }
           if (!visOn) {
             If(float(uWK).greaterThan(0.5), () => {
               keysNode.element(i).assign(uint(quantMax));
@@ -1640,6 +1722,7 @@ class WebGpuSplatBackend {
         const axis2 = vec2(0, 0).toVar();
         const uvStd = float(0).toVar();
         const adjOut = float(0).toVar();
+        const scl2 = projP ? float(0).toVar() : null;
         If(rejected.not(), () => {
           const scales = vec3(
             unpacked.scales.mul(material.renderToViewScale)
@@ -1799,6 +1882,7 @@ class WebGpuSplatBackend {
           );
           axis1.assign(eigenVec1.mul(scale1));
           axis2.assign(eigenVec2.mul(scale2));
+          if (scl2) scl2.assign(scale2);
           uvStd.assign(
             select(fillOn, adjustedStdDev.mul(quadScale), adjustedStdDev)
           );
@@ -1830,12 +1914,37 @@ class WebGpuSplatBackend {
             keysNode.element(i).assign(qk);
           }
         });
-        projC.c0.element(i).assign(clipCenter);
-        projC.c1.element(i).assign(vec4(axis1, axis2));
-        projC.c2.element(i).assign(rgba);
-        projC.c3.element(i).assign(
-          vec4(uvStd, adjOut, viewCenter.z, select(rejected, 0, 1))
-        );
+        if (projC && packLevel === 0) {
+          projC.c0.element(i).assign(clipCenter);
+          projC.c1.element(i).assign(vec4(axis1, axis2));
+          projC.c2.element(i).assign(rgba);
+          projC.c3.element(i).assign(
+            vec4(uvStd, adjOut, viewCenter.z, select(rejected, 0, 1))
+          );
+        } else if (projC) {
+          If(rejected.not(), () => {
+            projC.c0.element(i).assign(clipCenter);
+            projC.c1.element(i).assign(vec4(axis1, axis2));
+            projC.c2.element(i).assign(rgba);
+          });
+          projC.c3.element(i).assign(
+            vec4(uvStd, adjOut, viewCenter.z, select(rejected, 0, 1))
+          );
+        } else if (projP) {
+          If(rejected.not(), () => {
+            const w4 = packHalf2x16(axis1);
+            const w5 = packHalf2x16(vec2(scl2, rgba.a));
+            const r8 = uint(round(clamp(rgba.r.mul(255), 0, 255)));
+            const g8 = uint(round(clamp(rgba.g.mul(255), 0, 255)));
+            const b8 = uint(round(clamp(rgba.b.mul(255), 0, 255)));
+            const w6 = r8.bitOr(g8.shiftLeft(uint(8))).bitOr(b8.shiftLeft(uint(16))).bitOr(uint(1).shiftLeft(uint(24)));
+            const w7 = packHalf2x16(vec2(uvStd, adjOut));
+            projP.p0.element(i).assign(clipCenter);
+            projP.p1.element(i).assign(uvec4(w4, w5, w6, w7));
+          }).Else(() => {
+            projP.p1.element(i).assign(uvec4(uint(0), uint(0), uint(0), uint(0)));
+          });
+        }
       })().compute([Math.ceil(Math.max(1, capacity) / 256)], [256]).setName("splatProjector");
     }
     if (this.state) {
