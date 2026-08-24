@@ -335,6 +335,13 @@ export class WebGpuSplatBackend {
   //                    never wrong bits. Diagnostic ladder first; whether a
   //                    reduced width SHIPS is a visual call on device.
   sortBits = 16;
+  //   sortDigits     - radix digit width (?sortdigit=4|8). Default 8: two
+  //                    passes at FULL 16-bit key precision, the identical
+  //                    sorted permutation (LSD stability composes the same
+  //                    order), rig-verified and parity-smoked. Falls back to
+  //                    4 whenever sortBits is not a multiple of 8 (e.g. the
+  //                    ?sortbits=12 diagnostic).
+  sortDigits = 8;
 
   // Gate instrumentation (P2/P3 acceptance).
   frames = 0;
@@ -755,10 +762,13 @@ export class WebGpuSplatBackend {
         ? this.sortBits
         : 16;
     const quantMax = 2 ** sortBits - 1;
+    const digitBits =
+      this.sortDigits === 8 && sortBits % 8 === 0 ? 8 : 4;
     const radix = createRadixSort({
       keysNode,
       count: Math.max(1, capacity),
       numBits: sortBits,
+      digitBits,
     });
 
     const uNumSplats = uniform(0); // float; exact for counts < 2^24

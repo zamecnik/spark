@@ -1,6 +1,6 @@
 {
   "name": "@sparkjsdev/spark",
-  "version": "2.1.0-kroscloud.21",
+  "version": "2.1.0-kroscloud.22",
   "description": "An advanced 3D Gaussian Splatting renderer for THREE.js",
   "homepage": "https://sparkjs.dev/",
   "type": "module",

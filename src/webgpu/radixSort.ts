@@ -48,7 +48,8 @@ const countOneBits: (node: unknown) => any = (TSL as any).countOneBits;
 const TPW = 256; // threads per workgroup
 const EPT = 8; // elements per thread
 const EPW = TPW * EPT; // 2048 elements per workgroup
-const BUCKETS = 16; // 4-bit radix
+// BUCKETS is per-instance now: 1 << digitBits (16 for the classic 4-bit
+// kernel, 256 for the 8-bit-digit variant). See createRadixSort.
 const SCAN_ITEMS = 512; // Blelloch scan: 2 items per thread
 
 const pad = (n: number, m: number) => Math.ceil(n / m) * m;
@@ -66,14 +67,29 @@ export function createRadixSort({
   keysNode,
   count,
   numBits = 16,
+  digitBits = 4,
 }: {
   keysNode: TslNode;
   count: number;
   numBits?: number;
+  // [digit] radix digit width: 4 (classic, 16 buckets) or 8 (256 buckets,
+  // HALF the passes at the same key precision). The per-element reorder work
+  // is identical either way - each digit's ballot spans 8 words of 256 bits
+  // regardless of bucket count - so passes are the whole cost, and rows 78/79
+  // measured them at ~9.5 ms each over 1.16M keys on Adreno 640. Workgroup
+  // memory at 8: masks 256x8 u32 = 8 KB + offsets 1 KB, inside the 16 KB
+  // WebGPU floor. The sorted permutation is IDENTICAL for both widths (LSD
+  // radix stability composes the same total order), so this is a pure
+  // performance knob.
+  digitBits?: number;
 }): RadixSort {
-  if (numBits % 4 !== 0) throw new Error("numBits must be a multiple of 4");
+  if (digitBits !== 4 && digitBits !== 8)
+    throw new Error("digitBits must be 4 or 8");
+  if (numBits % digitBits !== 0)
+    throw new Error("numBits must be a multiple of digitBits");
 
-  const numPasses = numBits / 4;
+  const BUCKETS = 1 << digitBits;
+  const numPasses = numBits / digitBits;
   const wgCount = Math.max(1, Math.ceil(count / EPW));
   const blockSumCount = BUCKETS * wgCount;
 
@@ -136,7 +152,7 @@ export function createRadixSort({
           const digit = srcKeys
             .element(GID)
             .shiftRight(uint(bit))
-            .bitAnd(uint(15));
+            .bitAnd(uint(BUCKETS - 1));
           atomicAdd(hist.element(digit), uint(1));
         });
       }
@@ -268,7 +284,9 @@ export function createRadixSort({
     isFirst: boolean,
     isLast: boolean,
   ) => {
-    const masks = (workgroupArray("uint", 128) as TslNode).setAtomic(true); // 16 digits × 8 words × 32 bits
+    const masks = (workgroupArray("uint", BUCKETS * 8) as TslNode).setAtomic(
+      true,
+    ); // BUCKETS digits × 8 words × 32 bits
     const offsets = workgroupArray("uint", BUCKETS); // cumulative per-digit round offsets
 
     return (Fn(() => {
@@ -278,11 +296,16 @@ export function createRadixSort({
       const wordIdx = TID.shiftRight(uint(5)).toVar();
       const bitIdx = TID.bitAnd(uint(31)).toVar();
 
+      // one thread per digit clears its offsets slot and its 8 mask words -
+      // the same shape the per-round clear below uses, valid for 16 and 256
       If(TID.lessThan(uint(BUCKETS)), () => {
         offsets.element(TID).assign(uint(0));
-      });
-      If(TID.lessThan(uint(128)), () => {
-        atomicStore(masks.element(TID), uint(0));
+        for (let w = 0; w < 8; w++) {
+          atomicStore(
+            masks.element(TID.mul(uint(8)).add(uint(w))),
+            uint(0),
+          );
+        }
       });
       workgroupBarrier();
 
@@ -292,8 +315,8 @@ export function createRadixSort({
         const k = select(isValid, inKeys.element(GID), uint(0)).toVar();
         const digit = select(
           isValid,
-          k.shiftRight(uint(bit)).bitAnd(uint(15)),
-          uint(16),
+          k.shiftRight(uint(bit)).bitAnd(uint(BUCKETS - 1)),
+          uint(BUCKETS),
         ).toVar();
         // pre-fetch value before the barrier (reference does this for
         // latency overlap)
@@ -372,7 +395,7 @@ export function createRadixSort({
   let nxtVals: TslNode = valsB;
 
   for (let pass = 0; pass < numPasses; pass++) {
-    const bit = pass * 4;
+    const bit = pass * digitBits;
     const isFirst = pass === 0;
     const isLast = pass === numPasses - 1;
 
