@@ -68,6 +68,7 @@ export function createRadixSort({
   count,
   numBits = 16,
   digitBits = 4,
+  reorderThreads = 256,
 }: {
   keysNode: TslNode;
   count: number;
@@ -82,15 +83,32 @@ export function createRadixSort({
   // radix stability composes the same total order), so this is a pure
   // performance knob.
   digitBits?: number;
+  // [tpw] threads per workgroup for the histogram/reorder kernels (the scan
+  // keeps its own 256). Row 81: digit-8 at 256 threads REGRESSED on Adreno
+  // (86 vs 74 ms orbit; ~29 ms/pass vs the 4-bit kernel's 9.5) while the
+  // desktop rig ran it faster - the 9 KB mask footprint (256 buckets x 8
+  // ballot words) is the occupancy suspect. Fewer threads shrink the ballot:
+  // words/digit = threads/32, so 128 threads = 4 KB masks, 64 = 2 KB, at the
+  // price of more workgroups (EPW = threads x EPT). Same permutation always.
+  reorderThreads?: number;
 }): RadixSort {
   if (digitBits !== 4 && digitBits !== 8)
     throw new Error("digitBits must be 4 or 8");
   if (numBits % digitBits !== 0)
     throw new Error("numBits must be a multiple of digitBits");
+  if (![64, 128, 256].includes(reorderThreads))
+    throw new Error("reorderThreads must be 64, 128 or 256");
 
   const BUCKETS = 1 << digitBits;
   const numPasses = numBits / digitBits;
-  const wgCount = Math.max(1, Math.ceil(count / EPW));
+  const RT = reorderThreads; // hist/reorder thread count
+  const WORDS = RT / 32; // ballot words per digit
+  const EPW_R = RT * EPT; // elements per hist/reorder workgroup
+  // Digit-slots per thread for per-digit housekeeping (clears, histogram
+  // publish, offsets): with RT < BUCKETS one thread must own several digits -
+  // the rig caught exactly this (digits >= RT never written at tpw 128/64).
+  const DPT = Math.ceil(BUCKETS / RT);
+  const wgCount = Math.max(1, Math.ceil(count / EPW_R));
   const blockSumCount = BUCKETS * wgCount;
 
   // ---- buffers (all zero-initialised u32) --------------------------------
@@ -139,15 +157,18 @@ export function createRadixSort({
     return (Fn(() => {
       const TID = invocationLocalIndex;
       const WGID = workgroupId.x;
-      const WID = WGID.mul(uint(EPW));
+      const WID = WGID.mul(uint(EPW_R));
 
-      If(TID.lessThan(uint(BUCKETS)), () => {
-        atomicStore(hist.element(TID), uint(0));
-      });
+      for (let k = 0; k < DPT; k++) {
+        const dg = TID.add(uint(k * RT));
+        If(dg.lessThan(uint(BUCKETS)), () => {
+          atomicStore(hist.element(dg), uint(0));
+        });
+      }
       workgroupBarrier();
 
       for (let r = 0; r < EPT; r++) {
-        const GID = WID.add(uint(r * TPW)).add(TID);
+        const GID = WID.add(uint(r * RT)).add(TID);
         If(GID.lessThan(uint(count)), () => {
           const digit = srcKeys
             .element(GID)
@@ -158,13 +179,16 @@ export function createRadixSort({
       }
       workgroupBarrier();
 
-      If(TID.lessThan(uint(BUCKETS)), () => {
-        blockSums
-          .element(TID.mul(uint(wgCount)).add(WGID))
-          .assign(atomicLoad(hist.element(TID)));
-      });
+      for (let k = 0; k < DPT; k++) {
+        const dg = TID.add(uint(k * RT));
+        If(dg.lessThan(uint(BUCKETS)), () => {
+          blockSums
+            .element(dg.mul(uint(wgCount)).add(WGID))
+            .assign(atomicLoad(hist.element(dg)));
+        });
+      }
     })() as TslNode)
-      .compute([wgCount], [TPW])
+      .compute([wgCount], [RT])
       .setName(`radixHist_bit${bit}`);
   };
 
@@ -284,33 +308,36 @@ export function createRadixSort({
     isFirst: boolean,
     isLast: boolean,
   ) => {
-    const masks = (workgroupArray("uint", BUCKETS * 8) as TslNode).setAtomic(
+    const masks = (workgroupArray("uint", BUCKETS * WORDS) as TslNode).setAtomic(
       true,
-    ); // BUCKETS digits × 8 words × 32 bits
+    ); // BUCKETS digits × WORDS words × 32 bits
     const offsets = workgroupArray("uint", BUCKETS); // cumulative per-digit round offsets
 
     return (Fn(() => {
       const TID = invocationLocalIndex;
       const WGID = workgroupId.x;
-      const WID = WGID.mul(uint(EPW));
+      const WID = WGID.mul(uint(EPW_R));
       const wordIdx = TID.shiftRight(uint(5)).toVar();
       const bitIdx = TID.bitAnd(uint(31)).toVar();
 
       // one thread per digit clears its offsets slot and its 8 mask words -
       // the same shape the per-round clear below uses, valid for 16 and 256
-      If(TID.lessThan(uint(BUCKETS)), () => {
-        offsets.element(TID).assign(uint(0));
-        for (let w = 0; w < 8; w++) {
-          atomicStore(
-            masks.element(TID.mul(uint(8)).add(uint(w))),
-            uint(0),
-          );
-        }
-      });
+      for (let k = 0; k < DPT; k++) {
+        const dg = TID.add(uint(k * RT));
+        If(dg.lessThan(uint(BUCKETS)), () => {
+          offsets.element(dg).assign(uint(0));
+          for (let w = 0; w < WORDS; w++) {
+            atomicStore(
+              masks.element(dg.mul(uint(WORDS)).add(uint(w))),
+              uint(0),
+            );
+          }
+        });
+      }
       workgroupBarrier();
 
       for (let round = 0; round < EPT; round++) {
-        const GID = WID.add(uint(round * TPW)).add(TID).toVar();
+        const GID = WID.add(uint(round * RT)).add(TID).toVar();
         const isValid = GID.lessThan(uint(count)).toVar();
         const k = select(isValid, inKeys.element(GID), uint(0)).toVar();
         const digit = select(
@@ -326,17 +353,17 @@ export function createRadixSort({
 
         If(isValid, () => {
           atomicOr(
-            masks.element(digit.mul(uint(8)).add(wordIdx)),
+            masks.element(digit.mul(uint(WORDS)).add(wordIdx)),
             uint(1).shiftLeft(bitIdx),
           );
         });
         workgroupBarrier();
 
         If(isValid, () => {
-          const base = digit.mul(uint(8)).toVar();
+          const base = digit.mul(uint(WORDS)).toVar();
           const localPrefix = offsets.element(digit).toVar();
 
-          for (let w = 0; w < 7; w++) {
+          for (let w = 0; w < WORDS - 1; w++) {
             If(uint(w).lessThan(wordIdx), () => {
               localPrefix.addAssign(
                 countOneBits(atomicLoad(masks.element(base.add(uint(w))))),
@@ -362,20 +389,23 @@ export function createRadixSort({
         // update cumulative offsets and clear masks for the next round
         if (round < EPT - 1) {
           workgroupBarrier();
-          If(TID.lessThan(uint(BUCKETS)), () => {
-            const cnt = uint(0).toVar();
-            for (let w = 0; w < 8; w++) {
-              const idx = TID.mul(uint(8)).add(uint(w));
-              cnt.addAssign(countOneBits(atomicLoad(masks.element(idx))));
-              atomicStore(masks.element(idx), uint(0));
-            }
-            offsets.element(TID).addAssign(cnt);
-          });
+          for (let k = 0; k < DPT; k++) {
+            const dg = TID.add(uint(k * RT));
+            If(dg.lessThan(uint(BUCKETS)), () => {
+              const cnt = uint(0).toVar();
+              for (let w = 0; w < WORDS; w++) {
+                const idx = dg.mul(uint(WORDS)).add(uint(w));
+                cnt.addAssign(countOneBits(atomicLoad(masks.element(idx))));
+                atomicStore(masks.element(idx), uint(0));
+              }
+              offsets.element(dg).addAssign(cnt);
+            });
+          }
           workgroupBarrier();
         }
       }
     })() as TslNode)
-      .compute([wgCount], [TPW])
+      .compute([wgCount], [RT])
       .setName(`radixReorder_bit${bit}`);
   };
 

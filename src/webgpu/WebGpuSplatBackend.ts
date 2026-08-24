@@ -335,13 +335,20 @@ export class WebGpuSplatBackend {
   //                    never wrong bits. Diagnostic ladder first; whether a
   //                    reduced width SHIPS is a visual call on device.
   sortBits = 16;
-  //   sortDigits     - radix digit width (?sortdigit=4|8). Default 8: two
-  //                    passes at FULL 16-bit key precision, the identical
-  //                    sorted permutation (LSD stability composes the same
-  //                    order), rig-verified and parity-smoked. Falls back to
-  //                    4 whenever sortBits is not a multiple of 8 (e.g. the
-  //                    ?sortbits=12 diagnostic).
-  sortDigits = 8;
+  //   sortDigits     - radix digit width (?sortdigit=4|8). DEFAULT REVERTED
+  //                    to 4 after row 81: digit-8 at 256 threads REGRESSED on
+  //                    Adreno (orbit 86 vs 74 ms, ~29 ms/pass vs 9.5) while
+  //                    the desktop rig ran it FASTER - the 9 KB ballot
+  //                    footprint is the occupancy suspect. The permutation is
+  //                    identical either way, so this is purely a perf knob;
+  //                    the 2-pass prize (row 79 measured 55 ms orbit) is
+  //                    chased via sortTpw below.
+  sortDigits = 4;
+  //   sortTpw        - hist/reorder threads per workgroup (?sorttpw=64|128|
+  //                    256). Fewer threads shrink the digit-8 ballot masks
+  //                    (words = threads/32): 128 -> 4 KB, 64 -> 2 KB, testing
+  //                    the occupancy hypothesis on device.
+  sortTpw = 256;
 
   // Gate instrumentation (P2/P3 acceptance).
   frames = 0;
@@ -764,11 +771,15 @@ export class WebGpuSplatBackend {
     const quantMax = 2 ** sortBits - 1;
     const digitBits =
       this.sortDigits === 8 && sortBits % 8 === 0 ? 8 : 4;
+    const reorderThreads = [64, 128, 256].includes(this.sortTpw)
+      ? this.sortTpw
+      : 256;
     const radix = createRadixSort({
       keysNode,
       count: Math.max(1, capacity),
       numBits: sortBits,
       digitBits,
+      reorderThreads,
     });
 
     const uNumSplats = uniform(0); // float; exact for counts < 2^24
