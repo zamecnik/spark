@@ -131,6 +131,19 @@ export declare class SsogLodController {
     /** pinned coarsest chunk ids (computed once) */
     private readonly pinnedChunks;
     /**
+     * [ssog-17] per-tick scratch: final-cut page refcounts (balanced ∪ pinned)
+     * for the page-aware balancer — allocated once, length totalBlocks.
+     */
+    private readonly pageRefs;
+    /**
+     * [ssog-17 perf] per-tick scratch for the bucket-ordered leaf index
+     * (counting sort, stable in li): the balancer passes visit leaves in
+     * (bucket, li) order — the former 64×NL rescans dominated tick cost.
+     */
+    private readonly bucketOrder;
+    private readonly bucketStart;
+    private readonly bucketCursor;
+    /**
      * Chunks in THIS tick's fetchPriority (tiers 1–4). Flip eligibility
      * requires every desired chunk ∈ this set: a chunk that is resident but
      * NOT in the current priority is in driveFetchers' freeable set and can be
@@ -159,6 +172,10 @@ export declare class SsogLodController {
         headroomViolations: number;
         capacityDeferrals: number;
         poolDeferrals: number;
+        /** [ssog-17] distinct pages of the balanced∪pinned final cut */
+        balancedPages: number;
+        /** [ssog-17] page budget the balancer enforced (0 = not enforced) */
+        pageLimit: number;
         /** [B4] wave-gather hold observations (per flip-scan pass, not unique) */
         batchHolds: number;
         displayedChunkCount: number;
@@ -178,6 +195,13 @@ export declare class SsogLodController {
         revealTotalBlocks: number;
     };
     constructor(options: SsogLodControllerOptions);
+    /**
+     * [ssog-17] add (dir=+1) or remove (dir=−1) one leaf-level ref's pages
+     * to/from the final-cut refcount scratch; returns the updated distinct
+     * count. Same chunk math as forEachLeafChunk, inlined for the balancer's
+     * hot path. Aliased level pairs net to zero across a move.
+     */
+    private bumpLeafPageRefs;
     /** Q8: call once per rendered frame from the app rAF. */
     frame(camera: THREE.PerspectiveCamera): void;
     /**

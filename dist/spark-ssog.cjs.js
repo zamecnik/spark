@@ -421,12 +421,16 @@ class SsogSplats extends spark.PagedSplats {
     const cutSplats = Math.min(budget * 1.15, maxCut);
     const slackSplats = (model.maxLeafBlockFootprint + numFetchers) * SSOG_PAGE_SPLATS;
     const poolFactor = options.poolFactor ?? 1;
-    const poolPages = Math.min(
-      Math.ceil(
-        (cutSplats * poolFactor + coarsestSplats + slackSplats) / SSOG_PAGE_SPLATS
-      ),
-      model.totalBlocks
+    const MAX_POOL_PAGES = 256;
+    const wantPages = Math.ceil(
+      (cutSplats * poolFactor + coarsestSplats + slackSplats) / SSOG_PAGE_SPLATS
     );
+    const poolPages = Math.min(wantPages, model.totalBlocks, MAX_POOL_PAGES);
+    if (poolPages === MAX_POOL_PAGES && wantPages > MAX_POOL_PAGES && MAX_POOL_PAGES < model.totalBlocks) {
+      console.warn(
+        `[ssog] poolPages clamped ${wantPages} -> ${MAX_POOL_PAGES} (default maxTextureArrayLayers)`
+      );
+    }
     const pager = new spark.SplatPager({
       renderer: options.renderer,
       extSplats: false,
@@ -554,6 +558,10 @@ class SsogLodController {
       headroomViolations: 0,
       capacityDeferrals: 0,
       poolDeferrals: 0,
+      /** [ssog-17] distinct pages of the balanced∪pinned final cut */
+      balancedPages: 0,
+      /** [ssog-17] page budget the balancer enforced (0 = not enforced) */
+      pageLimit: 0,
       /** [B4] wave-gather hold observations (per flip-scan pass, not unique) */
       batchHolds: 0,
       displayedChunkCount: 0,
@@ -600,6 +608,52 @@ class SsogLodController {
     }
     this.pinnedChunks = pinned;
     this.stats.revealTotalBlocks = pinned.length;
+    this.pageRefs = new Int32Array(model.totalBlocks);
+    this.bucketOrder = new Int32Array(this.NL);
+    this.bucketStart = new Int32Array(65);
+    this.bucketCursor = new Int32Array(64);
+    const pager = this.splats.pager;
+    if (pager && pager.maxPages < model.totalBlocks) {
+      const margin = model.maxLeafBlockFootprint + pager.numFetchers;
+      const guard = this.poolGuardLimit();
+      if (pinned.length + margin > guard) {
+        console.warn(
+          `[ssog] pool too small for page-aware balance: pinned ${pinned.length} + margin ${margin} > guard ${guard} — cut will rest at coarsest`
+        );
+      }
+    }
+  }
+  /**
+   * [ssog-17] add (dir=+1) or remove (dir=−1) one leaf-level ref's pages
+   * to/from the final-cut refcount scratch; returns the updated distinct
+   * count. Same chunk math as forEachLeafChunk, inlined for the balancer's
+   * hot path. Aliased level pairs net to zero across a move.
+   */
+  bumpLeafPageRefs(li, level, refs, distinct, dir) {
+    const model = this.splats.model;
+    const o = (li * this.L + level) * 3;
+    const file = model.leafLods[o];
+    const offset = model.leafLods[o + 1];
+    const count = model.leafLods[o + 2];
+    if (count <= 0) {
+      return distinct;
+    }
+    const first = model.blockBase[file] + Math.floor(offset / SSOG_PAGE_SPLATS);
+    const last = model.blockBase[file] + Math.floor((offset + count - 1) / SSOG_PAGE_SPLATS);
+    for (let c = first; c <= last; c++) {
+      if (dir > 0) {
+        if (refs[c] === 0) {
+          distinct++;
+        }
+        refs[c]++;
+      } else {
+        refs[c]--;
+        if (refs[c] === 0) {
+          distinct--;
+        }
+      }
+    }
+    return distinct;
   }
   /** Q8: call once per rendered frame from the app rAF. */
   frame(camera) {
@@ -1005,18 +1059,30 @@ class SsogLodController {
       this.optimalLevel[li] = lvl;
       totalOptimal += model.leafLods[(li * L + lvl) * 3 + 2];
     }
+    const bucketOrder = this.bucketOrder;
+    const bucketStart = this.bucketStart;
+    const bucketCursor = this.bucketCursor;
+    bucketStart.fill(0);
+    for (let li = 0; li < NL; li++) {
+      bucketStart[this.bucketOf[li] + 1]++;
+    }
+    for (let b = 0; b < 64; b++) {
+      bucketStart[b + 1] += bucketStart[b];
+      bucketCursor[b] = bucketStart[b];
+    }
+    for (let li = 0; li < NL; li++) {
+      bucketOrder[bucketCursor[this.bucketOf[li]]++] = li;
+    }
     this.balancedLevel.set(this.optimalLevel);
     let totalBalanced = totalOptimal;
     const budget = this.budget;
     if (totalBalanced > budget) {
-      let passes = 0;
-      demote: while (totalBalanced > budget && passes < L) {
-        passes++;
+      let passes2 = 0;
+      demote: while (totalBalanced > budget && passes2 < L) {
+        passes2++;
         for (let b = 63; b >= 0; b--) {
-          for (let li = 0; li < NL; li++) {
-            if (this.bucketOf[li] !== b) {
-              continue;
-            }
+          for (let i = bucketStart[b]; i < bucketStart[b + 1]; i++) {
+            const li = bucketOrder[i];
             const cur = this.balancedLevel[li];
             if (cur >= L - 1) {
               continue;
@@ -1031,35 +1097,110 @@ class SsogLodController {
           }
         }
       }
-    } else {
-      let passes = 0;
-      promote: while (passes < L - 1) {
-        passes++;
-        let promoted = false;
-        for (let b = 0; b < 64; b++) {
-          for (let li = 0; li < NL; li++) {
-            if (this.bucketOf[li] !== b) {
-              continue;
-            }
-            const cur = this.balancedLevel[li];
-            if (cur <= 0) {
-              continue;
-            }
-            const curCount = model.leafLods[(li * L + cur) * 3 + 2];
-            const finer = model.leafLods[(li * L + cur - 1) * 3 + 2];
-            if (totalBalanced - curCount + finer > budget) {
-              break promote;
-            }
-            this.balancedLevel[li] = cur - 1;
-            totalBalanced += finer - curCount;
-            promoted = true;
-          }
+    }
+    const pager = this.splats.pager;
+    const wholeResident = !pager || pager.maxPages >= model.totalBlocks;
+    const pageLimit = wholeResident ? Number.POSITIVE_INFINITY : this.poolGuardLimit() - (model.maxLeafBlockFootprint + pager.numFetchers);
+    const pageRefs = this.pageRefs;
+    pageRefs.fill(0);
+    let distinctPages = 0;
+    for (const c of this.pinnedChunks) {
+      if (pageRefs[c] === 0) {
+        distinctPages++;
+      }
+      pageRefs[c]++;
+    }
+    for (let li = 0; li < NL; li++) {
+      distinctPages = this.bumpLeafPageRefs(
+        li,
+        this.balancedLevel[li],
+        pageRefs,
+        distinctPages,
+        1
+      );
+    }
+    if (distinctPages > pageLimit) {
+      totalBalanced = 0;
+      pageRefs.fill(0);
+      distinctPages = 0;
+      for (const c of this.pinnedChunks) {
+        if (pageRefs[c] === 0) {
+          distinctPages++;
         }
-        if (!promoted) {
-          break;
-        }
+        pageRefs[c]++;
+      }
+      for (let li = 0; li < NL; li++) {
+        this.balancedLevel[li] = L - 1;
+        totalBalanced += model.leafLods[(li * L + L - 1) * 3 + 2];
+        distinctPages = this.bumpLeafPageRefs(
+          li,
+          L - 1,
+          pageRefs,
+          distinctPages,
+          1
+        );
       }
     }
+    let passes = 0;
+    promote: while (passes < L - 1) {
+      passes++;
+      let promoted = false;
+      for (let b = 0; b < 64; b++) {
+        for (let i = bucketStart[b]; i < bucketStart[b + 1]; i++) {
+          const li = bucketOrder[i];
+          const cur = this.balancedLevel[li];
+          if (cur <= 0) {
+            continue;
+          }
+          const curCount = model.leafLods[(li * L + cur) * 3 + 2];
+          const finer = model.leafLods[(li * L + cur - 1) * 3 + 2];
+          if (totalBalanced - curCount + finer > budget) {
+            break promote;
+          }
+          if (pageLimit !== Number.POSITIVE_INFINITY) {
+            distinctPages = this.bumpLeafPageRefs(
+              li,
+              cur - 1,
+              pageRefs,
+              distinctPages,
+              1
+            );
+            distinctPages = this.bumpLeafPageRefs(
+              li,
+              cur,
+              pageRefs,
+              distinctPages,
+              -1
+            );
+            if (distinctPages > pageLimit) {
+              distinctPages = this.bumpLeafPageRefs(
+                li,
+                cur,
+                pageRefs,
+                distinctPages,
+                1
+              );
+              distinctPages = this.bumpLeafPageRefs(
+                li,
+                cur - 1,
+                pageRefs,
+                distinctPages,
+                -1
+              );
+              continue;
+            }
+          }
+          this.balancedLevel[li] = cur - 1;
+          totalBalanced += finer - curCount;
+          promoted = true;
+        }
+      }
+      if (!promoted) {
+        break;
+      }
+    }
+    this.stats.balancedPages = distinctPages;
+    this.stats.pageLimit = wholeResident ? 0 : pageLimit;
     const ratio = totalOptimal / budget;
     if (ratio > 1.4 || ratio < 0.6) {
       const before = this.budgetScale;
