@@ -55,6 +55,14 @@ export interface SsogSplatsOptions {
    * per-tier value.
    */
   poolFactor?: number;
+  /**
+   * [ssog-18] pool page ceiling = the device's texture-array-layer class.
+   * Default 256 (the WebGPU DEFAULT device limit / WebGL2 spec minimum).
+   * The app passes the GRANTED device limit when it requested a higher one
+   * (requiredLimits.maxTextureArrayLayers) — never a wish, always what
+   * renderer.backend.device.limits actually reports.
+   */
+  maxPoolPages?: number;
 }
 
 export class SsogSplats extends PagedSplats {
@@ -98,26 +106,35 @@ export class SsogSplats extends PagedSplats {
     const slackSplats =
       (model.maxLeafBlockFootprint + numFetchers) * SSOG_PAGE_SPLATS;
     const poolFactor = options.poolFactor ?? 1;
-    // [ssog-17] hard ceiling 256: the pool planes are 256×256×maxPages
-    // DataArrayTextures and the app runs DEFAULT device limits
-    // (maxTextureArrayLayers = 256 on WebGPU — WebGpuSplat requests none; the
-    // WebGL2 spec minimum is the same 256). A 257th layer fails createTexture
-    // with a VALIDATION error, not a device loss: pool sampling goes silently
-    // black and no fallback fires. Clamp and warn instead.
-    const MAX_POOL_PAGES = 256;
+    // [ssog-17/18] hard ceiling: the pool planes are 256×256×maxPages
+    // DataArrayTextures, so poolPages may never exceed the device's
+    // maxTextureArrayLayers — one layer over fails createTexture with a
+    // VALIDATION error, not a device loss: pool sampling goes silently
+    // black and no fallback fires. Default 256 (the WebGPU default limit /
+    // WebGL2 spec minimum); [ssog-18] the app passes the GRANTED limit when
+    // it requested more at device creation. Clamp and warn instead of dying.
+    // NaN-proof: `?? 256` does not catch NaN, and a NaN here would cascade
+    // into a NaN-depth texture (silent validation failure, black pool).
+    const rawMaxPoolPages = options.maxPoolPages;
+    const maxPoolPages =
+      typeof rawMaxPoolPages === "number" &&
+      Number.isFinite(rawMaxPoolPages) &&
+      rawMaxPoolPages >= 1
+        ? Math.floor(rawMaxPoolPages)
+        : 256;
     const wantPages = Math.ceil(
       (cutSplats * poolFactor + coarsestSplats + slackSplats) /
         SSOG_PAGE_SPLATS,
     );
-    const poolPages = Math.min(wantPages, model.totalBlocks, MAX_POOL_PAGES);
+    const poolPages = Math.min(wantPages, model.totalBlocks, maxPoolPages);
     if (
-      poolPages === MAX_POOL_PAGES &&
-      wantPages > MAX_POOL_PAGES &&
-      MAX_POOL_PAGES < model.totalBlocks // scene-size clamp binds equally
+      poolPages === maxPoolPages &&
+      wantPages > maxPoolPages &&
+      maxPoolPages < model.totalBlocks // scene-size clamp binds equally
     ) {
       console.warn(
-        `[ssog] poolPages clamped ${wantPages} -> ${MAX_POOL_PAGES}` +
-          " (default maxTextureArrayLayers)",
+        `[ssog] poolPages clamped ${wantPages} -> ${maxPoolPages}` +
+          " (device maxTextureArrayLayers class)",
       );
     }
 
