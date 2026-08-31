@@ -123,6 +123,15 @@ export class SsogLodController {
    */
   private moveGateOverride: number | null = null;
 
+  /**
+   * [ssog-19] scripted-flight fetch hold: while true, tier-3 (desired-cut)
+   * staging is suppressed — residency tiers, flips of already-resident
+   * targets, and the pump keep running. Set by the app for the duration of
+   * a scripted camera flight (POI fly-in/walk/exit); releasing sets
+   * paramsDirty so the arrival pose stages its cut immediately.
+   */
+  private fetchHold = false;
+
   private readonly L: number;
   private readonly NL: number;
 
@@ -416,6 +425,26 @@ export class SsogLodController {
         this.flipReadyLeaves();
       }
     }
+    // [ssog-19] completion-driven fetcher refill: the pager runs
+    // autoDrive:false, so freed slots otherwise idled until the next
+    // 10-frame lodTick while the STANDING fetchPriority still had work
+    // (~half a metronome period per slot on average — a large share of the
+    // measured 73 req/s ceiling). Re-issues from the list the last tick
+    // published; eviction-fed lodTreeUpdates stay bounded by the next
+    // tick's consume (§2.3 pump discards them).
+    // (!converged: at rest the standing priority is never empty, and an
+    // unconditional refill would re-scan + LRU-restamp ~400 entries every
+    // frame forever; converged requires a quiet pager, so nothing new can
+    // become fetchable until a gate un-converges and re-ticks.)
+    const refillPager = this.splats.pager;
+    if (
+      !this.converged &&
+      refillPager &&
+      refillPager.fetchPriority.length > 0 &&
+      refillPager.fetchers.length < refillPager.numFetchers
+    ) {
+      refillPager.driveFetchers();
+    }
     this.frameCounter += 1;
     if (this.frameCounter < this.metronomeFrames) {
       return;
@@ -470,6 +499,22 @@ export class SsogLodController {
         ? units
         : null;
     this.paramsDirty = true;
+  }
+
+  /**
+   * [ssog-19] Hold/release tier-3 fetch staging across a scripted camera
+   * flight (see the fetchHold field). Release forces a tick so the arrival
+   * cut stages without waiting for a motion gate.
+   */
+  setFetchHold(hold: boolean) {
+    const next = hold === true;
+    if (this.fetchHold === next) {
+      return;
+    }
+    this.fetchHold = next;
+    if (!next) {
+      this.paramsDirty = true;
+    }
   }
 
   // ---- gates ---------------------------------------------------------------
@@ -701,6 +746,19 @@ export class SsogLodController {
     const uniformScale = this.cameraLocal(camera);
     this.selectionAndBalance(camera, uniformScale);
 
+    // [ssog-19] inner-loop budgetScale settling: the multi-tick feedback
+    // walk staged a (superseded) full cut per tick and poisoned the
+    // cooldown tier; iterating the SAME recurrence to its fixed point
+    // inside this tick (selection-only passes, ~2-20 ms typical, ≤~100 ms
+    // at the 64-iteration bound) reaches the same resting scale with ONE
+    // staged cut.
+    // Settled poses pay nothing (scaleMoved false). Skipped under
+    // fetchHold — flights re-pose every tick and stage nothing anyway.
+    if (this.scaleMoved && !this.fetchHold) {
+      this.settleBudgetScale(camera, uniformScale);
+      this.selectionAndBalance(camera, uniformScale);
+    }
+
     // ---- swap state machine: desired = the balanced target DIRECTLY
     // (kroscloud.10 — upstream selectDesiredLodIndex semantics: one fetch +
     // one flip per leaf; the old one-step ladder popped every intermediate
@@ -744,8 +802,14 @@ export class SsogLodController {
       pushChunk(chunk, true);
     }
 
-    // tier 3 — desired blocks, nearest-first, headroom-asserted per leaf
-    if (anyPending) {
+    // tier 3 — desired blocks, nearest-first, headroom-asserted per leaf.
+    // [ssog-19] suppressed while a scripted flight holds fetches: every
+    // motion tick re-targets a full budget-sized cut along the flight arc,
+    // and staged fetches are never aborted — one 1 s POI flight swept
+    // ~300-500 MB of never-displayed units (2026-08-31 bandwidth findings).
+    // Tiers 1/2 keep residency (keep-old contract); the arrival tick stages
+    // the destination cut (setFetchHold(false) sets paramsDirty).
+    if (anyPending && !this.fetchHold) {
       const pendingLeaves: number[] = [];
       for (let li = 0; li < this.NL; li++) {
         if (this.desired[li] !== this.displayed[li]) {
@@ -795,12 +859,21 @@ export class SsogLodController {
 
     // tier 4 — cooldown (C4): recently-needed chunks stay warm in priority
     // (lowest tier, no cooldown refresh) while there is room; prune the rest.
+    // [ssog-19 t4res] RESIDENT-only: a chunk that was staged, superseded and
+    // EVICTED must not be re-downloaded just to keep it warm — idle fetchers
+    // were draining ~95-140 MB/session of such re-fetches on fast links
+    // (2026-08-31 bandwidth findings). Resident chunks keep their
+    // eviction-protection listing exactly as before.
     for (const [chunk, t] of this.chunkLastNeeded) {
       if (this.tickCount - t >= this.cooldownTicks) {
         this.chunkLastNeeded.delete(chunk);
         continue;
       }
-      if (priority.length < maxPages) {
+      if (
+        priority.length < maxPages &&
+        pager &&
+        pager.getSplatsChunk(this.splats, chunk)
+      ) {
         pushChunk(chunk, false);
       }
     }
@@ -853,7 +926,10 @@ export class SsogLodController {
     // [B4] heldPending blocks the pool-settled leg only — held flips are a
     // bounded state the quantized release resolves, but a latched converged
     // stops the metronome and would strand them.
+    // [ssog-19] a fetch-held tick must never latch converged — tier-3 was
+    // suppressed, so "no progress with a quiet pager" is not a settled state.
     this.converged =
+      !this.fetchHold &&
       (allAtTarget ||
         (this.ticksNoProgress >= 3 && pagerQuiet && !this.heldPending)) &&
       !this.scaleMoved;
@@ -862,6 +938,97 @@ export class SsogLodController {
     this.stats.budgetScale = this.budgetScale;
     this.stats.composedSplats = this.composedSplats;
     this.stats.lastTickMs = performance.now() - t0;
+  }
+
+  // ---- [ssog-19] inner-loop budgetScale settling ---------------------------
+
+  /**
+   * Pure selection-only totalOptimal at a hypothetical budgetScale — the
+   * same per-leaf math as selectionAndBalance's selection loop, writing
+   * nothing. Uses tmpPos/tmpFwd prepared by the caller's cameraLocal().
+   */
+  private totalOptimalAt(
+    camera: THREE.PerspectiveCamera,
+    uniformScale: number,
+    scale: number,
+  ): number {
+    const model = this.splats.model;
+    const L = this.L;
+    const NL = this.NL;
+    const bounds = model.boundsFlat;
+    const cam = this.tmpPos;
+    const fwd = this.tmpFwd;
+
+    const tanHalfV = Math.tan(((camera.fov / 2) * Math.PI) / 180);
+    const tanHalfH = tanHalfV * camera.aspect;
+    const fovScale =
+      Math.min(tanHalfV, tanHalfH) / Math.tan((22.5 * Math.PI) / 180);
+
+    const d0 = this.lodBaseDistance * scale;
+    const mPrime = Math.max(1.2, 3 * scale ** -0.2);
+    const logM = Math.log(mPrime);
+
+    let totalOptimal = 0;
+    for (let li = 0; li < NL; li++) {
+      const o = li * 6;
+      const px = Math.max(bounds[o], Math.min(cam.x, bounds[o + 3]));
+      const py = Math.max(bounds[o + 1], Math.min(cam.y, bounds[o + 4]));
+      const pz = Math.max(bounds[o + 2], Math.min(cam.z, bounds[o + 5]));
+      let dx = px - cam.x;
+      let dy = py - cam.y;
+      let dz = pz - cam.z;
+      const d = Math.hypot(dx, dy, dz);
+      let penalty = 1;
+      if (d > 1e-9) {
+        dx /= d;
+        dy /= d;
+        dz /= d;
+        const dot = fwd.x * dx + fwd.y * dy + fwd.z * dz;
+        penalty = 1 + 4 * Math.max(0, -dot);
+      }
+      const db = d * penalty * fovScale * uniformScale;
+      let lvl = db <= d0 ? 0 : 1 + Math.floor(Math.log(db / d0) / logM);
+      if (lvl < 0) {
+        lvl = 0;
+      }
+      if (lvl >= L) {
+        lvl = L - 1;
+      }
+      totalOptimal += model.leafLods[(li * L + lvl) * 3 + 2];
+    }
+    return totalOptimal;
+  }
+
+  /**
+   * Iterate the EXACT budgetScale feedback recurrence (verbatim constants —
+   * ·= 1 + (1/√ratio − 1)·0.3, clamp [0.01, 100], dead zone [0.6, 1.4]) to
+   * its fixed point for the current pose. Same resting scale the multi-tick
+   * walk reached, without staging a cut per intermediate step. Bounded at
+   * 64 iterations (the 1→100 clamp walk is ~26; worst-case cost ≈ 100 ms
+   * at 26K leaves, typical settles 2–20 ms); an unfinished walk simply
+   * resumes the old per-tick behavior.
+   */
+  private settleBudgetScale(
+    camera: THREE.PerspectiveCamera,
+    uniformScale: number,
+  ) {
+    let scale = this.budgetScale;
+    for (let i = 0; i < 64; i++) {
+      const totalOptimal = this.totalOptimalAt(camera, uniformScale, scale);
+      const ratio = totalOptimal / this.budget;
+      if (ratio <= 1.4 && ratio >= 0.6) {
+        break; // dead zone — settled
+      }
+      const next = Math.max(
+        0.01,
+        Math.min(100, scale * (1 + (1 / Math.sqrt(ratio) - 1) * 0.3)),
+      );
+      if (next === scale) {
+        break; // clamp-stuck
+      }
+      scale = next;
+    }
+    this.budgetScale = scale;
   }
 
   // ---- §2.4 selection + balancer + budgetScale (P0d structural port) -------

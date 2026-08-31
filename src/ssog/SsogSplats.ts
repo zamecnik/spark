@@ -24,6 +24,7 @@ import {
   SplatPager,
   defines,
   isMobile,
+  workerPool,
 } from "@sparkjsdev/spark";
 import type { SplatEncoding } from "../defines";
 import type { SsogModel } from "./SsogModel";
@@ -146,6 +147,14 @@ export class SsogSplats extends PagedSplats {
       autoDrive: false, // the controller owns the §2.3 pump contract
       numFetchers,
     });
+
+    // [ssog-19] decode pool keeps pace with the fetchers: a fetcher slot is
+    // held through the worker decode (SplatPager's fetcher promise wraps
+    // fetchDecodeChunk end-to-end), so with the default 4-worker pool any
+    // fetcher beyond 4 would queue on decode instead of downloading.
+    if (numFetchers > workerPool.maxWorkers) {
+      workerPool.maxWorkers = numFetchers;
+    }
 
     super({ pager, fileType: SplatFileType.SSOG, maxSh });
 
