@@ -441,6 +441,9 @@ class SsogSplats extends spark.PagedSplats {
       // the controller owns the §2.3 pump contract
       numFetchers
     });
+    if (numFetchers > spark.workerPool.maxWorkers) {
+      spark.workerPool.maxWorkers = numFetchers;
+    }
     super({ pager, fileType: spark.SplatFileType.SSOG, maxSh });
     this.externalLod = true;
     this.numShResolved = false;
@@ -518,6 +521,7 @@ class SsogLodController {
     this.paramsDirty = false;
     this.budgetScale = 1;
     this.moveGateOverride = null;
+    this.fetchHold = false;
     this.phase = "reveal";
     this.detached = false;
     this.heldPending = false;
@@ -673,6 +677,10 @@ class SsogLodController {
         this.flipReadyLeaves();
       }
     }
+    const refillPager = this.splats.pager;
+    if (!this.converged && refillPager && refillPager.fetchPriority.length > 0 && refillPager.fetchers.length < refillPager.numFetchers) {
+      refillPager.driveFetchers();
+    }
     this.frameCounter += 1;
     if (this.frameCounter < this.metronomeFrames) {
       return;
@@ -718,6 +726,21 @@ class SsogLodController {
   setMoveGate(units) {
     this.moveGateOverride = typeof units === "number" && Number.isFinite(units) && units > 0 ? units : null;
     this.paramsDirty = true;
+  }
+  /**
+   * [ssog-19] Hold/release tier-3 fetch staging across a scripted camera
+   * flight (see the fetchHold field). Release forces a tick so the arrival
+   * cut stages without waiting for a motion gate.
+   */
+  setFetchHold(hold) {
+    const next = hold === true;
+    if (this.fetchHold === next) {
+      return;
+    }
+    this.fetchHold = next;
+    if (!next) {
+      this.paramsDirty = true;
+    }
   }
   // ---- gates ---------------------------------------------------------------
   gatesPass(camera) {
@@ -889,6 +912,10 @@ class SsogLodController {
     this.tickCount += 1;
     const uniformScale = this.cameraLocal(camera);
     this.selectionAndBalance(camera, uniformScale);
+    if (this.scaleMoved && !this.fetchHold) {
+      this.settleBudgetScale(camera, uniformScale);
+      this.selectionAndBalance(camera, uniformScale);
+    }
     let anyPending = false;
     for (let li = 0; li < this.NL; li++) {
       const target = this.balancedLevel[li];
@@ -917,7 +944,7 @@ class SsogLodController {
     for (const chunk of this.chunkRefs.keys()) {
       pushChunk(chunk, true);
     }
-    if (anyPending) {
+    if (anyPending && !this.fetchHold) {
       const pendingLeaves = [];
       for (let li = 0; li < this.NL; li++) {
         if (this.desired[li] !== this.displayed[li]) {
@@ -960,7 +987,7 @@ class SsogLodController {
         this.chunkLastNeeded.delete(chunk);
         continue;
       }
-      if (priority.length < maxPages) {
+      if (priority.length < maxPages && pager && pager.getSplatsChunk(this.splats, chunk)) {
         pushChunk(chunk, false);
       }
     }
@@ -992,11 +1019,88 @@ class SsogLodController {
       this.ticksNoProgress += 1;
     }
     const pagerQuiet = !pager || pager.fetchers.length === 0 && pager.newUploads.length === 0 && pager.readyUploads.length === 0;
-    this.converged = (allAtTarget || this.ticksNoProgress >= 3 && pagerQuiet && !this.heldPending) && !this.scaleMoved;
+    this.converged = !this.fetchHold && (allAtTarget || this.ticksNoProgress >= 3 && pagerQuiet && !this.heldPending) && !this.scaleMoved;
     this.stats.ticks = this.tickCount;
     this.stats.budgetScale = this.budgetScale;
     this.stats.composedSplats = this.composedSplats;
     this.stats.lastTickMs = performance.now() - t0;
+  }
+  // ---- [ssog-19] inner-loop budgetScale settling ---------------------------
+  /**
+   * Pure selection-only totalOptimal at a hypothetical budgetScale — the
+   * same per-leaf math as selectionAndBalance's selection loop, writing
+   * nothing. Uses tmpPos/tmpFwd prepared by the caller's cameraLocal().
+   */
+  totalOptimalAt(camera, uniformScale, scale) {
+    const model = this.splats.model;
+    const L = this.L;
+    const NL = this.NL;
+    const bounds = model.boundsFlat;
+    const cam = this.tmpPos;
+    const fwd = this.tmpFwd;
+    const tanHalfV = Math.tan(camera.fov / 2 * Math.PI / 180);
+    const tanHalfH = tanHalfV * camera.aspect;
+    const fovScale = Math.min(tanHalfV, tanHalfH) / Math.tan(22.5 * Math.PI / 180);
+    const d0 = this.lodBaseDistance * scale;
+    const mPrime = Math.max(1.2, 3 * scale ** -0.2);
+    const logM = Math.log(mPrime);
+    let totalOptimal = 0;
+    for (let li = 0; li < NL; li++) {
+      const o = li * 6;
+      const px = Math.max(bounds[o], Math.min(cam.x, bounds[o + 3]));
+      const py = Math.max(bounds[o + 1], Math.min(cam.y, bounds[o + 4]));
+      const pz = Math.max(bounds[o + 2], Math.min(cam.z, bounds[o + 5]));
+      let dx = px - cam.x;
+      let dy = py - cam.y;
+      let dz = pz - cam.z;
+      const d = Math.hypot(dx, dy, dz);
+      let penalty = 1;
+      if (d > 1e-9) {
+        dx /= d;
+        dy /= d;
+        dz /= d;
+        const dot = fwd.x * dx + fwd.y * dy + fwd.z * dz;
+        penalty = 1 + 4 * Math.max(0, -dot);
+      }
+      const db = d * penalty * fovScale * uniformScale;
+      let lvl = db <= d0 ? 0 : 1 + Math.floor(Math.log(db / d0) / logM);
+      if (lvl < 0) {
+        lvl = 0;
+      }
+      if (lvl >= L) {
+        lvl = L - 1;
+      }
+      totalOptimal += model.leafLods[(li * L + lvl) * 3 + 2];
+    }
+    return totalOptimal;
+  }
+  /**
+   * Iterate the EXACT budgetScale feedback recurrence (verbatim constants —
+   * ·= 1 + (1/√ratio − 1)·0.3, clamp [0.01, 100], dead zone [0.6, 1.4]) to
+   * its fixed point for the current pose. Same resting scale the multi-tick
+   * walk reached, without staging a cut per intermediate step. Bounded at
+   * 64 iterations (the 1→100 clamp walk is ~26; worst-case cost ≈ 100 ms
+   * at 26K leaves, typical settles 2–20 ms); an unfinished walk simply
+   * resumes the old per-tick behavior.
+   */
+  settleBudgetScale(camera, uniformScale) {
+    let scale = this.budgetScale;
+    for (let i = 0; i < 64; i++) {
+      const totalOptimal = this.totalOptimalAt(camera, uniformScale, scale);
+      const ratio = totalOptimal / this.budget;
+      if (ratio <= 1.4 && ratio >= 0.6) {
+        break;
+      }
+      const next = Math.max(
+        0.01,
+        Math.min(100, scale * (1 + (1 / Math.sqrt(ratio) - 1) * 0.3))
+      );
+      if (next === scale) {
+        break;
+      }
+      scale = next;
+    }
+    this.budgetScale = scale;
   }
   // ---- §2.4 selection + balancer + budgetScale (P0d structural port) -------
   selectionAndBalance(camera, uniformScale) {

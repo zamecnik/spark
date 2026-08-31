@@ -58,6 +58,14 @@ export declare class SsogLodController {
      * can never cross the default gate, so a converged cut would freeze there.
      */
     private moveGateOverride;
+    /**
+     * [ssog-19] scripted-flight fetch hold: while true, tier-3 (desired-cut)
+     * staging is suppressed — residency tiers, flips of already-resident
+     * targets, and the pump keep running. Set by the app for the duration of
+     * a scripted camera flight (POI fly-in/walk/exit); releasing sets
+     * paramsDirty so the arrival pose stages its cut immediately.
+     */
+    private fetchHold;
     private readonly L;
     private readonly NL;
     private phase;
@@ -229,6 +237,12 @@ export declare class SsogLodController {
      * at the current pose.
      */
     setMoveGate(units: number | null): void;
+    /**
+     * [ssog-19] Hold/release tier-3 fetch staging across a scripted camera
+     * flight (see the fetchHold field). Release forces a tick so the arrival
+     * cut stages without waiting for a motion gate.
+     */
+    setFetchHold(hold: boolean): void;
     private gatesPass;
     /** camera pose in mesh-local space → tmpPos/tmpFwd/tmpQuat + uniformScale */
     private cameraLocal;
@@ -245,6 +259,22 @@ export declare class SsogLodController {
     private forEachLeafChunk;
     private revealTick;
     private lodTick;
+    /**
+     * Pure selection-only totalOptimal at a hypothetical budgetScale — the
+     * same per-leaf math as selectionAndBalance's selection loop, writing
+     * nothing. Uses tmpPos/tmpFwd prepared by the caller's cameraLocal().
+     */
+    private totalOptimalAt;
+    /**
+     * Iterate the EXACT budgetScale feedback recurrence (verbatim constants —
+     * ·= 1 + (1/√ratio − 1)·0.3, clamp [0.01, 100], dead zone [0.6, 1.4]) to
+     * its fixed point for the current pose. Same resting scale the multi-tick
+     * walk reached, without staging a cut per intermediate step. Bounded at
+     * 64 iterations (the 1→100 clamp walk is ~26; worst-case cost ≈ 100 ms
+     * at 26K leaves, typical settles 2–20 ms); an unfinished walk simply
+     * resumes the old per-tick behavior.
+     */
+    private settleBudgetScale;
     private selectionAndBalance;
     private flipReadyLeaves;
     /**
