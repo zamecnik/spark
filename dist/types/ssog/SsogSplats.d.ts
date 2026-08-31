@@ -23,6 +23,14 @@ export interface SsogSplatsOptions {
      * per-tier value.
      */
     poolFactor?: number;
+    /**
+     * [ssog-18] pool page ceiling = the device's texture-array-layer class.
+     * Default 256 (the WebGPU DEFAULT device limit / WebGL2 spec minimum).
+     * The app passes the GRANTED device limit when it requested a higher one
+     * (requiredLimits.maxTextureArrayLayers) — never a wish, always what
+     * renderer.backend.device.limits actually reports.
+     */
+    maxPoolPages?: number;
 }
 export declare class SsogSplats extends PagedSplats {
     readonly externalLod: boolean;

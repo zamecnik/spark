@@ -421,14 +421,15 @@ class SsogSplats extends spark.PagedSplats {
     const cutSplats = Math.min(budget * 1.15, maxCut);
     const slackSplats = (model.maxLeafBlockFootprint + numFetchers) * SSOG_PAGE_SPLATS;
     const poolFactor = options.poolFactor ?? 1;
-    const MAX_POOL_PAGES = 256;
+    const rawMaxPoolPages = options.maxPoolPages;
+    const maxPoolPages = typeof rawMaxPoolPages === "number" && Number.isFinite(rawMaxPoolPages) && rawMaxPoolPages >= 1 ? Math.floor(rawMaxPoolPages) : 256;
     const wantPages = Math.ceil(
       (cutSplats * poolFactor + coarsestSplats + slackSplats) / SSOG_PAGE_SPLATS
     );
-    const poolPages = Math.min(wantPages, model.totalBlocks, MAX_POOL_PAGES);
-    if (poolPages === MAX_POOL_PAGES && wantPages > MAX_POOL_PAGES && MAX_POOL_PAGES < model.totalBlocks) {
+    const poolPages = Math.min(wantPages, model.totalBlocks, maxPoolPages);
+    if (poolPages === maxPoolPages && wantPages > maxPoolPages && maxPoolPages < model.totalBlocks) {
       console.warn(
-        `[ssog] poolPages clamped ${wantPages} -> ${MAX_POOL_PAGES} (default maxTextureArrayLayers)`
+        `[ssog] poolPages clamped ${wantPages} -> ${maxPoolPages} (device maxTextureArrayLayers class)`
       );
     }
     const pager = new spark.SplatPager({
