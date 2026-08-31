@@ -62,7 +62,11 @@ export interface SsogLodControllerOptions {
   sparkRenderer: SparkRenderer;
   /** splat budget; defaults to splats.budget */
   budget?: number;
-  /** builder --lod-chunk-extent (default 16) — feeds d0 = (5/16)·extent (C3) */
+  /**
+   * builder --lod-chunk-extent — feeds d0 = (5/16)·extent (C3). Default:
+   * the model's [ssog-16] lod-meta stamp when present, else 16 (the
+   * splat-transform CLI default).
+   */
   chunkExtent?: number;
   /** direct override of lodBaseDistance (the ?ssogbands tuning hook) */
   lodBaseDistance?: number;
@@ -262,7 +266,12 @@ export class SsogLodController {
     this.sparkRenderer = options.sparkRenderer;
     this.budget = options.budget ?? this.splats.budget;
 
-    const chunkExtent = options.chunkExtent ?? 16;
+    // [ssog-16] option > lod-meta stamp > CLI default: a runtime that
+    // assumes extent 16 against a 4 m tree runs d0 and the moved gate 4×
+    // off (budgetScale self-corrects d0 but parks ~4× low; the gate never
+    // scales — 2026-08-31 budget-underfill findings).
+    const chunkExtent =
+      options.chunkExtent ?? this.splats.model.chunkExtent ?? 16;
     this.lodBaseDistance =
       options.lodBaseDistance ?? (5 / 16) * chunkExtent; // C3
     this.moveGateFactor = options.moveGateFactor ?? 0.2;

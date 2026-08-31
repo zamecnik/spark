@@ -36,6 +36,13 @@ export interface SsogLodMeta {
   lodLevels: number;
   filenames: string[];
   environment?: unknown;
+  /**
+   * [ssog-16] builder --lod-chunk-extent stamp (world units; Viewme pipeline
+   * ≥2026-08-31). splat-transform itself never writes it — the build
+   * pipeline injects it so the runtime can calibrate d0/move-gate to the
+   * ACTUAL tree instead of the CLI default (16).
+   */
+  chunkExtent?: number;
   tree: SsogLodMetaNode & { bound: SsogLodMetaBound };
 }
 
@@ -46,6 +53,8 @@ export class SsogModel {
   readonly filenames: string[];
   /** parsed-and-deferred (plan §2.3) — v1 never renders the environment */
   readonly hasEnvironment: boolean;
+  /** [ssog-16] builder chunk extent from the meta stamp; null on old bundles */
+  readonly chunkExtent: number | null;
 
   readonly numLeaves: number;
   /** [leaf*6 .. leaf*6+5] = minX,minY,minZ,maxX,maxY,maxZ */
@@ -94,6 +103,13 @@ export class SsogModel {
       throw new Error("bad tree");
     }
     this.hasEnvironment = meta.environment !== undefined;
+    // [ssog-16] optional pipeline stamp — see SsogLodMeta.chunkExtent
+    this.chunkExtent =
+      typeof meta.chunkExtent === "number" &&
+      Number.isFinite(meta.chunkExtent) &&
+      meta.chunkExtent > 0
+        ? meta.chunkExtent
+        : null;
 
     const L = meta.lodLevels;
     const numUnits = meta.filenames.length;
