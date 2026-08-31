@@ -2,14 +2,17 @@
 //
 // SsogLodController — the supersplat-equivalent runtime (plan §2.4, constants
 // pinned; structural port of the P0d-proven balancer bench
-// poc/ssog-p0/p0d-balancer.mjs where they overlap):
+// poc/ssog-p0/p0d-balancer.mjs where they overlap — since [ssog-14] the bench
+// DIVERGES on the promote leg: it still carries the never-past-optimal guard):
 //   - FOV-compensated distance-band selection with the ×1→×5 behind-camera
 //     penalty; d0 = lodBaseDistance·budgetScale with lodBaseDistance =
 //     (5/16)·chunkExtent (C3); m′ = max(1.2, 3·budgetScale^−0.2);
 //   - 64-√bucket balancer: farthest-first demote one level per leaf per pass
-//     with early-exit, nearest-first promote with fit-check-before-apply and
-//     stop-don't-skip (C9); d_bucket includes penalty AND fovScale AND
-//     uniformScale (the pinned definition);
+//     with early-exit, nearest-first promote-to-fill with fit-check-before-
+//     apply and stop-don't-skip (C9; [ssog-14] the promote leg fills the
+//     budget PAST optimal — budget is a soft target, not just a ceiling);
+//     d_bucket includes penalty AND fovScale AND uniformScale (the pinned
+//     definition);
 //   - budgetScale feedback: ±40% dead zone, ·= 1 + (1/√ratio − 1)·0.3,
 //     clamp [0.01, 100];
 //   - 10-frame free-running metronome, latched, with motion gates (moved >
@@ -847,22 +850,48 @@ export class SsogLodController {
         // capacity policy absorbs it
       }
     } else {
-      promote: for (let b = 0; b < 64; b++) {
-        for (let li = 0; li < NL; li++) {
-          if (this.bucketOf[li] !== b) {
-            continue;
+      // [ssog-14] promote-to-fill (kroscloud.26 — 2026-08-31 budget-underfill
+      // findings; supersplat GSplatBudgetBalancer parity): the budget is a
+      // soft TARGET, not just a ceiling. balancedLevel starts AT optimalLevel
+      // (line above), so the previous `cur <= optimalLevel` guard made this
+      // leg dead code — under budget the cut simply WAS totalOptimal, and any
+      // in-dead-zone selection (0.6–1.4× budget) rested there permanently
+      // (observed live: 2.89M/4M on a 19.9M-splat scene, blurred FPV near
+      // field with 1.1M splats of unused headroom). Now: walk nearest-first
+      // (bucket 0→63) and promote one level per leaf per pass — PAST optimal,
+      // down to L0 — while the result still fits. Fit-check-before-apply +
+      // stop-don't-skip (C9) are kept per pass; ≤ L−1 passes total (a leaf
+      // can climb at most L−1 levels), and an all-skip pass ends the walk.
+      // Deterministic at a fixed pose, so allAtTarget convergence latches
+      // exactly as before. budgetScale feedback stays driven by totalOptimal
+      // (pre-fill, below) — the fill never destabilizes the dead-zone walk.
+      // Aliased promotes (resolved missing levels sharing rows) may add 0
+      // splats — same accepted class as the aliased-demote note above.
+      let passes = 0;
+      promote: while (passes < L - 1) {
+        passes++;
+        let promoted = false;
+        for (let b = 0; b < 64; b++) {
+          for (let li = 0; li < NL; li++) {
+            if (this.bucketOf[li] !== b) {
+              continue;
+            }
+            const cur = this.balancedLevel[li];
+            if (cur <= 0) {
+              continue; // already finest
+            }
+            const curCount = model.leafLods[(li * L + cur) * 3 + 2];
+            const finer = model.leafLods[(li * L + cur - 1) * 3 + 2];
+            if (totalBalanced - curCount + finer > budget) {
+              break promote; // stop, don't skip
+            }
+            this.balancedLevel[li] = cur - 1;
+            totalBalanced += finer - curCount;
+            promoted = true;
           }
-          const cur = this.balancedLevel[li];
-          if (cur <= this.optimalLevel[li]) {
-            continue; // never promote past optimal
-          }
-          const curCount = model.leafLods[(li * L + cur) * 3 + 2];
-          const finer = model.leafLods[(li * L + cur - 1) * 3 + 2];
-          if (totalBalanced - curCount + finer > budget) {
-            break promote; // stop, don't skip
-          }
-          this.balancedLevel[li] = cur - 1;
-          totalBalanced += finer - curCount;
+        }
+        if (!promoted) {
+          break;
         }
       }
     }
