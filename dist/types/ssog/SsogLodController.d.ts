@@ -7,7 +7,11 @@ export interface SsogLodControllerOptions {
     sparkRenderer: SparkRenderer;
     /** splat budget; defaults to splats.budget */
     budget?: number;
-    /** builder --lod-chunk-extent (default 16) — feeds d0 = (5/16)·extent (C3) */
+    /**
+     * builder --lod-chunk-extent — feeds d0 = (5/16)·extent (C3). Default:
+     * the model's [ssog-16] lod-meta stamp when present, else 16 (the
+     * splat-transform CLI default).
+     */
     chunkExtent?: number;
     /** direct override of lodBaseDistance (the ?ssogbands tuning hook) */
     lodBaseDistance?: number;
@@ -47,6 +51,13 @@ export declare class SsogLodController {
     /** set true after any external param change to force a tick */
     paramsDirty: boolean;
     budgetScale: number;
+    /**
+     * [ssog-15] moved-gate override in MESH-LOCAL units (null = default
+     * moveGateFactor·lodBaseDistance). Set while the app pins the camera to a
+     * viewpoint-POI sphere: the FPV eye excursion (≤ 2·fpvRadius ≈ 0.1 units)
+     * can never cross the default gate, so a converged cut would freeze there.
+     */
+    private moveGateOverride;
     private readonly L;
     private readonly NL;
     private phase;
@@ -179,6 +190,21 @@ export declare class SsogLodController {
     /** Detach-only stop (pano roundtrip): state stays warm for reattach. */
     detach(): void;
     attach(): void;
+    /**
+     * [ssog-15] Force a re-selection tick at the next metronome beat — the
+     * attach() liveness semantic without a detach round-trip. Call sites:
+     * viewpoint-POI arrival and FPV drag-rest (2026-08-31 teleport-blur
+     * findings: after a flight the converged latch + motion gates could
+     * permanently freeze a coarse cut at a pose the gates cannot re-open from).
+     */
+    invalidate(): void;
+    /**
+     * [ssog-15] Override the moved-gate distance (mesh-local units; null or
+     * non-positive restores the default moveGateFactor·lodBaseDistance).
+     * Counts as a param change — forces a tick so the new gate takes effect
+     * at the current pose.
+     */
+    setMoveGate(units: number | null): void;
     private gatesPass;
     /** camera pose in mesh-local space → tmpPos/tmpFwd/tmpQuat + uniformScale */
     private cameraLocal;

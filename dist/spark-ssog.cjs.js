@@ -38,6 +38,7 @@ class SsogModel {
       throw new Error("bad tree");
     }
     this.hasEnvironment = meta.environment !== void 0;
+    this.chunkExtent = typeof meta.chunkExtent === "number" && Number.isFinite(meta.chunkExtent) && meta.chunkExtent > 0 ? meta.chunkExtent : null;
     const L = meta.lodLevels;
     const numUnits = meta.filenames.length;
     const unitCountsPerLevel = new Array(L).fill(0);
@@ -511,6 +512,7 @@ class SsogLodController {
   constructor(options) {
     this.paramsDirty = false;
     this.budgetScale = 1;
+    this.moveGateOverride = null;
     this.phase = "reveal";
     this.detached = false;
     this.heldPending = false;
@@ -568,7 +570,7 @@ class SsogLodController {
     this.splats = options.splats;
     this.sparkRenderer = options.sparkRenderer;
     this.budget = options.budget ?? this.splats.budget;
-    const chunkExtent = options.chunkExtent ?? 16;
+    const chunkExtent = options.chunkExtent ?? this.splats.model.chunkExtent ?? 16;
     this.lodBaseDistance = options.lodBaseDistance ?? 5 / 16 * chunkExtent;
     this.moveGateFactor = options.moveGateFactor ?? 0.2;
     this.metronomeFrames = options.metronomeFrames ?? 10;
@@ -642,6 +644,26 @@ class SsogLodController {
     this.detached = false;
     this.paramsDirty = true;
   }
+  /**
+   * [ssog-15] Force a re-selection tick at the next metronome beat — the
+   * attach() liveness semantic without a detach round-trip. Call sites:
+   * viewpoint-POI arrival and FPV drag-rest (2026-08-31 teleport-blur
+   * findings: after a flight the converged latch + motion gates could
+   * permanently freeze a coarse cut at a pose the gates cannot re-open from).
+   */
+  invalidate() {
+    this.paramsDirty = true;
+  }
+  /**
+   * [ssog-15] Override the moved-gate distance (mesh-local units; null or
+   * non-positive restores the default moveGateFactor·lodBaseDistance).
+   * Counts as a param change — forces a tick so the new gate takes effect
+   * at the current pose.
+   */
+  setMoveGate(units) {
+    this.moveGateOverride = typeof units === "number" && Number.isFinite(units) && units > 0 ? units : null;
+    this.paramsDirty = true;
+  }
   // ---- gates ---------------------------------------------------------------
   gatesPass(camera) {
     if (this.paramsDirty || !this.converged) {
@@ -655,7 +677,8 @@ class SsogLodController {
       return true;
     }
     this.cameraLocal(camera);
-    if (this.tmpPos.distanceTo(this.lastPose.pos) > this.moveGateFactor * this.lodBaseDistance) {
+    const moveGate = this.moveGateOverride ?? this.moveGateFactor * this.lodBaseDistance;
+    if (this.tmpPos.distanceTo(this.lastPose.pos) > moveGate) {
       return true;
     }
     if (Math.abs(this.tmpQuat.dot(this.lastPose.quat)) < Math.SQRT1_2) {
@@ -1009,22 +1032,31 @@ class SsogLodController {
         }
       }
     } else {
-      promote: for (let b = 0; b < 64; b++) {
-        for (let li = 0; li < NL; li++) {
-          if (this.bucketOf[li] !== b) {
-            continue;
+      let passes = 0;
+      promote: while (passes < L - 1) {
+        passes++;
+        let promoted = false;
+        for (let b = 0; b < 64; b++) {
+          for (let li = 0; li < NL; li++) {
+            if (this.bucketOf[li] !== b) {
+              continue;
+            }
+            const cur = this.balancedLevel[li];
+            if (cur <= 0) {
+              continue;
+            }
+            const curCount = model.leafLods[(li * L + cur) * 3 + 2];
+            const finer = model.leafLods[(li * L + cur - 1) * 3 + 2];
+            if (totalBalanced - curCount + finer > budget) {
+              break promote;
+            }
+            this.balancedLevel[li] = cur - 1;
+            totalBalanced += finer - curCount;
+            promoted = true;
           }
-          const cur = this.balancedLevel[li];
-          if (cur <= this.optimalLevel[li]) {
-            continue;
-          }
-          const curCount = model.leafLods[(li * L + cur) * 3 + 2];
-          const finer = model.leafLods[(li * L + cur - 1) * 3 + 2];
-          if (totalBalanced - curCount + finer > budget) {
-            break promote;
-          }
-          this.balancedLevel[li] = cur - 1;
-          totalBalanced += finer - curCount;
+        }
+        if (!promoted) {
+          break;
         }
       }
     }
