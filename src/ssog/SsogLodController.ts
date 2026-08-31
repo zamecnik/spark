@@ -111,6 +111,14 @@ export class SsogLodController {
 
   budgetScale = 1;
 
+  /**
+   * [ssog-15] moved-gate override in MESH-LOCAL units (null = default
+   * moveGateFactor·lodBaseDistance). Set while the app pins the camera to a
+   * viewpoint-POI sphere: the FPV eye excursion (≤ 2·fpvRadius ≈ 0.1 units)
+   * can never cross the default gate, so a converged cut would freeze there.
+   */
+  private moveGateOverride: number | null = null;
+
   private readonly L: number;
   private readonly NL: number;
 
@@ -351,6 +359,31 @@ export class SsogLodController {
     this.paramsDirty = true;
   }
 
+  /**
+   * [ssog-15] Force a re-selection tick at the next metronome beat — the
+   * attach() liveness semantic without a detach round-trip. Call sites:
+   * viewpoint-POI arrival and FPV drag-rest (2026-08-31 teleport-blur
+   * findings: after a flight the converged latch + motion gates could
+   * permanently freeze a coarse cut at a pose the gates cannot re-open from).
+   */
+  invalidate() {
+    this.paramsDirty = true;
+  }
+
+  /**
+   * [ssog-15] Override the moved-gate distance (mesh-local units; null or
+   * non-positive restores the default moveGateFactor·lodBaseDistance).
+   * Counts as a param change — forces a tick so the new gate takes effect
+   * at the current pose.
+   */
+  setMoveGate(units: number | null) {
+    this.moveGateOverride =
+      typeof units === "number" && Number.isFinite(units) && units > 0
+        ? units
+        : null;
+    this.paramsDirty = true;
+  }
+
   // ---- gates ---------------------------------------------------------------
 
   private gatesPass(camera: THREE.PerspectiveCamera): boolean {
@@ -371,10 +404,9 @@ export class SsogLodController {
       return true;
     }
     this.cameraLocal(camera);
-    if (
-      this.tmpPos.distanceTo(this.lastPose.pos) >
-      this.moveGateFactor * this.lodBaseDistance
-    ) {
+    const moveGate =
+      this.moveGateOverride ?? this.moveGateFactor * this.lodBaseDistance;
+    if (this.tmpPos.distanceTo(this.lastPose.pos) > moveGate) {
       return true; // moved
     }
     // rotation angle > 90° ⇔ |quat dot| < cos(45°)
