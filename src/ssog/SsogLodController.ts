@@ -204,6 +204,21 @@ export class SsogLodController {
   private readonly pinnedChunks: number[];
 
   /**
+   * [ssog-17] per-tick scratch: final-cut page refcounts (balanced ∪ pinned)
+   * for the page-aware balancer — allocated once, length totalBlocks.
+   */
+  private readonly pageRefs: Int32Array;
+
+  /**
+   * [ssog-17 perf] per-tick scratch for the bucket-ordered leaf index
+   * (counting sort, stable in li): the balancer passes visit leaves in
+   * (bucket, li) order — the former 64×NL rescans dominated tick cost.
+   */
+  private readonly bucketOrder: Int32Array;
+  private readonly bucketStart: Int32Array;
+  private readonly bucketCursor: Int32Array;
+
+  /**
    * Chunks in THIS tick's fetchPriority (tiers 1–4). Flip eligibility
    * requires every desired chunk ∈ this set: a chunk that is resident but
    * NOT in the current priority is in driveFetchers' freeable set and can be
@@ -241,6 +256,10 @@ export class SsogLodController {
     headroomViolations: 0,
     capacityDeferrals: 0,
     poolDeferrals: 0,
+    /** [ssog-17] distinct pages of the balanced∪pinned final cut */
+    balancedPages: 0,
+    /** [ssog-17] page budget the balancer enforced (0 = not enforced) */
+    pageLimit: 0,
     /** [B4] wave-gather hold observations (per flip-scan pass, not unique) */
     batchHolds: 0,
     displayedChunkCount: 0,
@@ -313,6 +332,66 @@ export class SsogLodController {
     }
     this.pinnedChunks = pinned;
     this.stats.revealTotalBlocks = pinned.length;
+
+    // [ssog-17] page-aware balancer scratch + sanity: the page budget must
+    // at least cover the pinned tier plus the transition margin, or the
+    // balancer parks everything at coarsest (pool sized far too small).
+    this.pageRefs = new Int32Array(model.totalBlocks);
+    this.bucketOrder = new Int32Array(this.NL);
+    this.bucketStart = new Int32Array(65);
+    this.bucketCursor = new Int32Array(64);
+    const pager = this.splats.pager;
+    if (pager && pager.maxPages < model.totalBlocks) {
+      const margin = model.maxLeafBlockFootprint + pager.numFetchers;
+      const guard = this.poolGuardLimit();
+      if (pinned.length + margin > guard) {
+        console.warn(
+          `[ssog] pool too small for page-aware balance: pinned ${pinned.length}` +
+            ` + margin ${margin} > guard ${guard} — cut will rest at coarsest`,
+        );
+      }
+    }
+  }
+
+  /**
+   * [ssog-17] add (dir=+1) or remove (dir=−1) one leaf-level ref's pages
+   * to/from the final-cut refcount scratch; returns the updated distinct
+   * count. Same chunk math as forEachLeafChunk, inlined for the balancer's
+   * hot path. Aliased level pairs net to zero across a move.
+   */
+  private bumpLeafPageRefs(
+    li: number,
+    level: number,
+    refs: Int32Array,
+    distinct: number,
+    dir: 1 | -1,
+  ): number {
+    const model = this.splats.model;
+    const o = (li * this.L + level) * 3;
+    const file = model.leafLods[o];
+    const offset = model.leafLods[o + 1];
+    const count = model.leafLods[o + 2];
+    if (count <= 0) {
+      return distinct;
+    }
+    const first = model.blockBase[file] + Math.floor(offset / SSOG_PAGE_SPLATS);
+    const last =
+      model.blockBase[file] +
+      Math.floor((offset + count - 1) / SSOG_PAGE_SPLATS);
+    for (let c = first; c <= last; c++) {
+      if (dir > 0) {
+        if (refs[c] === 0) {
+          distinct++;
+        }
+        refs[c]++;
+      } else {
+        refs[c]--;
+        if (refs[c] === 0) {
+          distinct--;
+        }
+      }
+    }
+    return distinct;
   }
 
   /** Q8: call once per rendered frame from the app rAF. */
@@ -861,7 +940,26 @@ export class SsogLodController {
       totalOptimal += model.leafLods[(li * L + lvl) * 3 + 2];
     }
 
-    // ---- balancer (verbatim shape, C9) ------------------------------------
+    // [ssog-17 perf] bucket-ordered leaf index (counting sort, stable in
+    // li): both balancer passes below visit leaves in exactly the former
+    // (bucket, li-ascending) order, so the output is bit-identical to the
+    // old 64×NL rescans at a fraction of the cost.
+    const bucketOrder = this.bucketOrder;
+    const bucketStart = this.bucketStart;
+    const bucketCursor = this.bucketCursor;
+    bucketStart.fill(0);
+    for (let li = 0; li < NL; li++) {
+      bucketStart[this.bucketOf[li] + 1]++;
+    }
+    for (let b = 0; b < 64; b++) {
+      bucketStart[b + 1] += bucketStart[b];
+      bucketCursor[b] = bucketStart[b];
+    }
+    for (let li = 0; li < NL; li++) {
+      bucketOrder[bucketCursor[this.bucketOf[li]]++] = li;
+    }
+
+    // ---- balancer (C9 shape; [ssog-14] fill, now [ssog-17] page-aware) ----
     this.balancedLevel.set(this.optimalLevel);
     let totalBalanced = totalOptimal;
     const budget = this.budget;
@@ -870,10 +968,8 @@ export class SsogLodController {
       demote: while (totalBalanced > budget && passes < L) {
         passes++;
         for (let b = 63; b >= 0; b--) {
-          for (let li = 0; li < NL; li++) {
-            if (this.bucketOf[li] !== b) {
-              continue;
-            }
+          for (let i = bucketStart[b]; i < bucketStart[b + 1]; i++) {
+            const li = bucketOrder[i];
             const cur = this.balancedLevel[li];
             if (cur >= L - 1) {
               continue;
@@ -890,52 +986,173 @@ export class SsogLodController {
         // exhaustion: soft target (§2.4) — all at coarsest is legal; the
         // capacity policy absorbs it
       }
-    } else {
-      // [ssog-14] promote-to-fill (kroscloud.26 — 2026-08-31 budget-underfill
-      // findings; supersplat GSplatBudgetBalancer parity): the budget is a
-      // soft TARGET, not just a ceiling. balancedLevel starts AT optimalLevel
-      // (line above), so the previous `cur <= optimalLevel` guard made this
-      // leg dead code — under budget the cut simply WAS totalOptimal, and any
-      // in-dead-zone selection (0.6–1.4× budget) rested there permanently
-      // (observed live: 2.89M/4M on a 19.9M-splat scene, blurred FPV near
-      // field with 1.1M splats of unused headroom). Now: walk nearest-first
-      // (bucket 0→63) and promote one level per leaf per pass — PAST optimal,
-      // down to L0 — while the result still fits. Fit-check-before-apply +
-      // stop-don't-skip (C9) are kept per pass; ≤ L−1 passes total (a leaf
-      // can climb at most L−1 levels), and an all-skip pass ends the walk.
-      // Deterministic at a fixed pose, so allAtTarget convergence latches
-      // exactly as before. budgetScale feedback stays driven by totalOptimal
-      // (pre-fill, below) — the fill never destabilizes the dead-zone walk.
-      // Aliased promotes (resolved missing levels sharing rows) may add 0
-      // splats — same accepted class as the aliased-demote note above.
-      let passes = 0;
-      promote: while (passes < L - 1) {
-        passes++;
-        let promoted = false;
-        for (let b = 0; b < 64; b++) {
-          for (let li = 0; li < NL; li++) {
-            if (this.bucketOf[li] !== b) {
-              continue;
-            }
-            const cur = this.balancedLevel[li];
-            if (cur <= 0) {
-              continue; // already finest
-            }
-            const curCount = model.leafLods[(li * L + cur) * 3 + 2];
-            const finer = model.leafLods[(li * L + cur - 1) * 3 + 2];
-            if (totalBalanced - curCount + finer > budget) {
-              break promote; // stop, don't skip
-            }
-            this.balancedLevel[li] = cur - 1;
-            totalBalanced += finer - curCount;
-            promoted = true;
-          }
+    }
+
+    // ---- [ssog-17] page-feasibility + page-aware promote-to-fill ----------
+    // (kroscloud.27 — 2026-08-31 pool-binder verification on the live 20M
+    // artifact.) The splat budget is not the only resource: the displayed
+    // cut occupies whole 64K-splat pool pages per touched unit block, and on
+    // heavily-chunked trees the cut's page occupancy runs FAR below the
+    // pool calibration (56bg: 1,139 single-page units, ~52% intrinsic fill,
+    // displayed-cut occupancy measured 17–33% — a 4M cut demanded 205–376
+    // pages against a 137-page guard). A page-blind balanced target then
+    // dies at the flip guard: 12–21K grow flips per pose were vetoed
+    // path-dependently by arrival order, and the pool-settled latch froze a
+    // run-to-run DIFFERENT ~2.3–3M subset (the observed unreliability).
+    // Fix: balance PAGES here in the selection so the final cut is
+    // pool-feasible BY CONSTRUCTION — deterministic per pose, poolDeferrals
+    // ≈ 0 at rest; the flip-time guard and the latch stay as backstops.
+    //   - final-cut page demand is refcounted incrementally (pageRefs
+    //     scratch seeded with the pinned tier; promotes MOVE a leaf's refs
+    //     between levels, so freed pages are reusable within the same pass);
+    //   - if the post-demote (or optimal) target is already page-infeasible,
+    //     reset to per-leaf coarsest (≈ the pinned tier) and let the fill
+    //     rebuild nearest-first;
+    //   - the fill gets a DUAL fit-check: splat overflow → break (C9
+    //     stop-don't-skip, unchanged axis); PAGE overflow → revert the
+    //     tentative ref move and CONTINUE (skip) — a farther leaf may
+    //     promote onto pages already paid for, which is the right page
+    //     economics (measured on the live artifact: skip-not-stop composes
+    //     2.8–3.1M deterministically at a 141-page pool where stop-on-miss
+    //     or post-hoc farthest-first page-shedding collapse to 0.6–2.1M).
+    // Margin: (maxLeafBlockFootprint + numFetchers) pages — the same
+    // quantified slack SsogSplats reserves — covers keep-old transition
+    // overlap (shrink flips land first and free refs; deferred grows retry
+    // every tick). Whole-scene-resident pools skip enforcement (the
+    // [ssog-6] class: demand can never exceed totalBlocks ≤ maxPages).
+    // NOTE: diverges further from the P0d bench — it has no page model.
+    const pager = this.splats.pager;
+    const wholeResident = !pager || pager.maxPages >= model.totalBlocks;
+    // NOTE: poolGuardLimit() already reserves numFetchers, so the margin
+    // double-counts them (total slack = mLBF + 2·nF pages). INTENTIONAL —
+    // conservative, and the validated simulation numbers include it; do not
+    // "fix" without re-running the sim.
+    const pageLimit = wholeResident
+      ? Number.POSITIVE_INFINITY
+      : this.poolGuardLimit() -
+        (model.maxLeafBlockFootprint + pager.numFetchers);
+
+    const pageRefs = this.pageRefs;
+    pageRefs.fill(0);
+    let distinctPages = 0;
+    for (const c of this.pinnedChunks) {
+      if (pageRefs[c] === 0) {
+        distinctPages++;
+      }
+      pageRefs[c]++;
+    }
+    for (let li = 0; li < NL; li++) {
+      distinctPages = this.bumpLeafPageRefs(
+        li,
+        this.balancedLevel[li],
+        pageRefs,
+        distinctPages,
+        1,
+      );
+    }
+
+    if (distinctPages > pageLimit) {
+      // page-infeasible target: reset to per-leaf coarsest (its refs are
+      // ≈ the pinned tier — resolved-missing coarsest slots can point at a
+      // finer unit, so refs are recomputed, not assumed) and rebuild below.
+      totalBalanced = 0;
+      pageRefs.fill(0);
+      distinctPages = 0;
+      for (const c of this.pinnedChunks) {
+        if (pageRefs[c] === 0) {
+          distinctPages++;
         }
-        if (!promoted) {
-          break;
-        }
+        pageRefs[c]++;
+      }
+      for (let li = 0; li < NL; li++) {
+        this.balancedLevel[li] = L - 1;
+        totalBalanced += model.leafLods[(li * L + L - 1) * 3 + 2];
+        distinctPages = this.bumpLeafPageRefs(
+          li,
+          L - 1,
+          pageRefs,
+          distinctPages,
+          1,
+        );
       }
     }
+
+    // [ssog-14] promote-to-fill (supersplat GSplatBudgetBalancer parity —
+    // the budget is a soft TARGET, not just a ceiling; without this leg any
+    // in-dead-zone selection rested permanently at 0.6–1.4× budget). Walk
+    // nearest-first (bucket 0→63), one level per leaf per pass, PAST
+    // optimal down to L0, while BOTH resources fit. ≤ L−1 passes + all-skip
+    // early exit; deterministic per pose so allAtTarget still latches;
+    // budgetScale feedback stays on totalOptimal (below). Runs after BOTH
+    // demote and reset paths — a demote result already at budget breaks on
+    // its first splat check. Aliased promotes may add 0 splats/pages (same
+    // accepted class as the aliased-demote note above).
+    let passes = 0;
+    promote: while (passes < L - 1) {
+      passes++;
+      let promoted = false;
+      for (let b = 0; b < 64; b++) {
+        for (let i = bucketStart[b]; i < bucketStart[b + 1]; i++) {
+          const li = bucketOrder[i];
+          const cur = this.balancedLevel[li];
+          if (cur <= 0) {
+            continue; // already finest
+          }
+          const curCount = model.leafLods[(li * L + cur) * 3 + 2];
+          const finer = model.leafLods[(li * L + cur - 1) * 3 + 2];
+          if (totalBalanced - curCount + finer > budget) {
+            break promote; // stop, don't skip (C9, splat axis)
+          }
+          if (pageLimit !== Number.POSITIVE_INFINITY) {
+            // tentatively move this leaf's final-cut refs cur → cur−1
+            distinctPages = this.bumpLeafPageRefs(
+              li,
+              cur - 1,
+              pageRefs,
+              distinctPages,
+              1,
+            );
+            distinctPages = this.bumpLeafPageRefs(
+              li,
+              cur,
+              pageRefs,
+              distinctPages,
+              -1,
+            );
+            if (distinctPages > pageLimit) {
+              // revert and SKIP (page axis): stop-don't-skip here was
+              // measured to collapse the cut — see the [ssog-17] note.
+              distinctPages = this.bumpLeafPageRefs(
+                li,
+                cur,
+                pageRefs,
+                distinctPages,
+                1,
+              );
+              distinctPages = this.bumpLeafPageRefs(
+                li,
+                cur - 1,
+                pageRefs,
+                distinctPages,
+                -1,
+              );
+              continue;
+            }
+          }
+          this.balancedLevel[li] = cur - 1;
+          totalBalanced += finer - curCount;
+          promoted = true;
+        }
+      }
+      if (!promoted) {
+        break;
+      }
+    }
+
+    this.stats.balancedPages = distinctPages;
+    // 0 when nothing is enforced (whole-resident pool) so the HUD's "gN"
+    // marker only appears where the page budget actually binds.
+    this.stats.pageLimit = wholeResident ? 0 : pageLimit;
 
     // ---- budgetScale feedback (verbatim constants) ------------------------
     const ratio = totalOptimal / budget;

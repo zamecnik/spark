@@ -98,13 +98,28 @@ export class SsogSplats extends PagedSplats {
     const slackSplats =
       (model.maxLeafBlockFootprint + numFetchers) * SSOG_PAGE_SPLATS;
     const poolFactor = options.poolFactor ?? 1;
-    const poolPages = Math.min(
-      Math.ceil(
-        (cutSplats * poolFactor + coarsestSplats + slackSplats) /
-          SSOG_PAGE_SPLATS,
-      ),
-      model.totalBlocks,
+    // [ssog-17] hard ceiling 256: the pool planes are 256×256×maxPages
+    // DataArrayTextures and the app runs DEFAULT device limits
+    // (maxTextureArrayLayers = 256 on WebGPU — WebGpuSplat requests none; the
+    // WebGL2 spec minimum is the same 256). A 257th layer fails createTexture
+    // with a VALIDATION error, not a device loss: pool sampling goes silently
+    // black and no fallback fires. Clamp and warn instead.
+    const MAX_POOL_PAGES = 256;
+    const wantPages = Math.ceil(
+      (cutSplats * poolFactor + coarsestSplats + slackSplats) /
+        SSOG_PAGE_SPLATS,
     );
+    const poolPages = Math.min(wantPages, model.totalBlocks, MAX_POOL_PAGES);
+    if (
+      poolPages === MAX_POOL_PAGES &&
+      wantPages > MAX_POOL_PAGES &&
+      MAX_POOL_PAGES < model.totalBlocks // scene-size clamp binds equally
+    ) {
+      console.warn(
+        `[ssog] poolPages clamped ${wantPages} -> ${MAX_POOL_PAGES}` +
+          " (default maxTextureArrayLayers)",
+      );
+    }
 
     const pager = new SplatPager({
       renderer: options.renderer,
