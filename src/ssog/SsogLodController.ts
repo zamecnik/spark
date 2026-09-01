@@ -1550,7 +1550,20 @@ export class SsogLodController {
       }
       if (!grow) {
         this.readySinceTick[li] = -1;
-        readyShrink.push(li);
+        // [ssog-21] Under a scripted-flight hold, shrinks are suppressed
+        // too. Tier-3 staging is already held, so nothing can grow — but
+        // shrinks were still landing immediately, collapsing the departure
+        // pose's working set onto the pinned coarsest tier mid-flight.
+        // removeLeafRefs then drops those chunks out of tier 2, the
+        // saturated tier-4 cooldown cannot re-protect them, their pages
+        // become freeable, and the ARRIVAL re-downloads what the flight
+        // just discarded (measured: 487 units per POI click where a
+        // properly held flight needs 174-214). Holding the displayed set
+        // still is free: no grow can become ready under the hold, so
+        // displayedTotal, capacitySplats and chunkRefs cannot increase.
+        if (!this.fetchHold) {
+          readyShrink.push(li);
+        }
       } else {
         if (file >= 0) {
           growReadyByFile.set(file, (growReadyByFile.get(file) ?? 0) + 1);

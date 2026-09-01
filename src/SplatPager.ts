@@ -1452,12 +1452,22 @@ export class SplatPager {
     this.freeablePages = Array.from(extraPages).map(({ page }) => page);
   }
 
+  /**
+   * [ssog-21] pages evicted to make room for an arriving fetch, and chunks
+   * fetched again after having been resident. Pool eviction was invisible —
+   * the ssog cache's `evictions` counts the DECODE LRU, not this.
+   */
+  pageEvictions = 0;
+  chunkRefetches = 0;
+  private everResident: WeakMap<object, Set<number>> = new WeakMap();
+
   private allocateFreeable(): number | undefined {
     const page = this.freeablePages.shift();
     if (page === undefined) {
       // No freeable pages available
       return undefined;
     }
+    this.pageEvictions += 1;
 
     const splatsChunk = this.pageToSplatsChunk[page];
     if (!splatsChunk) {
@@ -1486,11 +1496,40 @@ export class SplatPager {
 
       let page = this.allocatePage();
       if (page === undefined) {
+        // [ssog-21] A fetch that completed for a target the controller has
+        // since abandoned must NOT evict a live page to install itself: the
+        // arrival then has to re-download whatever it displaced (measured on
+        // a 3-pose tour: superseded fetches evicting useful pages was a
+        // large share of ~1,030 MB of excess transfer). A chunk still wanted
+        // is in the CURRENT fetchPriority; one that is not is dropped on the
+        // floor — its bytes are already spent either way, and it re-enters
+        // normally if a later tick wants it again.
+        if (
+          this.fetchPriority.length > 0 &&
+          !this.fetchPriority.some(
+            (e) => e.splats === splats && e.chunk === chunk,
+          )
+        ) {
+          continue;
+        }
         page = this.allocateFreeable();
         if (page === undefined) {
           // No pages available, stop for now
           return;
         }
+      }
+
+      // [ssog-21] refetch telemetry: a chunk arriving that was resident
+      // before is a byte we paid for twice.
+      let seen = this.everResident.get(splats as object);
+      if (!seen) {
+        seen = new Set<number>();
+        this.everResident.set(splats as object, seen);
+      }
+      if (seen.has(chunk)) {
+        this.chunkRefetches += 1;
+      } else {
+        seen.add(chunk);
       }
 
       this.insertSplatsChunkPage(splats, chunk, page, now);
