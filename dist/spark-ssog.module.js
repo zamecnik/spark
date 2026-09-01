@@ -548,6 +548,8 @@ class SsogLodController {
       balancedPages: 0,
       /** [ssog-17] page budget the balancer enforced (0 = not enforced) */
       pageLimit: 0,
+      /** [ssog-20] page cap the promote-to-fill leg spent (0 = not enforced) */
+      fillPageCap: 0,
       /** [B4] wave-gather hold observations (per flip-scan pass, not unique) */
       batchHolds: 0,
       displayedChunkCount: 0,
@@ -558,7 +560,9 @@ class SsogLodController {
       priorityLen: 0,
       lastTickMs: 0,
       revealResidentBlocks: 0,
-      revealTotalBlocks: 0
+      revealTotalBlocks: 0,
+      /** [ssog-20] leaves whose resolved-coarsest ref is outside the pin tier */
+      revealHoleLeaves: 0
     };
     this.mesh = options.mesh;
     this.splats = options.splats;
@@ -566,6 +570,8 @@ class SsogLodController {
     this.budget = options.budget ?? this.splats.budget;
     const chunkExtent = options.chunkExtent ?? this.splats.model.chunkExtent ?? 16;
     this.lodBaseDistance = options.lodBaseDistance ?? 5 / 16 * chunkExtent;
+    const rawFillCap = options.fillPageCap;
+    this.fillPageCapOption = typeof rawFillCap === "number" && Number.isFinite(rawFillCap) && rawFillCap >= 1 ? Math.floor(rawFillCap) : null;
     this.moveGateFactor = options.moveGateFactor ?? 0.2;
     this.metronomeFrames = options.metronomeFrames ?? 10;
     this.cooldownTicks = options.cooldownTicks ?? 100;
@@ -829,8 +835,67 @@ class SsogLodController {
     }
     return pager.maxPages - pager.numFetchers;
   }
+  /**
+   * [ssog-20] splat count a leaf currently contributes to the cut; 0 when the
+   * leaf displays nothing (level −1: a reveal hole not yet laddered in).
+   */
+  displayedCount(li) {
+    const lvl = this.displayed[li];
+    return lvl < 0 ? 0 : this.splats.model.leafLods[(li * this.L + lvl) * 3 + 2];
+  }
+  /**
+   * [ssog-20] EXACT net change in distinct-page count of moving one leaf's
+   * refs from level `from` to level `to`, computed read-only. Equivalent to
+   * bump(+to) then bump(−from) and reading the delta, because:
+   *   • every page of the FROM span already carries this leaf's ref (the
+   *     leaf is currently at `from` in the refcounted cut), so it can never
+   *     be counted as new, and
+   *   • a page in BOTH spans nets zero under the +to/−from order (it sits
+   *     at refs+1 when the decrement lands), so it is excluded from the
+   *     freed count.
+   * Used to reject a promotion without touching the scratch at all.
+   */
+  netPageDelta(li, to, from, refs) {
+    const model = this.splats.model;
+    const L = this.L;
+    let toFirst = 0;
+    let toLast = -1;
+    const toOff = (li * L + to) * 3;
+    const toCount = to >= 0 ? model.leafLods[toOff + 2] : 0;
+    if (toCount > 0) {
+      const file = model.leafLods[toOff];
+      const offset = model.leafLods[toOff + 1];
+      toFirst = model.blockBase[file] + Math.floor(offset / SSOG_PAGE_SPLATS);
+      toLast = model.blockBase[file] + Math.floor((offset + toCount - 1) / SSOG_PAGE_SPLATS);
+    }
+    let fromFirst = 0;
+    let fromLast = -1;
+    const fromOff = (li * L + from) * 3;
+    const fromCount = from >= 0 ? model.leafLods[fromOff + 2] : 0;
+    if (fromCount > 0) {
+      const file = model.leafLods[fromOff];
+      const offset = model.leafLods[fromOff + 1];
+      fromFirst = model.blockBase[file] + Math.floor(offset / SSOG_PAGE_SPLATS);
+      fromLast = model.blockBase[file] + Math.floor((offset + fromCount - 1) / SSOG_PAGE_SPLATS);
+    }
+    let delta = 0;
+    for (let c = toFirst; c <= toLast; c++) {
+      if (refs[c] === 0) {
+        delta += 1;
+      }
+    }
+    for (let c = fromFirst; c <= fromLast; c++) {
+      if (refs[c] === 1 && !(c >= toFirst && c <= toLast)) {
+        delta -= 1;
+      }
+    }
+    return delta;
+  }
   /** iterate global chunk ids of a (leaf, level) ref */
   forEachLeafChunk(li, level, fn) {
+    if (level < 0) {
+      return;
+    }
     const model = this.splats.model;
     const o = (li * this.L + level) * 3;
     const file = model.leafLods[o];
@@ -864,17 +929,26 @@ class SsogLodController {
       return;
     }
     const model = this.splats.model;
-    this.displayed.fill(this.L - 1);
-    this.desired.set(this.displayed);
     this.displayedTotal = 0;
     this.chunkRefs.clear();
     for (const chunk of this.pinnedChunks) {
       this.chunkRefs.set(chunk, 1);
     }
+    let holes = 0;
     for (let li = 0; li < this.NL; li++) {
+      const o = (li * this.L + this.L - 1) * 3;
+      const pinnedResident = model.leafLods[o + 2] <= 0 || model.unitLevel[model.leafLods[o]] === this.L - 1;
+      if (!pinnedResident) {
+        this.displayed[li] = -1;
+        holes += 1;
+        continue;
+      }
+      this.displayed[li] = this.L - 1;
       this.displayedTotal += model.leafLods[(li * this.L + this.L - 1) * 3 + 2];
       this.addLeafRefs(li, this.L - 1);
     }
+    this.desired.set(this.displayed);
+    this.stats.revealHoleLeaves = holes;
     this.compose();
     this.mesh.raycastIndices = {
       numSplats: this.composedSplats,
@@ -1163,9 +1237,9 @@ class SsogLodController {
     let totalBalanced = totalOptimal;
     const budget = this.budget;
     if (totalBalanced > budget) {
-      let passes2 = 0;
-      demote: while (totalBalanced > budget && passes2 < L) {
-        passes2++;
+      let passes = 0;
+      demote: while (totalBalanced > budget && passes < L) {
+        passes++;
         for (let b = 63; b >= 0; b--) {
           for (let i = bucketStart[b]; i < bucketStart[b + 1]; i++) {
             const li = bucketOrder[i];
@@ -1227,65 +1301,69 @@ class SsogLodController {
         );
       }
     }
-    let passes = 0;
-    promote: while (passes < L - 1) {
-      passes++;
-      let promoted = false;
-      for (let b = 0; b < 64; b++) {
-        for (let i = bucketStart[b]; i < bucketStart[b + 1]; i++) {
-          const li = bucketOrder[i];
-          const cur = this.balancedLevel[li];
-          if (cur <= 0) {
-            continue;
-          }
-          const curCount = model.leafLods[(li * L + cur) * 3 + 2];
-          const finer = model.leafLods[(li * L + cur - 1) * 3 + 2];
-          if (totalBalanced - curCount + finer > budget) {
-            break promote;
-          }
-          if (pageLimit !== Number.POSITIVE_INFINITY) {
-            distinctPages = this.bumpLeafPageRefs(
-              li,
-              cur - 1,
-              pageRefs,
-              distinctPages,
-              1
-            );
-            distinctPages = this.bumpLeafPageRefs(
-              li,
-              cur,
-              pageRefs,
-              distinctPages,
-              -1
-            );
-            if (distinctPages > pageLimit) {
+    const FILL_UTILIZATION = 0.78;
+    const avgPageSplats = model.count / Math.max(1, model.totalBlocks);
+    const autoFillCap = Math.ceil(
+      this.budget / Math.max(1, avgPageSplats * FILL_UTILIZATION)
+    );
+    const fillPageCap = wholeResident ? Number.POSITIVE_INFINITY : Math.min(pageLimit, this.fillPageCapOption ?? autoFillCap);
+    const basePages = distinctPages;
+    const runFill = (cap) => {
+      let passes = 0;
+      promote: while (passes < L - 1) {
+        passes++;
+        let promoted = false;
+        for (let b = 0; b < 64; b++) {
+          for (let i = bucketStart[b]; i < bucketStart[b + 1]; i++) {
+            const li = bucketOrder[i];
+            const cur = this.balancedLevel[li];
+            if (cur <= 0) {
+              continue;
+            }
+            const curCount = model.leafLods[(li * L + cur) * 3 + 2];
+            const finer = model.leafLods[(li * L + cur - 1) * 3 + 2];
+            if (totalBalanced - curCount + finer > budget) {
+              break promote;
+            }
+            if (cap !== Number.POSITIVE_INFINITY) {
+              if (distinctPages + this.netPageDelta(li, cur - 1, cur, pageRefs) > cap) {
+                continue;
+              }
               distinctPages = this.bumpLeafPageRefs(
                 li,
-                cur,
+                cur - 1,
                 pageRefs,
                 distinctPages,
                 1
               );
               distinctPages = this.bumpLeafPageRefs(
                 li,
-                cur - 1,
+                cur,
                 pageRefs,
                 distinctPages,
                 -1
               );
-              continue;
             }
+            this.balancedLevel[li] = cur - 1;
+            totalBalanced += finer - curCount;
+            promoted = true;
           }
-          this.balancedLevel[li] = cur - 1;
-          totalBalanced += finer - curCount;
-          promoted = true;
+        }
+        if (!promoted) {
+          break;
         }
       }
-      if (!promoted) {
-        break;
+    };
+    if (wholeResident) {
+      runFill(Number.POSITIVE_INFINITY);
+    } else {
+      runFill(basePages);
+      if (fillPageCap > basePages) {
+        runFill(fillPageCap);
       }
     }
     this.stats.balancedPages = distinctPages;
+    this.stats.fillPageCap = fillPageCap === Number.POSITIVE_INFINITY ? 0 : fillPageCap;
     this.stats.pageLimit = wholeResident ? 0 : pageLimit;
     const ratio = totalOptimal / budget;
     if (ratio > 1.4 || ratio < 0.6) {
@@ -1315,7 +1393,7 @@ class SsogLodController {
         continue;
       }
       const o = (li * this.L + to) * 3;
-      const delta = model.leafLods[o + 2] - model.leafLods[(li * this.L + from) * 3 + 2];
+      const delta = model.leafLods[o + 2] - this.displayedCount(li);
       const grow = delta > 0;
       const file = grow && model.leafLods[o + 2] > 0 ? model.leafLods[o] : -1;
       if (file >= 0) {
@@ -1370,7 +1448,7 @@ class SsogLodController {
     const applyFlip = (li, to) => {
       this.removeLeafRefs(li, this.displayed[li]);
       this.addLeafRefs(li, to);
-      this.displayedTotal += model.leafLods[(li * this.L + to) * 3 + 2] - model.leafLods[(li * this.L + this.displayed[li]) * 3 + 2];
+      this.displayedTotal += model.leafLods[(li * this.L + to) * 3 + 2] - this.displayedCount(li);
       this.displayed[li] = to;
       this.readySinceTick[li] = -1;
       flipped += 1;
@@ -1382,7 +1460,7 @@ class SsogLodController {
     for (const li of eligibleGrow) {
       const to = this.desired[li];
       const from = this.displayed[li];
-      const delta = model.leafLods[(li * this.L + to) * 3 + 2] - model.leafLods[(li * this.L + from) * 3 + 2];
+      const delta = model.leafLods[(li * this.L + to) * 3 + 2] - this.displayedCount(li);
       if (this.displayedTotal + delta > this.splats.capacitySplats) {
         this.stats.capacityDeferrals += 1;
         continue;
@@ -1424,6 +1502,9 @@ class SsogLodController {
     const capacity = this.splats.capacitySplats;
     let w = 0;
     for (let li = 0; li < this.NL; li++) {
+      if (this.displayed[li] < 0) {
+        continue;
+      }
       const o = (li * this.L + this.displayed[li]) * 3;
       const file = model.leafLods[o];
       const offset = model.leafLods[o + 1];
@@ -1509,7 +1590,11 @@ class SsogLodController {
       return out;
     }
     for (let li = 0; li < this.NL; li++) {
-      out[this.displayed[li]] += model.leafLods[(li * this.L + this.displayed[li]) * 3 + 2];
+      const lvl = this.displayed[li];
+      if (lvl < 0) {
+        continue;
+      }
+      out[lvl] += model.leafLods[(li * this.L + lvl) * 3 + 2];
     }
     return out;
   }

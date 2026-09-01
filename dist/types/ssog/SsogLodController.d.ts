@@ -36,6 +36,13 @@ export interface SsogLodControllerOptions {
      * sparkRenderer.sorting (§2.4). Default: auto-detect from the renderer.
      */
     isWebGL2?: boolean;
+    /**
+     * [ssog-20] hard page cap for the promote-to-fill leg (A/B override;
+     * default = the budget's page-equivalent at ~0.78 row utilization).
+     * Bytes, not splats, are what the fill actually spends — see
+     * selectionAndBalance.
+     */
+    fillPageCap?: number;
 }
 export declare class SsogLodController {
     readonly mesh: SplatMesh;
@@ -66,6 +73,8 @@ export declare class SsogLodController {
      * paramsDirty so the arrival pose stages its cut immediately.
      */
     private fetchHold;
+    /** [ssog-20] explicit fill page cap (A/B override; null = auto) */
+    private readonly fillPageCapOption;
     private readonly L;
     private readonly NL;
     private phase;
@@ -184,6 +193,8 @@ export declare class SsogLodController {
         balancedPages: number;
         /** [ssog-17] page budget the balancer enforced (0 = not enforced) */
         pageLimit: number;
+        /** [ssog-20] page cap the promote-to-fill leg spent (0 = not enforced) */
+        fillPageCap: number;
         /** [B4] wave-gather hold observations (per flip-scan pass, not unique) */
         batchHolds: number;
         displayedChunkCount: number;
@@ -201,6 +212,8 @@ export declare class SsogLodController {
         lastTickMs: number;
         revealResidentBlocks: number;
         revealTotalBlocks: number;
+        /** [ssog-20] leaves whose resolved-coarsest ref is outside the pin tier */
+        revealHoleLeaves: number;
     };
     constructor(options: SsogLodControllerOptions);
     /**
@@ -255,6 +268,24 @@ export declare class SsogLodController {
     private removeLeafRefs;
     /** pages tier 1+2 may occupy; leaves headroom for in-flight fetchers */
     private poolGuardLimit;
+    /**
+     * [ssog-20] splat count a leaf currently contributes to the cut; 0 when the
+     * leaf displays nothing (level −1: a reveal hole not yet laddered in).
+     */
+    private displayedCount;
+    /**
+     * [ssog-20] EXACT net change in distinct-page count of moving one leaf's
+     * refs from level `from` to level `to`, computed read-only. Equivalent to
+     * bump(+to) then bump(−from) and reading the delta, because:
+     *   • every page of the FROM span already carries this leaf's ref (the
+     *     leaf is currently at `from` in the refcounted cut), so it can never
+     *     be counted as new, and
+     *   • a page in BOTH spans nets zero under the +to/−from order (it sits
+     *     at refs+1 when the decrement lands), so it is excluded from the
+     *     freed count.
+     * Used to reject a promotion without touching the scratch at all.
+     */
+    private netPageDelta;
     /** iterate global chunk ids of a (leaf, level) ref */
     private forEachLeafChunk;
     private revealTick;
