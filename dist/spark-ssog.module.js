@@ -1411,7 +1411,9 @@ class SsogLodController {
       }
       if (!grow) {
         this.readySinceTick[li] = -1;
-        readyShrink.push(li);
+        if (!this.fetchHold) {
+          readyShrink.push(li);
+        }
       } else {
         if (file >= 0) {
           growReadyByFile.set(file, (growReadyByFile.get(file) ?? 0) + 1);

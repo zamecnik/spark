@@ -11576,6 +11576,9 @@ const _SplatPager = class _SplatPager {
     this.fetchPause = 0;
     this.splatsChunkToPage = /* @__PURE__ */ new Map();
     this.pageToSplatsChunk = [];
+    this.pageEvictions = 0;
+    this.chunkRefetches = 0;
+    this.everResident = /* @__PURE__ */ new WeakMap();
     this.renderer = options.renderer;
     this.extSplats = options.extSplats ?? false;
     this.pageSplats = 65536;
@@ -12128,6 +12131,7 @@ const _SplatPager = class _SplatPager {
     if (page === void 0) {
       return void 0;
     }
+    this.pageEvictions += 1;
     const splatsChunk = this.pageToSplatsChunk[page];
     if (!splatsChunk) {
       throw new Error(`splatsChunk not found for page: ${page}`);
@@ -12152,10 +12156,25 @@ const _SplatPager = class _SplatPager {
       const { splats, chunk, data } = fetched;
       let page = this.allocatePage();
       if (page === void 0) {
+        if (this.fetchPriority.length > 0 && !this.fetchPriority.some(
+          (e) => e.splats === splats && e.chunk === chunk
+        )) {
+          continue;
+        }
         page = this.allocateFreeable();
         if (page === void 0) {
           return;
         }
+      }
+      let seen = this.everResident.get(splats);
+      if (!seen) {
+        seen = /* @__PURE__ */ new Set();
+        this.everResident.set(splats, seen);
+      }
+      if (seen.has(chunk)) {
+        this.chunkRefetches += 1;
+      } else {
+        seen.add(chunk);
       }
       this.insertSplatsChunkPage(splats, chunk, page, now);
       const { numSplats, extra } = data;

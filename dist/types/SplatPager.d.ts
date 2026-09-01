@@ -206,6 +206,14 @@ export declare class SplatPager {
     private getGlTexture;
     private newUint32ArrayTexture;
     driveFetchers(): void;
+    /**
+     * [ssog-21] pages evicted to make room for an arriving fetch, and chunks
+     * fetched again after having been resident. Pool eviction was invisible —
+     * the ssog cache's `evictions` counts the DECODE LRU, not this.
+     */
+    pageEvictions: number;
+    chunkRefetches: number;
+    private everResident;
     private allocateFreeable;
     private processFetched;
     processUploads(): void;
