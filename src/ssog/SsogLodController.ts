@@ -91,6 +91,13 @@ export interface SsogLodControllerOptions {
    * sparkRenderer.sorting (§2.4). Default: auto-detect from the renderer.
    */
   isWebGL2?: boolean;
+  /**
+   * [ssog-20] hard page cap for the promote-to-fill leg (A/B override;
+   * default = the budget's page-equivalent at ~0.78 row utilization).
+   * Bytes, not splats, are what the fill actually spends — see
+   * selectionAndBalance.
+   */
+  fillPageCap?: number;
 }
 
 interface FetchPriorityEntry {
@@ -131,6 +138,9 @@ export class SsogLodController {
    * paramsDirty so the arrival pose stages its cut immediately.
    */
   private fetchHold = false;
+
+  /** [ssog-20] explicit fill page cap (A/B override; null = auto) */
+  private readonly fillPageCapOption: number | null;
 
   private readonly L: number;
   private readonly NL: number;
@@ -269,6 +279,8 @@ export class SsogLodController {
     balancedPages: 0,
     /** [ssog-17] page budget the balancer enforced (0 = not enforced) */
     pageLimit: 0,
+    /** [ssog-20] page cap the promote-to-fill leg spent (0 = not enforced) */
+    fillPageCap: 0,
     /** [B4] wave-gather hold observations (per flip-scan pass, not unique) */
     batchHolds: 0,
     displayedChunkCount: 0,
@@ -286,6 +298,8 @@ export class SsogLodController {
     lastTickMs: 0,
     revealResidentBlocks: 0,
     revealTotalBlocks: 0,
+    /** [ssog-20] leaves whose resolved-coarsest ref is outside the pin tier */
+    revealHoleLeaves: 0,
   };
 
   constructor(options: SsogLodControllerOptions) {
@@ -302,6 +316,13 @@ export class SsogLodController {
       options.chunkExtent ?? this.splats.model.chunkExtent ?? 16;
     this.lodBaseDistance =
       options.lodBaseDistance ?? (5 / 16) * chunkExtent; // C3
+    const rawFillCap = options.fillPageCap;
+    this.fillPageCapOption =
+      typeof rawFillCap === "number" &&
+      Number.isFinite(rawFillCap) &&
+      rawFillCap >= 1
+        ? Math.floor(rawFillCap)
+        : null;
     this.moveGateFactor = options.moveGateFactor ?? 0.2;
     this.metronomeFrames = options.metronomeFrames ?? 10;
     this.cooldownTicks = options.cooldownTicks ?? 100;
@@ -658,12 +679,84 @@ export class SsogLodController {
     return pager.maxPages - pager.numFetchers;
   }
 
+  /**
+   * [ssog-20] splat count a leaf currently contributes to the cut; 0 when the
+   * leaf displays nothing (level −1: a reveal hole not yet laddered in).
+   */
+  private displayedCount(li: number): number {
+    const lvl = this.displayed[li];
+    return lvl < 0
+      ? 0
+      : this.splats.model.leafLods[(li * this.L + lvl) * 3 + 2];
+  }
+
+  /**
+   * [ssog-20] EXACT net change in distinct-page count of moving one leaf's
+   * refs from level `from` to level `to`, computed read-only. Equivalent to
+   * bump(+to) then bump(−from) and reading the delta, because:
+   *   • every page of the FROM span already carries this leaf's ref (the
+   *     leaf is currently at `from` in the refcounted cut), so it can never
+   *     be counted as new, and
+   *   • a page in BOTH spans nets zero under the +to/−from order (it sits
+   *     at refs+1 when the decrement lands), so it is excluded from the
+   *     freed count.
+   * Used to reject a promotion without touching the scratch at all.
+   */
+  private netPageDelta(
+    li: number,
+    to: number,
+    from: number,
+    refs: Int32Array,
+  ): number {
+    const model = this.splats.model;
+    const L = this.L;
+    let toFirst = 0;
+    let toLast = -1;
+    const toOff = (li * L + to) * 3;
+    const toCount = to >= 0 ? model.leafLods[toOff + 2] : 0;
+    if (toCount > 0) {
+      const file = model.leafLods[toOff];
+      const offset = model.leafLods[toOff + 1];
+      toFirst = model.blockBase[file] + Math.floor(offset / SSOG_PAGE_SPLATS);
+      toLast =
+        model.blockBase[file] +
+        Math.floor((offset + toCount - 1) / SSOG_PAGE_SPLATS);
+    }
+    let fromFirst = 0;
+    let fromLast = -1;
+    const fromOff = (li * L + from) * 3;
+    const fromCount = from >= 0 ? model.leafLods[fromOff + 2] : 0;
+    if (fromCount > 0) {
+      const file = model.leafLods[fromOff];
+      const offset = model.leafLods[fromOff + 1];
+      fromFirst = model.blockBase[file] + Math.floor(offset / SSOG_PAGE_SPLATS);
+      fromLast =
+        model.blockBase[file] +
+        Math.floor((offset + fromCount - 1) / SSOG_PAGE_SPLATS);
+    }
+    let delta = 0;
+    for (let c = toFirst; c <= toLast; c++) {
+      if (refs[c] === 0) {
+        delta += 1;
+      }
+    }
+    for (let c = fromFirst; c <= fromLast; c++) {
+      if (refs[c] === 1 && !(c >= toFirst && c <= toLast)) {
+        delta -= 1;
+      }
+    }
+    return delta;
+  }
+
   /** iterate global chunk ids of a (leaf, level) ref */
   private forEachLeafChunk(
     li: number,
     level: number,
     fn: (chunk: number) => void,
   ) {
+    if (level < 0) {
+      return; // [ssog-20] leaf not displayed (reveal hole) — no chunks
+    }
     const model = this.splats.model;
     const o = (li * this.L + level) * 3;
     const file = model.leafLods[o];
@@ -703,19 +796,48 @@ export class SsogLodController {
     }
 
     // complete coarsest scene → first cut → activeSplats>0 fires (§2.7)
+    //
+    // [ssog-20] HOLE-FREE reveal: the pinned tier is every block of every
+    // unit whose LEVEL is L−1, but SsogModel resolves a leaf's MISSING
+    // coarsest level to the nearest available one — which can be FINER, in
+    // a unit that is not pinned (56bg: 537 of 26,041 leaves, whose refs
+    // live in 44 unpinned units). The old unconditional fill(L−1) therefore
+    // composed a cut with those leaves as holes AND refcounted their
+    // chunks, which staged all 44 units as tier-2 — 65 MB that appears in
+    // no balanced cut, for 1,832 splats (2026-09-01 bandwidth findings).
+    // Those leaves now display NOTHING until the normal ladder reaches
+    // them, so the composed cut is exact — no missing-page compose noise
+    // masking a real R7 stale-cut failure in the soak counters.
+    // mesh.raycastIndices below is UNCHANGED by this: compose() used to
+    // break out on the first non-resident chunk, so those rows never made
+    // it into the published set either way.
     const model = this.splats.model;
-    this.displayed.fill(this.L - 1);
-    this.desired.set(this.displayed);
     this.displayedTotal = 0;
     this.chunkRefs.clear();
     for (const chunk of this.pinnedChunks) {
       this.chunkRefs.set(chunk, 1); // permanent pin ref
     }
+    let holes = 0;
     for (let li = 0; li < this.NL; li++) {
+      // pinned ⇔ the leaf's resolved-coarsest ref lives in a coarsest-LEVEL
+      // unit (the pinned tier is every block of every such unit, and a leaf
+      // level ref lives in exactly one file) — the definition, O(1).
+      const o = (li * this.L + this.L - 1) * 3;
+      const pinnedResident =
+        model.leafLods[o + 2] <= 0 ||
+        model.unitLevel[model.leafLods[o]] === this.L - 1;
+      if (!pinnedResident) {
+        this.displayed[li] = -1;
+        holes += 1;
+        continue;
+      }
+      this.displayed[li] = this.L - 1;
       this.displayedTotal +=
         model.leafLods[(li * this.L + this.L - 1) * 3 + 2];
       this.addLeafRefs(li, this.L - 1);
     }
+    this.desired.set(this.displayed);
+    this.stats.revealHoleLeaves = holes;
     this.compose();
     // §2.7 raycast contract: the dblclick 5-ray median consensus reads its
     // bounded set from the PINNED coarsest level — a complete, view-
@@ -1254,69 +1376,103 @@ export class SsogLodController {
     // demote and reset paths — a demote result already at budget breaks on
     // its first splat check. Aliased promotes may add 0 splats/pages (same
     // accepted class as the aliased-demote note above).
-    let passes = 0;
-    promote: while (passes < L - 1) {
-      passes++;
-      let promoted = false;
-      for (let b = 0; b < 64; b++) {
-        for (let i = bucketStart[b]; i < bucketStart[b + 1]; i++) {
-          const li = bucketOrder[i];
-          const cur = this.balancedLevel[li];
-          if (cur <= 0) {
-            continue; // already finest
-          }
-          const curCount = model.leafLods[(li * L + cur) * 3 + 2];
-          const finer = model.leafLods[(li * L + cur - 1) * 3 + 2];
-          if (totalBalanced - curCount + finer > budget) {
-            break promote; // stop, don't skip (C9, splat axis)
-          }
-          if (pageLimit !== Number.POSITIVE_INFINITY) {
-            // tentatively move this leaf's final-cut refs cur → cur−1
-            distinctPages = this.bumpLeafPageRefs(
-              li,
-              cur - 1,
-              pageRefs,
-              distinctPages,
-              1,
-            );
-            distinctPages = this.bumpLeafPageRefs(
-              li,
-              cur,
-              pageRefs,
-              distinctPages,
-              -1,
-            );
-            if (distinctPages > pageLimit) {
-              // revert and SKIP (page axis): stop-don't-skip here was
-              // measured to collapse the cut — see the [ssog-17] note.
+    // [ssog-20] ...and its currency is PAGES, not splats. A promoted leaf
+    // costs a WHOLE unit download (~1–1.5 MB on production trees) however
+    // few of its rows the cut composes, so a splat-only cap spends the
+    // budget in the most expensive possible way: at a far pose the fill
+    // spread 8M splats over 302 extra units = 452 MB, 83% of the session's
+    // bytes, on detail the distance bands themselves called unnecessary
+    // (2026-09-01 bandwidth findings). Two phases, both nearest-first:
+    //   phase 1 — promote only where the finer refs cost no NEW page
+    //             (page-count-neutral; a swap that frees its old page may
+    //             still fetch a new one);
+    //   phase 2 — promote into new pages until the page budget is spent.
+    // The budget is the page count the splat budget can actually fill at a
+    // realistic row utilization, so it auto-scales with the artifact's unit
+    // size (measured optimum on the live 20M tree: ~300 pages at 32K units;
+    // the same formula gives ~345 after a 28K rebuild, matching the
+    // independently derived re-tune target). Whole-resident pools skip it
+    // entirely — every page is downloaded anyway.
+    const FILL_UTILIZATION = 0.78;
+    const avgPageSplats = model.count / Math.max(1, model.totalBlocks);
+    const autoFillCap = Math.ceil(
+      this.budget / Math.max(1, avgPageSplats * FILL_UTILIZATION),
+    );
+    const fillPageCap = wholeResident
+      ? Number.POSITIVE_INFINITY
+      : Math.min(pageLimit, this.fillPageCapOption ?? autoFillCap);
+    const basePages = distinctPages;
+
+    const runFill = (cap: number) => {
+      let passes = 0;
+      promote: while (passes < L - 1) {
+        passes++;
+        let promoted = false;
+        for (let b = 0; b < 64; b++) {
+          for (let i = bucketStart[b]; i < bucketStart[b + 1]; i++) {
+            const li = bucketOrder[i];
+            const cur = this.balancedLevel[li];
+            if (cur <= 0) {
+              continue; // already finest
+            }
+            const curCount = model.leafLods[(li * L + cur) * 3 + 2];
+            const finer = model.leafLods[(li * L + cur - 1) * 3 + 2];
+            if (totalBalanced - curCount + finer > budget) {
+              break promote; // stop, don't skip (C9, splat axis)
+            }
+            if (cap !== Number.POSITIVE_INFINITY) {
+              // Price the move read-only, then apply only if it fits: the
+              // old bump→test→revert cost four span walks per REJECTED
+              // candidate, and at cap saturation the overwhelming majority
+              // are rejected (~87k/tick measured at 26k leaves).
+              if (
+                distinctPages + this.netPageDelta(li, cur - 1, cur, pageRefs) >
+                cap
+              ) {
+                // SKIP on the page axis (stop-don't-skip here was measured
+                // to collapse the cut — see the [ssog-17] note).
+                continue;
+              }
               distinctPages = this.bumpLeafPageRefs(
                 li,
-                cur,
+                cur - 1,
                 pageRefs,
                 distinctPages,
                 1,
               );
               distinctPages = this.bumpLeafPageRefs(
                 li,
-                cur - 1,
+                cur,
                 pageRefs,
                 distinctPages,
                 -1,
               );
-              continue;
             }
+            this.balancedLevel[li] = cur - 1;
+            totalBalanced += finer - curCount;
+            promoted = true;
           }
-          this.balancedLevel[li] = cur - 1;
-          totalBalanced += finer - curCount;
-          promoted = true;
+        }
+        if (!promoted) {
+          break;
         }
       }
-      if (!promoted) {
-        break;
+    };
+
+    if (wholeResident) {
+      // [ssog-6] class: every page is resident, so there is no page axis at
+      // all — one unbounded splat-greedy fill, byte-identical to [ssog-17].
+      runFill(Number.POSITIVE_INFINITY);
+    } else {
+      runFill(basePages); // free: refine only into pages already in the cut
+      if (fillPageCap > basePages) {
+        runFill(fillPageCap); // paid: nearest-first into new pages, capped
       }
     }
 
     this.stats.balancedPages = distinctPages;
+    this.stats.fillPageCap =
+      fillPageCap === Number.POSITIVE_INFINITY ? 0 : fillPageCap;
     // 0 when nothing is enforced (whole-resident pool) so the HUD's "gN"
     // marker only appears where the page budget actually binds.
     this.stats.pageLimit = wholeResident ? 0 : pageLimit;
@@ -1339,6 +1495,12 @@ export class SsogLodController {
   // ---- swap flips ----------------------------------------------------------
 
   private flipReadyLeaves() {
+    // INVARIANT: `desired` is rewritten from balancedLevel (always 0…L−1)
+    // at the top of every lodTick before anything here runs, and this never
+    // runs before the first lodTick — so `to` is never −1 and the leafLods
+    // indexing below needs no guard. `from` (= displayed) CAN be −1 (an
+    // [ssog-20] reveal hole); every read of it goes through displayedCount
+    // or forEachLeafChunk, both of which handle −1.
     const model = this.splats.model;
     const pending = this.pendingUploadPages();
 
@@ -1361,9 +1523,9 @@ export class SsogLodController {
         continue;
       }
       const o = (li * this.L + to) * 3;
-      const delta =
-        model.leafLods[o + 2] -
-        model.leafLods[(li * this.L + from) * 3 + 2];
+      // [ssog-20] from may be −1 (reveal hole) — contributes 0 rows, so the
+      // flip is classified as a GROW (it adds content and needs pool pages)
+      const delta = model.leafLods[o + 2] - this.displayedCount(li);
       const grow = delta > 0;
       const file = grow && model.leafLods[o + 2] > 0 ? model.leafLods[o] : -1;
       if (file >= 0) {
@@ -1450,11 +1612,10 @@ export class SsogLodController {
     const poolLimit = this.poolGuardLimit();
     let flipped = 0;
     const applyFlip = (li: number, to: number) => {
-      this.removeLeafRefs(li, this.displayed[li]);
+      this.removeLeafRefs(li, this.displayed[li]); // no-op at level −1
       this.addLeafRefs(li, to);
       this.displayedTotal +=
-        model.leafLods[(li * this.L + to) * 3 + 2] -
-        model.leafLods[(li * this.L + this.displayed[li]) * 3 + 2];
+        model.leafLods[(li * this.L + to) * 3 + 2] - this.displayedCount(li);
       this.displayed[li] = to;
       this.readySinceTick[li] = -1;
       flipped += 1;
@@ -1468,8 +1629,7 @@ export class SsogLodController {
       const to = this.desired[li];
       const from = this.displayed[li];
       const delta =
-        model.leafLods[(li * this.L + to) * 3 + 2] -
-        model.leafLods[(li * this.L + from) * 3 + 2];
+        model.leafLods[(li * this.L + to) * 3 + 2] - this.displayedCount(li);
       if (this.displayedTotal + delta > this.splats.capacitySplats) {
         this.stats.capacityDeferrals += 1;
         continue;
@@ -1514,6 +1674,9 @@ export class SsogLodController {
     const capacity = this.splats.capacitySplats;
     let w = 0;
     for (let li = 0; li < this.NL; li++) {
+      if (this.displayed[li] < 0) {
+        continue; // [ssog-20] leaf displays nothing yet
+      }
       const o = (li * this.L + this.displayed[li]) * 3;
       const file = model.leafLods[o];
       const offset = model.leafLods[o + 1];
@@ -1606,8 +1769,11 @@ export class SsogLodController {
       return out;
     }
     for (let li = 0; li < this.NL; li++) {
-      out[this.displayed[li]] +=
-        model.leafLods[(li * this.L + this.displayed[li]) * 3 + 2];
+      const lvl = this.displayed[li];
+      if (lvl < 0) {
+        continue; // [ssog-20] not displayed
+      }
+      out[lvl] += model.leafLods[(li * this.L + lvl) * 3 + 2];
     }
     return out;
   }
