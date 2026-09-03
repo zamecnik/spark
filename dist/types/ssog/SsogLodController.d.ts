@@ -43,6 +43,29 @@ export interface SsogLodControllerOptions {
      * selectionAndBalance.
      */
     fillPageCap?: number;
+    /**
+     * [ssog-23] selection policy. "bands" = the shipped supersplat port
+     * (distance bands rescaled by budgetScale feedback, then promote-to-fill
+     * up to the budget). "sse" = screen-space-error termination: the bands are
+     * calibrated in PIXELS from the scene's own L0 splat spacing (L1 acceptable
+     * once its merge error projects to <= e px, level multiplier sqrt(2)),
+     * there is no budgetScale feedback, and the promote-to-fill legs never
+     * refine a leaf past the level the error rule allows; budget and pool
+     * stay ceilings. Default "bands" (byte-identical to kroscloud.31).
+     */
+    lodMode?: "bands" | "sse";
+    /** [ssog-23] sse: error tolerance in CSS pixels at rest (default 2) */
+    sseErrorPx?: number;
+    /**
+     * [ssog-23] sse: error tolerance while the camera moves and for
+     * sseDwellMs after it stops (default 4). 0 or <= sseErrorPx disables the
+     * base phase.
+     */
+    sseBaseErrorPx?: number;
+    /** [ssog-23] sse: dwell before switching from base to fine (ms, default 1500) */
+    sseDwellMs?: number;
+    /** [ssog-23] sse: viewport height in CSS pixels (default 1080; see setViewportHeight) */
+    viewportHeightPx?: number;
 }
 export declare class SsogLodController {
     readonly mesh: SplatMesh;
@@ -58,6 +81,23 @@ export declare class SsogLodController {
     /** set true after any external param change to force a tick */
     paramsDirty: boolean;
     budgetScale: number;
+    /** [ssog-23] selection policy (see SsogLodControllerOptions.lodMode) */
+    readonly lodMode: "bands" | "sse";
+    private sseErrorPx;
+    private sseBaseErrorPx;
+    private sseDwellMs;
+    private viewportHeightPx;
+    /**
+     * [ssog-23] L1's geometric error in MESH-LOCAL units: half the level-1
+     * splat spacing = 0.5 * s0 * sqrt(2), s0 = the scene-median L0 spacing per
+     * leaf (extent_max / sqrt(rows)). Level l's error is err1 * sqrt(2)^(l-1),
+     * so "coarsest level whose projected error <= e px" is exactly the bands
+     * formula with d0 = err1 * f_px / e and multiplier sqrt(2).
+     */
+    private readonly sseErr1;
+    /** [ssog-23] last controller tick that observed camera motion (ms) */
+    private lastMotionMs;
+    private ssePhase;
     /**
      * [ssog-15] moved-gate override in MESH-LOCAL units (null = default
      * moveGateFactor·lodBaseDistance). Set while the app pins the camera to a
@@ -86,6 +126,17 @@ export declare class SsogLodController {
     private readonly balancedLevel;
     private readonly bucketOf;
     private readonly dBucket;
+    /**
+     * [ssog-25] orbit-centric ordering: per-leaf distance from the INTEREST
+     * point (the camera's orbit target, mesh-local), refreshed by every
+     * selection while `interest` is set. Orders the page-capped grows and
+     * the tier-3 fetch staging in place of dBucket; never the level rule,
+     * never the budget demotion.
+     */
+    private readonly tBucket;
+    /** [ssog-25] WORLD-space interest point (null = camera-centric) */
+    private interest;
+    private readonly tmpInterest;
     /**
      * [B4] controller tick at which a pending GROW leaf first became ready
      * while its unit-file wave was still incomplete (−1 = not held). Bounds
@@ -145,6 +196,12 @@ export declare class SsogLodController {
      * so grow flips that would overflow the pool are deferred instead.
      */
     private chunkRefs;
+    /**
+     * [ssog-24] chunks that entered chunkRefs (pin or flip) during their
+     * CURRENT residency — cleared on eviction. A page evicted without ever
+     * having been displayed was a wasted download (wastedChunks/wastedBytes).
+     */
+    private readonly everDisplayed;
     /** pinned coarsest chunk ids (computed once) */
     private readonly pinnedChunks;
     /**
@@ -214,6 +271,76 @@ export declare class SsogLodController {
         revealTotalBlocks: number;
         /** [ssog-20] leaves whose resolved-coarsest ref is outside the pin tier */
         revealHoleLeaves: number;
+        /** [ssog-23] selection policy in force */
+        lodMode: string;
+        /** [ssog-25] "target" while an interest point orders the fill, else "camera" */
+        interestMode: string;
+        /**
+         * [ssog-25] grows deferred by capacity or the pool guard that sat in the
+         * NEARER half of the ordered grow list — the subject's share of the
+         * deferrals. Non-zero at rest means the subject is being held back by
+         * the cap, not by the ordering.
+         */
+        subjectDeferrals: number;
+        /** [ssog-23] L1 geometric error (mesh-local units) the sse mode calibrated */
+        sseErr1: number;
+        /** [ssog-23] error tolerance (CSS px) the last selection ran at */
+        sseErrorPx: number;
+        /** [ssog-23] "base" while moving / before dwell, "fine" at rest */
+        ssePhase: string;
+        /** [ssog-23] distance (world units) from which L1 is acceptable at the last selection */
+        sseD0: number;
+        /** [ssog-24] unit downloads aborted (no in-flight chunk still wanted) — cache mirror */
+        fetchCancels: number;
+        /** [ssog-24] EXACT Σ over aborted units of (known size − received) — cache mirror */
+        cancelSavedBytes: number;
+        /**
+         * [ssog-24 fix E] modelled saving of the same aborts — cache mirror.
+         * Cancels are admitted early, before Content-Length headers exist, so the
+         * exact counter above reads 0 over a whole soak; this one estimates the
+         * unit's total from the running bytes-per-splat mean of completed units.
+         */
+        cancelSavedEstimateBytes: number;
+        /**
+         * [ssog-24 fix D] WIRE bytes (PerformanceResourceTiming.transferSize,
+         * body-sum fallback) — cache mirror. 0 for a file served from the HTTP
+         * cache; compressed octets for a gzip'd meta.json.
+         */
+        bytesReceived: number;
+        /** [ssog-24 fix D] DECODED body bytes read — cache mirror, NOT the wire */
+        decodedBytesReceived: number;
+        /**
+         * [ssog-22 fix] shared SH palette files fetched — cache mirror. The build
+         * writes one per LEVEL, so this settles at the number of distinct levels
+         * touched; higher means the per-path memo is thrashing.
+         */
+        paletteFetches: number;
+        /** [ssog-24] pager pages evicted whose chunk was never displayed while resident */
+        wastedChunks: number;
+        /** [ssog-24] estimate for wastedChunks: unit bytes / blocks in the unit */
+        wastedBytes: number;
+        /** [ssog-24] chunk-level cancel requests the pager issued — pager mirror */
+        chunkCancels: number;
+        /**
+         * [ssog-24] chunks re-fetched within the pager's cancel cooldown of their
+         * own cancel — pager mirror. Non-zero = the cancel lever is thrashing
+         * under motion (bytes spent twice) rather than saving.
+         */
+        cancelRefetches: number;
+        /**
+         * [ssog-24] responses seen with no Content-Length — cache mirror. While
+         * such a file is in flight its unit reports NO progress, so the ≥75%
+         * skip is measuring blind rather than finding nothing to save.
+         */
+        filesWithoutLength: number;
+        /**
+         * [ssog-24 r4] settled files whose true WIRE size could not be read (no
+         * resource-timing entry, or a cross-origin response without
+         * Timing-Allow-Origin), so the higher decoded body sum was billed into
+         * bytesReceived instead. Non-zero means the byte figures are an
+         * over-estimate, not that little was transferred.
+         */
+        filesWithoutWireSize: number;
     };
     constructor(options: SsogLodControllerOptions);
     /**
@@ -251,20 +378,67 @@ export declare class SsogLodController {
      */
     setMoveGate(units: number | null): void;
     /**
+     * [ssog-25] Orbit-centric ordering. `point` is the camera's ORBIT TARGET in
+     * WORLD space (converted into the mesh frame with the same matrix the
+     * camera goes through); null restores the camera-centric order — the
+     * shipped behaviour, and the right one inside a first-person viewpoint,
+     * where the eye IS the target. Changes ONLY the order in which the
+     * page-capped grows and the tier-3 fetch staging are served (distance
+     * from this point instead of from the camera): never the level rule and
+     * never the budget demotion — measured on the 20M scene, target-ordering
+     * the demotion coarsens the subject (docs/features/gaussian-splatting/
+     * orbit-centric-lod-proposal-2026-09.md). Under orbit the key does not
+     * move with the camera, which also halves the per-step refetch
+     * (sim: 55 -> 28 units per 30 degrees at 144 m). No tick is forced: a
+     * target only moves together with the camera, which ticks anyway.
+     */
+    setInterest(point: {
+        x: number;
+        y: number;
+        z: number;
+    } | null): void;
+    /** [ssog-25] ordering key: interest distance when set, else camera distance */
+    private orderKey;
+    /**
      * [ssog-19] Hold/release tier-3 fetch staging across a scripted camera
      * flight (see the fetchHold field). Release forces a tick so the arrival
      * cut stages without waiting for a motion gate.
      */
     setFetchHold(hold: boolean): void;
+    /**
+     * [ssog-23] Viewport height in CSS pixels — the sse projection's f_px.
+     * CSS pixels on purpose (Cesium divides its SSE by pixelRatio for the same
+     * reason): a DPR-3 phone must not fetch more than a desktop.
+     */
+    setViewportHeight(px: number): void;
+    /** [ssog-23] runtime dials (A/B): fine tolerance, base tolerance, dwell */
+    setSseError(finePx: number, basePx?: number, dwellMs?: number): void;
+    /** [ssog-23] the tolerance the next selection will use */
+    private sseTolerance;
     private gatesPass;
     /** camera pose in mesh-local space → tmpPos/tmpFwd/tmpQuat + uniformScale */
     private cameraLocal;
     private markPose;
+    /**
+     * [ssog-24] mirror the byte counters of the unit cache and the pager into
+     * stats every frame (not per tick: downloads finish and abort between
+     * ticks, and a converged controller stops ticking while transfers drain).
+     */
+    private syncByteStats;
     private pump;
     /** pages queued-but-not-yet-uploaded (recomputed per scan) */
     private pendingUploadPages;
     private chunkResidentUploaded;
     private addLeafRefs;
+    /**
+     * [ssog-24] Mark a (leaf, level) ref's chunks as HAVING BEEN DISPLAYED.
+     * Deliberately NOT folded into addLeafRefs: the grow path adds refs
+     * TENTATIVELY and reverts them when the block-aware pool guard rejects the
+     * flip, so marking there counted chunks that were never composed and made
+     * wastedChunks/wastedBytes undercount exactly in the near, pool-limited
+     * regime the metric exists to measure. Only committed flips mark.
+     */
+    private markDisplayed;
     private removeLeafRefs;
     /** pages tier 1+2 may occupy; leaves headroom for in-flight fetchers */
     private poolGuardLimit;

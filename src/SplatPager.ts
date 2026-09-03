@@ -192,6 +192,29 @@ export class PagedSplats implements SplatSource {
     return this.rootUrl.replace(/-lod-0\./, `-lod-${chunk}.`);
   }
 
+  // Kroscloud fork [ssog-24]: optional request-side cancellation hooks. A
+  // source that can abort an in-flight fetchDecodeChunk implements
+  // cancelFetchChunk (the pager calls it for fetchers whose chunk left
+  // fetchPriority) and fetchProgress (0..1 download progress of that chunk's
+  // transfer, null = unknown; the pager skips cancelling nearly-complete
+  // transfers). Upstream sources implement neither and are never cancelled.
+  //
+  // fetchGroup reports the SHARED TRANSFER a chunk rides on (ssog: its unit
+  // file set). Cancelling a fetcher kills the whole group, so the pager
+  // never cancels while another chunk of the same group is still wanted —
+  // that "saving" would re-download the group from byte 0. null / absent =
+  // the chunk has a transfer of its own.
+  //
+  // resumeFetchChunk re-acquires the transfer of a chunk that was cancelled
+  // and then became wanted again before its fetch rejected; true = the
+  // in-flight transfer is the caller's again (the pager clears the cancelled
+  // flag so a later sibling cancel cannot abort it out from under a wanted
+  // fetcher), false = it is gone and the fetcher stays cancelled.
+  cancelFetchChunk?(chunk: number): void;
+  fetchProgress?(chunk: number): number | null;
+  fetchGroup?(chunk: number): number | null;
+  resumeFetchChunk?(chunk: number): boolean;
+
   async fetchDecodeChunk(chunk: number) {
     let decodeBytes = undefined;
 
@@ -637,7 +660,15 @@ export class SplatPager {
     lodTree?: Uint32Array;
   }[];
 
-  fetchers: { splats: PagedSplats; chunk: number; promise: Promise<void> }[];
+  fetchers: {
+    splats: PagedSplats;
+    chunk: number;
+    promise: Promise<void>;
+    /** [ssog-24] consecutive fetchPriority lists that did not want the chunk */
+    missCount: number;
+    /** [ssog-24] cancelFetchChunk was issued for this fetcher */
+    cancelled: boolean;
+  }[];
   fetched: {
     splats: PagedSplats;
     chunk: number;
@@ -1396,6 +1427,14 @@ export class SplatPager {
 
       if (numPages < this.maxPages && this.fetchers.length < this.numFetchers) {
         numPages += 1;
+        this.noteFetchStart(splats, chunk);
+        const fetcher = {
+          splats,
+          chunk,
+          promise: undefined as unknown as Promise<void>,
+          missCount: 0,
+          cancelled: false,
+        };
         const promise = splats
           .fetchDecodeChunk(chunk)
           .then(
@@ -1409,6 +1448,14 @@ export class SplatPager {
               }
             },
             async (error) => {
+              // [ssog-24] a cancelled fetch rejects by design (AbortError):
+              // free the slot at once — no warning, no backoff.
+              if (
+                fetcher.cancelled ||
+                (error as { name?: unknown } | null)?.name === "AbortError"
+              ) {
+                return;
+              }
               console.warn(error);
               const backoff = 250 + 500 * Math.random();
               await new Promise((resolve) => setTimeout(resolve, backoff));
@@ -1420,14 +1467,115 @@ export class SplatPager {
             );
             this.processFetched();
           });
+        fetcher.promise = promise;
         // Add self to active fetchers list
-        this.fetchers.push({ splats, chunk, promise });
+        this.fetchers.push(fetcher);
 
         promise.then((data) => {
           if (this.autoDrive) {
             this.driveFetchers();
           }
         });
+      }
+    }
+
+    // [ssog-24] request-side cancellation: an in-flight fetcher whose chunk
+    // is absent from the CURRENT fetchPriority is a superseded target (the
+    // controller lists tiers 1-2 every tick, so displayed/pinned chunks can
+    // never qualify). Misses are counted once per DISTINCT priority list —
+    // the completion-driven refill re-drives the same list several times
+    // per tick — and a chunk must be missing from two consecutive lists
+    // (grace against single-tick jitter) before its source is asked to
+    // abort; transfers ≥ 75% received are left to finish (their bytes are
+    // spent, and the arrival is dropped on the floor by [ssog-21] if still
+    // unwanted). Only sources implementing cancelFetchChunk take part.
+    //
+    // [ssog-24 fix B] A cancel kills the fetcher's whole fetchGroup (the ssog
+    // unit download every chunk of the unit shares), so a fetcher is spared
+    // whenever ANY chunk of the CURRENT wanted set belongs to its group —
+    // otherwise the wanted sibling that has not been given a fetcher slot yet
+    // would restart the group from byte 0, a "saving" that costs bytes.
+    // [ssog-24 fix C] A cancelled fetcher whose chunk is wanted again is
+    // re-leased (resumeFetchChunk) and un-cancelled, so a later sibling
+    // cancel cannot abort a transfer a wanted fetcher depends on.
+    {
+      const list = this.fetchPriority;
+      if (this.wantedCache?.list !== list) {
+        const wanted = new Map<PagedSplats, Set<number>>();
+        const groups = new Map<PagedSplats, Set<number>>();
+        for (const { splats, chunk } of list) {
+          let set = wanted.get(splats);
+          if (!set) {
+            set = new Set();
+            wanted.set(splats, set);
+          }
+          set.add(chunk);
+          // [ssog-24 fix B2] Only a chunk that still NEEDS a transfer may
+          // protect its group. A resident chunk (already in the pool) and one
+          // whose data is sitting in the fetched queue await nothing — letting
+          // them into the group set suppressed cancels that would have cost
+          // nothing, over-shooting fix B's "never abort a transfer a wanted
+          // sibling rides on" into "never abort anything near a wanted
+          // sibling". The wanted-CHUNK set above stays complete: it drives
+          // missCount, which must reflect the real priority list.
+          if (splats.fetchGroup && !this.getSplatsChunk(splats, chunk)) {
+            const alreadyFetched = this.fetched.some(
+              ({ splats: s, chunk: c }) => splats === s && chunk === c,
+            );
+            if (!alreadyFetched) {
+              const group = splats.fetchGroup(chunk);
+              if (group !== null && group !== undefined) {
+                let gset = groups.get(splats);
+                if (!gset) {
+                  gset = new Set();
+                  groups.set(splats, gset);
+                }
+                gset.add(group);
+              }
+            }
+          }
+        }
+        this.wantedCache = { list, wanted, groups };
+        this.listTick += 1;
+        for (const fetcher of this.fetchers) {
+          if (wanted.get(fetcher.splats)?.has(fetcher.chunk)) {
+            fetcher.missCount = 0;
+            if (fetcher.cancelled) {
+              // wanted again before the abort surfaced: take the transfer back
+              if (fetcher.splats.resumeFetchChunk?.(fetcher.chunk)) {
+                fetcher.cancelled = false;
+                // [ssog-24 fix F] the cancel was taken back and cost nothing:
+                // drop its stamp so noteFetchStart cannot later score this
+                // chunk as cancel→refetch thrash it never was.
+                this.clearCancelTick(fetcher.splats, fetcher.chunk);
+              }
+            }
+            continue;
+          }
+          fetcher.missCount += 1;
+          if (
+            fetcher.missCount < 2 ||
+            fetcher.cancelled ||
+            !fetcher.splats.cancelFetchChunk
+          ) {
+            continue;
+          }
+          const group = fetcher.splats.fetchGroup?.(fetcher.chunk);
+          if (
+            group !== null &&
+            group !== undefined &&
+            groups.get(fetcher.splats)?.has(group)
+          ) {
+            continue; // a wanted chunk still rides this transfer
+          }
+          if ((fetcher.splats.fetchProgress?.(fetcher.chunk) ?? 0) >= 0.75) {
+            continue;
+          }
+          fetcher.cancelled = true;
+          fetcher.splats.cancelFetchChunk(fetcher.chunk);
+          this.fetchCancels += 1;
+          this.noteCancelTick(fetcher.splats, fetcher.chunk);
+        }
       }
     }
 
@@ -1461,6 +1609,81 @@ export class SplatPager {
   chunkRefetches = 0;
   private everResident: WeakMap<object, Set<number>> = new WeakMap();
 
+  /**
+   * [ssog-24] in-flight fetchers asked to cancel (chunk-level requests; the
+   * ssog cache's `fetchCancels` counts the UNIT downloads actually aborted).
+   */
+  fetchCancels = 0;
+  /**
+   * [ssog-24] cancel→refetch thrash: a chunk whose fetch was cancelled and
+   * that is fetched AGAIN within `cancelCooldownTicks` pager ticks (distinct
+   * fetchPriority lists) of that cancel. Under continuous motion a cancel
+   * lever can churn instead of save; without this counter that churn hides
+   * inside the bandwidth total and looks like ordinary streaming.
+   */
+  cancelRefetches = 0;
+  /** [ssog-24] window (in distinct fetchPriority lists) for cancelRefetches */
+  cancelCooldownTicks = 8;
+  /** [ssog-24] distinct fetchPriority lists seen — the pager's tick clock */
+  private listTick = 0;
+  /** [ssog-24] splats → chunk → listTick at which its fetch was cancelled */
+  private cancelTick: WeakMap<object, Map<number, number>> = new WeakMap();
+
+  private noteCancelTick(splats: PagedSplats, chunk: number) {
+    let map = this.cancelTick.get(splats as object);
+    if (!map) {
+      map = new Map<number, number>();
+      this.cancelTick.set(splats as object, map);
+    }
+    map.set(chunk, this.listTick);
+    if (map.size > 1024) {
+      // bounded: entries older than the cooldown can never score a refetch
+      for (const [c, tick] of map) {
+        if (this.listTick - tick > this.cancelCooldownTicks) {
+          map.delete(c);
+        }
+      }
+    }
+  }
+
+  /**
+   * [ssog-24 fix F] Forget a chunk's cancel stamp — used when a cancel is
+   * TAKEN BACK (resumeFetchChunk succeeded): no bytes were lost, so a later
+   * fetch of that chunk must not be scored as cancel→refetch thrash.
+   */
+  private clearCancelTick(splats: PagedSplats, chunk: number) {
+    this.cancelTick.get(splats as object)?.delete(chunk);
+  }
+
+  /** [ssog-24] a fetcher slot is being opened for (splats, chunk) */
+  private noteFetchStart(splats: PagedSplats, chunk: number) {
+    const map = this.cancelTick.get(splats as object);
+    if (!map) {
+      return;
+    }
+    const tick = map.get(chunk);
+    if (tick === undefined) {
+      return;
+    }
+    map.delete(chunk);
+    if (this.listTick - tick <= this.cancelCooldownTicks) {
+      this.cancelRefetches += 1;
+    }
+  }
+  /**
+   * [ssog-24] eviction hook: called with the (splats, chunk) of every
+   * resident page freed to make room for an arrival — never for
+   * clear/dispose. The ssog controller prices never-displayed evictions.
+   */
+  onPageEvicted?: (splats: PagedSplats, chunk: number) => void;
+  /** [ssog-24] wanted-set of the last DISTINCT fetchPriority list seen */
+  private wantedCache?: {
+    list: { splats: PagedSplats; chunk: number }[];
+    wanted: Map<PagedSplats, Set<number>>;
+    /** [ssog-24] fetchGroup ids covered by the wanted set, per source */
+    groups: Map<PagedSplats, Set<number>>;
+  };
+
   private allocateFreeable(): number | undefined {
     const page = this.freeablePages.shift();
     if (page === undefined) {
@@ -1475,6 +1698,7 @@ export class SplatPager {
     }
 
     const { splats, chunk } = splatsChunk;
+    this.onPageEvicted?.(splats, chunk);
     this.removeSplatsChunkPage(splats, chunk, page);
     this.lodTreeUpdates.push({
       splats,

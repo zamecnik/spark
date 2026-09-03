@@ -1,6 +1,17 @@
 import { PcSogsJson, PcSogsV2Json } from './SplatLoader';
 import { SplatEncoding } from './defines';
-export declare function unpackPcSogs(json: PcSogsJson | PcSogsV2Json, extraFiles: Record<string, ArrayBuffer>, splatEncoding: SplatEncoding): Promise<{
+export type DecodedImage = {
+    rgba: Uint8Array;
+    width: number;
+    height: number;
+};
+export declare function unpackPcSogs(json: PcSogsJson | PcSogsV2Json, extraFiles: Record<string, ArrayBuffer>, splatEncoding: SplatEncoding, options?: {
+    /**
+     * [ssog-22] decoded shared SH palette (shN_centroids image) for units that
+     * carry labels only (`json.shN.palette` set, one file in `shN.files`).
+     */
+    centroidsImage?: Promise<DecodedImage> | DecodedImage;
+}): Promise<{
     packedArray: Uint32Array;
     numSplats: number;
     extra: Record<string, unknown>;

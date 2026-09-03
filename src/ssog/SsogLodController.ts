@@ -98,6 +98,29 @@ export interface SsogLodControllerOptions {
    * selectionAndBalance.
    */
   fillPageCap?: number;
+  /**
+   * [ssog-23] selection policy. "bands" = the shipped supersplat port
+   * (distance bands rescaled by budgetScale feedback, then promote-to-fill
+   * up to the budget). "sse" = screen-space-error termination: the bands are
+   * calibrated in PIXELS from the scene's own L0 splat spacing (L1 acceptable
+   * once its merge error projects to <= e px, level multiplier sqrt(2)),
+   * there is no budgetScale feedback, and the promote-to-fill legs never
+   * refine a leaf past the level the error rule allows; budget and pool
+   * stay ceilings. Default "bands" (byte-identical to kroscloud.31).
+   */
+  lodMode?: "bands" | "sse";
+  /** [ssog-23] sse: error tolerance in CSS pixels at rest (default 2) */
+  sseErrorPx?: number;
+  /**
+   * [ssog-23] sse: error tolerance while the camera moves and for
+   * sseDwellMs after it stops (default 4). 0 or <= sseErrorPx disables the
+   * base phase.
+   */
+  sseBaseErrorPx?: number;
+  /** [ssog-23] sse: dwell before switching from base to fine (ms, default 1500) */
+  sseDwellMs?: number;
+  /** [ssog-23] sse: viewport height in CSS pixels (default 1080; see setViewportHeight) */
+  viewportHeightPx?: number;
 }
 
 interface FetchPriorityEntry {
@@ -121,6 +144,24 @@ export class SsogLodController {
   paramsDirty = false;
 
   budgetScale = 1;
+
+  /** [ssog-23] selection policy (see SsogLodControllerOptions.lodMode) */
+  readonly lodMode: "bands" | "sse";
+  private sseErrorPx: number;
+  private sseBaseErrorPx: number;
+  private sseDwellMs: number;
+  private viewportHeightPx: number;
+  /**
+   * [ssog-23] L1's geometric error in MESH-LOCAL units: half the level-1
+   * splat spacing = 0.5 * s0 * sqrt(2), s0 = the scene-median L0 spacing per
+   * leaf (extent_max / sqrt(rows)). Level l's error is err1 * sqrt(2)^(l-1),
+   * so "coarsest level whose projected error <= e px" is exactly the bands
+   * formula with d0 = err1 * f_px / e and multiplier sqrt(2).
+   */
+  private readonly sseErr1: number;
+  /** [ssog-23] last controller tick that observed camera motion (ms) */
+  private lastMotionMs = Number.NEGATIVE_INFINITY;
+  private ssePhase: "base" | "fine" = "fine";
 
   /**
    * [ssog-15] moved-gate override in MESH-LOCAL units (null = default
@@ -155,6 +196,17 @@ export class SsogLodController {
   private readonly balancedLevel: Int32Array;
   private readonly bucketOf: Int32Array;
   private readonly dBucket: Float64Array;
+  /**
+   * [ssog-25] orbit-centric ordering: per-leaf distance from the INTEREST
+   * point (the camera's orbit target, mesh-local), refreshed by every
+   * selection while `interest` is set. Orders the page-capped grows and
+   * the tier-3 fetch staging in place of dBucket; never the level rule,
+   * never the budget demotion.
+   */
+  private readonly tBucket: Float64Array;
+  /** [ssog-25] WORLD-space interest point (null = camera-centric) */
+  private interest: THREE.Vector3 | null = null;
+  private readonly tmpInterest = new THREE.Vector3();
   /**
    * [B4] controller tick at which a pending GROW leaf first became ready
    * while its unit-file wave was still incomplete (−1 = not held). Bounds
@@ -218,6 +270,13 @@ export class SsogLodController {
    * so grow flips that would overflow the pool are deferred instead.
    */
   private chunkRefs: Map<number, number> = new Map();
+
+  /**
+   * [ssog-24] chunks that entered chunkRefs (pin or flip) during their
+   * CURRENT residency — cleared on eviction. A page evicted without ever
+   * having been displayed was a wasted download (wastedChunks/wastedBytes).
+   */
+  private readonly everDisplayed: Set<number> = new Set();
 
   /** pinned coarsest chunk ids (computed once) */
   private readonly pinnedChunks: number[];
@@ -300,6 +359,76 @@ export class SsogLodController {
     revealTotalBlocks: 0,
     /** [ssog-20] leaves whose resolved-coarsest ref is outside the pin tier */
     revealHoleLeaves: 0,
+    /** [ssog-23] selection policy in force */
+    lodMode: "bands" as string,
+    /** [ssog-25] "target" while an interest point orders the fill, else "camera" */
+    interestMode: "camera" as string,
+    /**
+     * [ssog-25] grows deferred by capacity or the pool guard that sat in the
+     * NEARER half of the ordered grow list — the subject's share of the
+     * deferrals. Non-zero at rest means the subject is being held back by
+     * the cap, not by the ordering.
+     */
+    subjectDeferrals: 0,
+    /** [ssog-23] L1 geometric error (mesh-local units) the sse mode calibrated */
+    sseErr1: 0,
+    /** [ssog-23] error tolerance (CSS px) the last selection ran at */
+    sseErrorPx: 0,
+    /** [ssog-23] "base" while moving / before dwell, "fine" at rest */
+    ssePhase: "fine" as string,
+    /** [ssog-23] distance (world units) from which L1 is acceptable at the last selection */
+    sseD0: 0,
+    /** [ssog-24] unit downloads aborted (no in-flight chunk still wanted) — cache mirror */
+    fetchCancels: 0,
+    /** [ssog-24] EXACT Σ over aborted units of (known size − received) — cache mirror */
+    cancelSavedBytes: 0,
+    /**
+     * [ssog-24 fix E] modelled saving of the same aborts — cache mirror.
+     * Cancels are admitted early, before Content-Length headers exist, so the
+     * exact counter above reads 0 over a whole soak; this one estimates the
+     * unit's total from the running bytes-per-splat mean of completed units.
+     */
+    cancelSavedEstimateBytes: 0,
+    /**
+     * [ssog-24 fix D] WIRE bytes (PerformanceResourceTiming.transferSize,
+     * body-sum fallback) — cache mirror. 0 for a file served from the HTTP
+     * cache; compressed octets for a gzip'd meta.json.
+     */
+    bytesReceived: 0,
+    /** [ssog-24 fix D] DECODED body bytes read — cache mirror, NOT the wire */
+    decodedBytesReceived: 0,
+    /**
+     * [ssog-22 fix] shared SH palette files fetched — cache mirror. The build
+     * writes one per LEVEL, so this settles at the number of distinct levels
+     * touched; higher means the per-path memo is thrashing.
+     */
+    paletteFetches: 0,
+    /** [ssog-24] pager pages evicted whose chunk was never displayed while resident */
+    wastedChunks: 0,
+    /** [ssog-24] estimate for wastedChunks: unit bytes / blocks in the unit */
+    wastedBytes: 0,
+    /** [ssog-24] chunk-level cancel requests the pager issued — pager mirror */
+    chunkCancels: 0,
+    /**
+     * [ssog-24] chunks re-fetched within the pager's cancel cooldown of their
+     * own cancel — pager mirror. Non-zero = the cancel lever is thrashing
+     * under motion (bytes spent twice) rather than saving.
+     */
+    cancelRefetches: 0,
+    /**
+     * [ssog-24] responses seen with no Content-Length — cache mirror. While
+     * such a file is in flight its unit reports NO progress, so the ≥75%
+     * skip is measuring blind rather than finding nothing to save.
+     */
+    filesWithoutLength: 0,
+    /**
+     * [ssog-24 r4] settled files whose true WIRE size could not be read (no
+     * resource-timing entry, or a cross-origin response without
+     * Timing-Allow-Origin), so the higher decoded body sum was billed into
+     * bytesReceived instead. Non-zero means the byte figures are an
+     * over-estimate, not that little was transferred.
+     */
+    filesWithoutWireSize: 0,
   };
 
   constructor(options: SsogLodControllerOptions) {
@@ -344,7 +473,42 @@ export class SsogLodController {
     this.balancedLevel = new Int32Array(this.NL);
     this.bucketOf = new Int32Array(this.NL);
     this.dBucket = new Float64Array(this.NL);
+    this.tBucket = new Float64Array(this.NL);
     this.readySinceTick = new Int32Array(this.NL).fill(-1);
+
+    // [ssog-23] SSE calibration from the artifact itself: median L0 leaf
+    // spacing (extent_max / sqrt(L0 rows), PRE-resolution refs so resolved
+    // aliases don't count). Measured on the 19.92M reference scene: 0.314 m.
+    this.lodMode = options.lodMode === "sse" ? "sse" : "bands";
+    this.sseErrorPx = Math.max(0.1, options.sseErrorPx ?? 2);
+    this.sseBaseErrorPx = options.sseBaseErrorPx ?? 4;
+    this.sseDwellMs = Math.max(0, options.sseDwellMs ?? 1500);
+    this.viewportHeightPx = Math.max(64, options.viewportHeightPx ?? 1080);
+    {
+      const L = this.L;
+      const spacings: number[] = [];
+      const bounds = model.boundsFlat;
+      for (let li = 0; li < this.NL; li++) {
+        const o = li * 6;
+        const ext = Math.max(
+          bounds[o + 3] - bounds[o],
+          bounds[o + 4] - bounds[o + 1],
+          bounds[o + 5] - bounds[o + 2],
+        );
+        const n0 =
+          model.leafLodsPre[li * L * 3] >= 0
+            ? model.leafLodsPre[li * L * 3 + 2]
+            : 0;
+        if (n0 > 0 && ext > 0) {
+          spacings.push(ext / Math.sqrt(n0));
+        }
+      }
+      spacings.sort((a, b) => a - b);
+      const s0 = spacings.length > 0 ? spacings[spacings.length >> 1] : 1;
+      this.sseErr1 = 0.5 * s0 * Math.SQRT2;
+      this.stats.sseErr1 = this.sseErr1;
+      this.stats.lodMode = this.lodMode;
+    }
 
     this.cut = new Uint32Array(this.splats.capacitySplats);
 
@@ -371,6 +535,29 @@ export class SsogLodController {
     this.bucketStart = new Int32Array(65);
     this.bucketCursor = new Int32Array(64);
     const pager = this.splats.pager;
+    // [ssog-24] wasted-download telemetry: a page evicted whose chunk never
+    // entered a displayed cut during this residency was fetched for nothing.
+    // Priced at the unit's received bytes spread evenly over its blocks (0
+    // when the unit's bytes are not remembered). Decides the eviction-order
+    // lever of the request-side tier (2026-09-02 research D10).
+    if (pager) {
+      pager.onPageEvicted = (s, c) => {
+        if (s !== this.splats) {
+          return;
+        }
+        const displayed = this.everDisplayed.delete(c);
+        if (displayed) {
+          return;
+        }
+        this.stats.wastedChunks += 1;
+        const { unit } = model.unitOfChunk(c);
+        const bytes = this.splats.cache.unitBytes(unit);
+        const blocks = model.blockBase[unit + 1] - model.blockBase[unit];
+        if (bytes && blocks > 0) {
+          this.stats.wastedBytes += bytes / blocks;
+        }
+      };
+    }
     if (pager && pager.maxPages < model.totalBlocks) {
       const margin = model.maxLeafBlockFootprint + pager.numFetchers;
       const guard = this.poolGuardLimit();
@@ -429,6 +616,7 @@ export class SsogLodController {
     if (this.detached) {
       return;
     }
+    this.syncByteStats();
     if (this.phase === "reveal") {
       this.revealTick(camera);
       return;
@@ -465,6 +653,17 @@ export class SsogLodController {
       refillPager.fetchers.length < refillPager.numFetchers
     ) {
       refillPager.driveFetchers();
+    }
+    // [ssog-23] dwell expiry: a converged base-phase cut must re-select at
+    // the fine tolerance once the camera has rested long enough — the
+    // motion/resource gates cannot re-open from a still pose, so this is
+    // the only path from "base" to "fine".
+    if (
+      this.lodMode === "sse" &&
+      this.ssePhase === "base" &&
+      performance.now() - this.lastMotionMs >= this.sseDwellMs
+    ) {
+      this.paramsDirty = true;
     }
     this.frameCounter += 1;
     if (this.frameCounter < this.metronomeFrames) {
@@ -523,6 +722,43 @@ export class SsogLodController {
   }
 
   /**
+   * [ssog-25] Orbit-centric ordering. `point` is the camera's ORBIT TARGET in
+   * WORLD space (converted into the mesh frame with the same matrix the
+   * camera goes through); null restores the camera-centric order — the
+   * shipped behaviour, and the right one inside a first-person viewpoint,
+   * where the eye IS the target. Changes ONLY the order in which the
+   * page-capped grows and the tier-3 fetch staging are served (distance
+   * from this point instead of from the camera): never the level rule and
+   * never the budget demotion — measured on the 20M scene, target-ordering
+   * the demotion coarsens the subject (docs/features/gaussian-splatting/
+   * orbit-centric-lod-proposal-2026-09.md). Under orbit the key does not
+   * move with the camera, which also halves the per-step refetch
+   * (sim: 55 -> 28 units per 30 degrees at 144 m). No tick is forced: a
+   * target only moves together with the camera, which ticks anyway.
+   */
+  setInterest(point: { x: number; y: number; z: number } | null) {
+    if (
+      point &&
+      Number.isFinite(point.x) &&
+      Number.isFinite(point.y) &&
+      Number.isFinite(point.z)
+    ) {
+      if (!this.interest) {
+        this.interest = new THREE.Vector3(point.x, point.y, point.z);
+      } else {
+        this.interest.set(point.x, point.y, point.z);
+      }
+    } else {
+      this.interest = null;
+    }
+  }
+
+  /** [ssog-25] ordering key: interest distance when set, else camera distance */
+  private orderKey(li: number): number {
+    return this.interest ? this.tBucket[li] : this.dBucket[li];
+  }
+
+  /**
    * [ssog-19] Hold/release tier-3 fetch staging across a scripted camera
    * flight (see the fetchHold field). Release forces a tick so the arrival
    * cut stages without waiting for a motion gate.
@@ -536,6 +772,48 @@ export class SsogLodController {
     if (!next) {
       this.paramsDirty = true;
     }
+  }
+
+  /**
+   * [ssog-23] Viewport height in CSS pixels — the sse projection's f_px.
+   * CSS pixels on purpose (Cesium divides its SSE by pixelRatio for the same
+   * reason): a DPR-3 phone must not fetch more than a desktop.
+   */
+  setViewportHeight(px: number) {
+    const next = Math.max(64, Number.isFinite(px) ? px : 1080);
+    if (next === this.viewportHeightPx) {
+      return;
+    }
+    this.viewportHeightPx = next;
+    if (this.lodMode === "sse") {
+      this.paramsDirty = true;
+    }
+  }
+
+  /** [ssog-23] runtime dials (A/B): fine tolerance, base tolerance, dwell */
+  setSseError(finePx: number, basePx?: number, dwellMs?: number) {
+    if (Number.isFinite(finePx) && finePx > 0) {
+      this.sseErrorPx = finePx;
+    }
+    if (typeof basePx === "number" && Number.isFinite(basePx)) {
+      this.sseBaseErrorPx = basePx;
+    }
+    if (typeof dwellMs === "number" && Number.isFinite(dwellMs)) {
+      this.sseDwellMs = Math.max(0, dwellMs);
+    }
+    if (this.lodMode === "sse") {
+      this.paramsDirty = true;
+    }
+  }
+
+  /** [ssog-23] the tolerance the next selection will use */
+  private sseTolerance(): number {
+    const baseActive =
+      this.sseDwellMs > 0 &&
+      this.sseBaseErrorPx > this.sseErrorPx &&
+      performance.now() - this.lastMotionMs < this.sseDwellMs;
+    this.ssePhase = baseActive ? "base" : "fine";
+    return baseActive ? this.sseBaseErrorPx : this.sseErrorPx;
   }
 
   // ---- gates ---------------------------------------------------------------
@@ -596,6 +874,28 @@ export class SsogLodController {
     this.lastPose.fov = camera.fov;
   }
 
+  /**
+   * [ssog-24] mirror the byte counters of the unit cache and the pager into
+   * stats every frame (not per tick: downloads finish and abort between
+   * ticks, and a converged controller stops ticking while transfers drain).
+   */
+  private syncByteStats() {
+    const cs = this.splats.cache.stats;
+    this.stats.fetchCancels = cs.fetchCancels;
+    this.stats.cancelSavedBytes = cs.cancelSavedBytes;
+    this.stats.cancelSavedEstimateBytes = cs.cancelSavedEstimateBytes;
+    this.stats.bytesReceived = cs.bytesReceived;
+    this.stats.decodedBytesReceived = cs.decodedBytesReceived;
+    this.stats.paletteFetches = cs.paletteFetches;
+    this.stats.filesWithoutLength = cs.filesWithoutLength;
+    this.stats.filesWithoutWireSize = cs.filesWithoutWireSize;
+    const pager = this.splats.pager;
+    if (pager) {
+      this.stats.chunkCancels = pager.fetchCancels;
+      this.stats.cancelRefetches = pager.cancelRefetches;
+    }
+  }
+
   // ---- §2.3 pump contract --------------------------------------------------
 
   private pump(priority: FetchPriorityEntry[]) {
@@ -644,6 +944,20 @@ export class SsogLodController {
   private addLeafRefs(li: number, level: number) {
     this.forEachLeafChunk(li, level, (c) => {
       this.chunkRefs.set(c, (this.chunkRefs.get(c) ?? 0) + 1);
+    });
+  }
+
+  /**
+   * [ssog-24] Mark a (leaf, level) ref's chunks as HAVING BEEN DISPLAYED.
+   * Deliberately NOT folded into addLeafRefs: the grow path adds refs
+   * TENTATIVELY and reverts them when the block-aware pool guard rejects the
+   * flip, so marking there counted chunks that were never composed and made
+   * wastedChunks/wastedBytes undercount exactly in the near, pool-limited
+   * regime the metric exists to measure. Only committed flips mark.
+   */
+  private markDisplayed(li: number, level: number) {
+    this.forEachLeafChunk(li, level, (c) => {
+      this.everDisplayed.add(c);
     });
   }
 
@@ -816,6 +1130,7 @@ export class SsogLodController {
     this.chunkRefs.clear();
     for (const chunk of this.pinnedChunks) {
       this.chunkRefs.set(chunk, 1); // permanent pin ref
+      this.everDisplayed.add(chunk);
     }
     let holes = 0;
     for (let li = 0; li < this.NL; li++) {
@@ -835,6 +1150,11 @@ export class SsogLodController {
       this.displayedTotal +=
         model.leafLods[(li * this.L + this.L - 1) * 3 + 2];
       this.addLeafRefs(li, this.L - 1);
+      // [ssog-24] the reveal cut IS displayed. Redundant with the pinned adds
+      // above (a pinnedResident leaf's refs live in a coarsest-LEVEL unit, and
+      // pinnedChunks is every block of every such unit) — kept so "displayed"
+      // never depends on that superset argument holding.
+      this.markDisplayed(li, this.L - 1);
     }
     this.desired.set(this.displayed);
     this.stats.revealHoleLeaves = holes;
@@ -866,6 +1186,23 @@ export class SsogLodController {
     this.tickCount += 1;
 
     const uniformScale = this.cameraLocal(camera);
+
+    // [ssog-23] motion bookkeeping for the base/fine dwell phases: a tick
+    // that sees a real pose change (the same thresholds the motion gates
+    // use) stamps lastMotionMs; sseTolerance() reads it inside selection.
+    if (this.lodMode === "sse" && this.lastPose.valid) {
+      const moveGate =
+        this.moveGateOverride ?? this.moveGateFactor * this.lodBaseDistance;
+      if (
+        this.tmpPos.distanceTo(this.lastPose.pos) > moveGate ||
+        Math.abs(this.tmpQuat.dot(this.lastPose.quat)) < Math.SQRT1_2 ||
+        Math.abs(camera.fov - this.lastPose.fov) >
+          0.02 * Math.max(1e-6, this.lastPose.fov)
+      ) {
+        this.lastMotionMs = performance.now();
+      }
+    }
+
     this.selectionAndBalance(camera, uniformScale);
 
     // [ssog-19] inner-loop budgetScale settling: the multi-tick feedback
@@ -938,7 +1275,9 @@ export class SsogLodController {
           pendingLeaves.push(li);
         }
       }
-      pendingLeaves.sort((a, b) => this.dBucket[a] - this.dBucket[b]);
+      // [ssog-25] nearest to the interest point when the app set one
+      // (orbit target), else nearest to the camera: the subject downloads first
+      pendingLeaves.sort((a, b) => this.orderKey(a) - this.orderKey(b));
 
       const stage: number[] = [];
       let staged = true;
@@ -1171,8 +1510,35 @@ export class SsogLodController {
     const fovScale =
       Math.min(tanHalfV, tanHalfH) / Math.tan((22.5 * Math.PI) / 180);
 
-    const d0 = this.lodBaseDistance * this.budgetScale;
-    const mPrime = Math.max(1.2, 3 * this.budgetScale ** -0.2);
+    // [ssog-25] interest point into the mesh frame (tmpMat = mesh inverse,
+    // refreshed by cameraLocal at the top of this tick) — the ordering key
+    // below is the closest-point distance from it, no behind penalty, no
+    // FOV scale: it ranks, it does not select.
+    const interest = this.interest
+      ? this.tmpInterest.copy(this.interest).applyMatrix4(this.tmpMat)
+      : null;
+    this.stats.interestMode = interest ? "target" : "camera";
+
+    // [ssog-23] sse: bands calibrated in pixels, terminated. L1 is acceptable
+    // where its merge error err1 (mesh-local) projects to <= e px through
+    // f_px_ref = (viewportH/2)/tan(22.5deg) — db below already carries the
+    // camera FOV via fovScale (normalised to the 45deg reference) and the
+    // mesh world scale via uniformScale, so d0 is scaled by uniformScale
+    // too and the comparison db <= d0 is exactly err1*f_px/(d*penalty) <= e.
+    // Multiplier sqrt(2): each coarser level halves the rows, so its spacing
+    // (and merge error) grows by sqrt(2). No budgetScale feedback.
+    const sse = this.lodMode === "sse";
+    let sseD0 = 0;
+    if (sse) {
+      const e = this.sseTolerance();
+      const fpxRef = this.viewportHeightPx / 2 / Math.tan((22.5 * Math.PI) / 180);
+      sseD0 = (this.sseErr1 * uniformScale * fpxRef) / e;
+      this.stats.sseErrorPx = e;
+      this.stats.ssePhase = this.ssePhase;
+      this.stats.sseD0 = sseD0;
+    }
+    const d0 = sse ? sseD0 : this.lodBaseDistance * this.budgetScale;
+    const mPrime = sse ? Math.SQRT2 : Math.max(1.2, 3 * this.budgetScale ** -0.2);
     const logM = Math.log(mPrime);
 
     const rb = model.rootBound;
@@ -1214,6 +1580,17 @@ export class SsogLodController {
       // the SAME value drives selection AND bucketing.
       const db = d * penalty * fovScale * uniformScale;
       this.dBucket[li] = db;
+      if (interest) {
+        const tx =
+          Math.max(bounds[o], Math.min(interest.x, bounds[o + 3])) - interest.x;
+        const ty =
+          Math.max(bounds[o + 1], Math.min(interest.y, bounds[o + 4])) -
+          interest.y;
+        const tz =
+          Math.max(bounds[o + 2], Math.min(interest.z, bounds[o + 5])) -
+          interest.z;
+        this.tBucket[li] = Math.hypot(tx, ty, tz);
+      }
       this.bucketOf[li] = Math.min(
         63,
         Math.floor((64 * Math.sqrt(db)) / sqrtDMax),
@@ -1415,6 +1792,10 @@ export class SsogLodController {
             if (cur <= 0) {
               continue; // already finest
             }
+            if (sse && cur - 1 < this.optimalLevel[li]) {
+              // [ssog-23] termination: never finer than the error rule allows
+              continue;
+            }
             const curCount = model.leafLods[(li * L + cur) * 3 + 2];
             const finer = model.leafLods[(li * L + cur - 1) * 3 + 2];
             if (totalBalanced - curCount + finer > budget) {
@@ -1478,8 +1859,12 @@ export class SsogLodController {
     this.stats.pageLimit = wholeResident ? 0 : pageLimit;
 
     // ---- budgetScale feedback (verbatim constants) ------------------------
+    // [ssog-23] sse: no feedback — the pixel tolerance is the dial and the
+    // budget is a ceiling only; budgetScale stays 1 and never "moves".
     const ratio = totalOptimal / budget;
-    if (ratio > 1.4 || ratio < 0.6) {
+    if (sse) {
+      this.scaleMoved = false;
+    } else if (ratio > 1.4 || ratio < 0.6) {
       const before = this.budgetScale;
       this.budgetScale *= 1 + (1 / Math.sqrt(ratio) - 1) * 0.3;
       this.budgetScale = Math.max(0.01, Math.min(100, this.budgetScale));
@@ -1627,6 +2012,7 @@ export class SsogLodController {
     const applyFlip = (li: number, to: number) => {
       this.removeLeafRefs(li, this.displayed[li]); // no-op at level −1
       this.addLeafRefs(li, to);
+      this.markDisplayed(li, to); // [ssog-24] this flip COMMITS
       this.displayedTotal +=
         model.leafLods[(li * this.L + to) * 3 + 2] - this.displayedCount(li);
       this.displayed[li] = to;
@@ -1636,15 +2022,23 @@ export class SsogLodController {
     for (const li of readyShrink) {
       applyFlip(li, this.desired[li]);
     }
-    // nearest-first so pool headroom goes to the leaves that matter most
-    eligibleGrow.sort((a, b) => this.dBucket[a] - this.dBucket[b]);
-    for (const li of eligibleGrow) {
+    // nearest-first so pool headroom goes to the leaves that matter most —
+    // [ssog-25] nearest to the INTEREST point (orbit target) when the app set
+    // one, else to the camera. Demotion above stays camera-ordered on
+    // purpose (measured: target-ordering it coarsens the subject).
+    eligibleGrow.sort((a, b) => this.orderKey(a) - this.orderKey(b));
+    const subjectHalf = eligibleGrow.length >> 1;
+    for (let gi = 0; gi < eligibleGrow.length; gi++) {
+      const li = eligibleGrow[gi];
       const to = this.desired[li];
       const from = this.displayed[li];
       const delta =
         model.leafLods[(li * this.L + to) * 3 + 2] - this.displayedCount(li);
       if (this.displayedTotal + delta > this.splats.capacitySplats) {
         this.stats.capacityDeferrals += 1;
+        if (gi < subjectHalf) {
+          this.stats.subjectDeferrals += 1;
+        }
         continue;
       }
       // tentative block accounting; revert on pool-guard overflow
@@ -1654,8 +2048,14 @@ export class SsogLodController {
         this.removeLeafRefs(li, to);
         this.addLeafRefs(li, from);
         this.stats.poolDeferrals += 1;
+        if (gi < subjectHalf) {
+          this.stats.subjectDeferrals += 1;
+        }
         continue;
       }
+      // [ssog-24] past the pool guard the grow COMMITS — only now do these
+      // chunks count as displayed (the reverted branch above must not).
+      this.markDisplayed(li, to);
       this.displayedTotal += delta;
       this.displayed[li] = to;
       this.readySinceTick[li] = -1;

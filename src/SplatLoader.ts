@@ -529,6 +529,14 @@ export type PcSogsV2Json = {
     bands: number;
     codebook: number[];
     files: string[];
+    /**
+     * Kroscloud [ssog-22]: streamed-SOG units written against a shared
+     * per-level palette carry only their labels plane (files =
+     * ["shN_labels.webp"]) and name the shared centroids image relative to
+     * the ssog root ("palette/L3/shN_centroids.webp" for a level-3 unit).
+     * `count`/`codebook` are the palette's.
+     */
+    palette?: string;
   };
 };
 

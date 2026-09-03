@@ -278,45 +278,261 @@ class SsogModel {
     };
   }
 }
+const UNIT_BYTES_MAX = 4096;
 class SsogUnitCache {
   constructor(options) {
     this.units = /* @__PURE__ */ new Map();
-    this.stats = { fetches: 0, decodes: 0, evictions: 0, fetchErrors: 0 };
+    this.unitBytesMap = /* @__PURE__ */ new Map();
+    this.recordSeq = 0;
+    this.stats = {
+      fetches: 0,
+      decodes: 0,
+      evictions: 0,
+      fetchErrors: 0,
+      /** [ssog-24] unit downloads aborted (no in-flight chunk still wanted) */
+      fetchCancels: 0,
+      /**
+       * [ssog-24] EXACT saving: Σ over aborted units of (known size − received),
+       * counted ONLY for units whose every file size was already known at abort
+       * time. Never estimated into — see cancelSavedEstimateBytes.
+       */
+      cancelSavedBytes: 0,
+      /**
+       * [ssog-24 fix E] Modelled saving, superset of cancelSavedBytes: when a
+       * unit is aborted before its sizes are known (the common case — admitted
+       * cancels happen early, before Content-Length headers exist, which is why
+       * the exact counter reads 0 on a whole soak), the unit's total is
+       * estimated as (running mean bytes-per-splat over COMPLETED units) ×
+       * model.unitSplats[unit], minus what already arrived, clamped at ≥ 0.
+       */
+      cancelSavedEstimateBytes: 0,
+      /**
+       * [ssog-24 fix D] WIRE bytes: PerformanceResourceTiming.transferSize per
+       * file (0 on an HTTP-cache hit, compressed octets otherwise), falling back
+       * to the decoded body sum when no timing entry exists or transferSize is 0
+       * while bytes were read (a cross-origin response exposes transferSize only
+       * under Timing-Allow-Origin, which the CDN may not carry).
+       */
+      bytesReceived: 0,
+      /**
+       * [ssog-24 fix D] DECODED bytes read out of the response bodies — what
+       * bytesReceived used to hold. Post-gunzip, and counted in full even for a
+       * response served entirely from the HTTP cache, so it measures decode
+       * volume, NOT network transfer.
+       */
+      decodedBytesReceived: 0,
+      /**
+       * [ssog-22 fix] shared SH palette files actually fetched. The build writes
+       * one per level, so this should settle at the number of DISTINCT levels
+       * the session touched; anything higher means the per-path memo is
+       * thrashing and the ~1 MB centroids image is being re-downloaded.
+       */
+      paletteFetches: 0,
+      /**
+       * [ssog-24] responses that carried NO Content-Length (gzip'd meta.json is
+       * chunked). While such a file is in flight the unit's progress is
+       * unknowable, so unitProgress reports null and the pager treats the
+       * transfer as cancellable. A large value here means the byte-progress
+       * lever is measuring blind, not that there is nothing to save.
+       */
+      filesWithoutLength: 0,
+      /**
+       * [ssog-24 r4] settled files whose true wire size could not be read, so
+       * the (higher) decoded body sum was billed instead: no PerformanceResource
+       * Timing entry, or a cross-origin response without Timing-Allow-Origin.
+       * bytesReceived is an OVER-estimate by exactly these files' compression
+       * savings — a large value means the wire measurement is not working.
+       */
+      filesWithoutWireSize: 0
+    };
+    this.palettes = /* @__PURE__ */ new Map();
+    this.completedBytes = 0;
+    this.completedSplats = 0;
     this.model = options.model;
     this.baseUrl = options.baseUrl ?? "";
     this.withCredentials = options.withCredentials ?? false;
     this.maxUnits = Math.max(1, options.maxUnits ?? 3);
     this.splatEncoding = options.splatEncoding ?? defines.DEFAULT_SPLAT_ENCODING;
     this.resolver = options.resolveUrl ?? ((relativePath) => this.baseUrl + relativePath);
+    prepareTimingBuffer();
   }
-  /** Memoized unit decode. Blocks of one unit share a single fetch+decode. */
+  getPalette(rel) {
+    const existing = this.palettes.get(rel);
+    if (existing) {
+      return existing;
+    }
+    this.stats.paletteFetches += 1;
+    const promise = this.fetchFile(rel);
+    promise.catch(() => {
+      if (this.palettes.get(rel) === promise) {
+        this.palettes.delete(rel);
+      }
+    });
+    this.palettes.set(rel, promise);
+    return promise;
+  }
+  /**
+   * Memoized unit decode. Blocks of one unit share a single fetch+decode.
+   * [ssog-24] Every call on an IN-FLIGHT record registers one waiter; pair
+   * it with `release(unit)` if the caller stops wanting the unit before it
+   * settles (settled records ignore waiters).
+   */
   getUnit(unit) {
     const existing = this.units.get(unit);
     if (existing) {
       this.units.delete(unit);
       this.units.set(unit, existing);
+      if (!existing.settled) {
+        existing.waiters += 1;
+      }
       return existing.promise;
     }
     const record = {
+      id: ++this.recordSeq,
       promise: void 0,
-      settled: false
+      settled: false,
+      controller: new AbortController(),
+      waiters: 1,
+      received: 0,
+      receivedWire: 0,
+      expected: 0,
+      filesTotal: 0,
+      filesWithLength: 0,
+      fetchDone: false,
+      aborted: false
     };
-    record.promise = this.fetchDecodeUnit(unit).then(
+    record.promise = this.fetchDecodeUnit(unit, record).then(
       (decoded) => {
         record.settled = true;
+        this.rememberUnitBytes(unit, record.receivedWire);
         return decoded;
       },
       (error) => {
         if (this.units.get(unit) === record) {
           this.units.delete(unit);
         }
-        this.stats.fetchErrors += 1;
+        if (!record.aborted && !isAbortError(error)) {
+          this.stats.fetchErrors += 1;
+        }
         throw error;
       }
     );
     this.units.set(unit, record);
     this.evictOverflow();
     return record.promise;
+  }
+  /**
+   * [ssog-24] Drop one waiter of an IN-FLIGHT unit. When the last waiter
+   * leaves while bytes are still on the wire, the unit's downloads are
+   * aborted, the record is removed (a later getUnit re-fetches cleanly) and
+   * the saved bytes are accounted. A unit whose files have all arrived is
+   * left to finish its decode — nothing is saved by aborting it, and the
+   * settled decode stays useful in the LRU.
+   */
+  release(unit) {
+    const record = this.units.get(unit);
+    if (!record || record.settled) {
+      return;
+    }
+    record.waiters = Math.max(0, record.waiters - 1);
+    if (record.waiters > 0 || record.fetchDone) {
+      return;
+    }
+    record.aborted = true;
+    this.units.delete(unit);
+    this.stats.fetchCancels += 1;
+    const sizeKnown = record.filesTotal > 0 && record.filesWithLength >= record.filesTotal && record.expected > 0;
+    const exact = Math.max(0, record.expected - record.received);
+    this.stats.cancelSavedBytes += sizeKnown ? exact : 0;
+    if (sizeKnown) {
+      this.stats.cancelSavedEstimateBytes += exact;
+    } else {
+      const perSplat = this.bytesPerSplat();
+      const splats = this.model.unitSplats[unit] ?? 0;
+      const predicted = perSplat !== void 0 && splats > 0 ? perSplat * splats : 0;
+      this.stats.cancelSavedEstimateBytes += Math.max(
+        0,
+        predicted - record.received
+      );
+    }
+    record.controller.abort();
+  }
+  /**
+   * [ssog-24] Identity of the CURRENT in-flight record of a unit, or
+   * undefined when there is none (settled records are not leasable). Pair it
+   * with `retain(unit, id)` across a cancel so a re-lease can tell "the
+   * record I was awaiting" from "a new download of the same unit".
+   */
+  unitRecordId(unit) {
+    const record = this.units.get(unit);
+    return record && !record.settled ? record.id : void 0;
+  }
+  /**
+   * [ssog-24] Re-lease an IN-FLIGHT unit whose waiter this caller previously
+   * dropped (the pager's chunk became wanted again before its cancelled
+   * fetcher rejected). Returns true when a waiter was added — pair it with
+   * a later `release(unit)`. Returns false when the record is gone, settled
+   * or already aborted, or when `id` names a different record: the caller
+   * then stays cancelled and its chunk restarts through the normal path.
+   */
+  retain(unit, id) {
+    const record = this.units.get(unit);
+    if (!record || record.settled || record.aborted) {
+      return false;
+    }
+    if (id !== void 0 && record.id !== id) {
+      return false;
+    }
+    record.waiters += 1;
+    return true;
+  }
+  /**
+   * [ssog-24] Download progress of an in-flight unit: received/expected
+   * (0..1) only while EVERY started-or-pending file's size is known; null
+   * while any is not; 1 for a settled unit; null for a unit not in the
+   * cache. Mixing wire Content-Length with received body bytes across a set
+   * where some files report no length (a gzip'd meta.json is chunked, and
+   * the plane list is not even known until it is parsed) reads as ~1.0 and
+   * silently disables cancellation for the unit — the pager treats null as
+   * 0, i.e. cancellable, which is the safe direction for a byte lever.
+   */
+  unitProgress(unit) {
+    const record = this.units.get(unit);
+    if (!record) {
+      return null;
+    }
+    if (record.settled || record.fetchDone) {
+      return 1;
+    }
+    if (record.filesTotal <= 0 || record.filesWithLength < record.filesTotal || record.expected <= 0) {
+      return null;
+    }
+    return Math.min(1, record.received / record.expected);
+  }
+  /** [ssog-24] bytes received for a COMPLETED unit download, if remembered */
+  unitBytes(unit) {
+    return this.unitBytesMap.get(unit);
+  }
+  /** mean bytes per splat so far, or undefined until one unit has completed */
+  bytesPerSplat() {
+    return this.completedSplats > 0 ? this.completedBytes / this.completedSplats : void 0;
+  }
+  rememberUnitBytes(unit, bytes) {
+    const splats = this.model.unitSplats[unit];
+    if (bytes > 0 && splats > 0) {
+      this.completedBytes += bytes;
+      this.completedSplats += splats;
+    }
+    if (this.unitBytesMap.has(unit)) {
+      this.unitBytesMap.delete(unit);
+    }
+    this.unitBytesMap.set(unit, bytes);
+    if (this.unitBytesMap.size > UNIT_BYTES_MAX) {
+      const oldest = this.unitBytesMap.keys().next();
+      if (!oldest.done) {
+        this.unitBytesMap.delete(oldest.value);
+      }
+    }
   }
   /** Drop settled entries beyond maxUnits, oldest-touched first. */
   evictOverflow() {
@@ -335,9 +551,35 @@ class SsogUnitCache {
   }
   clear() {
     this.units.clear();
+    this.unitBytesMap.clear();
+    this.palettes.clear();
   }
-  async fetchFile(relativePath) {
+  /**
+   * Fetch one file under the signing hook. [ssog-24] The body is read as a
+   * stream so bytes are counted as they arrive (`stats.decodedBytesReceived`,
+   * plus the caller's sink) and an abort mid-body stops the transfer; the
+   * Content-Length, when the response carries one, is reported to the sink
+   * once the headers arrive; when it carries none (a compressed JSON
+   * response is chunked) `onEnd` reports the size the file turned out to
+   * have, so the record can stop calling itself blind once it completes.
+   * Aborts reject with the DOMException whose name is "AbortError".
+   *
+   * [ssog-24 fix D] The WIRE size is a separate question from the body size:
+   * body bytes are POST-gunzip (this tier turned gzip on for every unit
+   * meta.json) and count in full for a response served from the HTTP cache,
+   * which transferred nothing. Once the file settles its
+   * PerformanceResourceTiming.transferSize is preferred into
+   * `stats.bytesReceived` — 0 on a cache hit, compressed octets otherwise —
+   * and the body sum is the fallback when no entry exists or transferSize is
+   * 0 while bytes were read (cross-origin responses expose transferSize only
+   * with a Timing-Allow-Origin header, which the CDN may not carry).
+   */
+  async fetchFile(relativePath, signal, sink) {
+    var _a, _b, _c, _d, _e;
     const resolved = await this.resolver(relativePath);
+    if (signal == null ? void 0 : signal.aborted) {
+      throw abortError();
+    }
     const url = typeof resolved === "string" ? resolved : resolved.url;
     const headers = typeof resolved === "string" ? void 0 : resolved.headers;
     const request = new Request(url, {
@@ -345,18 +587,93 @@ class SsogUnitCache {
       credentials: this.withCredentials ? "include" : "same-origin"
     });
     this.stats.fetches += 1;
-    const response = await fetch(request);
+    const startedAt = typeof performance !== "undefined" ? performance.now() : 0;
+    const response = await fetch(request, signal ? { signal } : void 0);
     if (!response.ok || !response.body) {
       throw new Error(
         `Failed to fetch "${url}": ${response.status} ${response.statusText}`
       );
     }
-    return await response.arrayBuffer();
+    const lengthHeader = response.headers.get("content-length");
+    const encodingHeader = (response.headers.get("content-encoding") ?? "").trim().toLowerCase();
+    const encoded = encodingHeader !== "" && encodingHeader !== "identity";
+    let hadLength = false;
+    if (lengthHeader !== null && !encoded) {
+      const length = Number.parseInt(lengthHeader, 10);
+      if (Number.isFinite(length) && length >= 0) {
+        hadLength = true;
+        (_a = sink == null ? void 0 : sink.onLength) == null ? void 0 : _a.call(sink, length);
+      }
+    }
+    if (!hadLength) {
+      this.stats.filesWithoutLength += 1;
+    }
+    const reader = response.body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        if (value && value.byteLength > 0) {
+          chunks.push(value);
+          total += value.byteLength;
+          this.stats.decodedBytesReceived += value.byteLength;
+          (_b = sink == null ? void 0 : sink.onBytes) == null ? void 0 : _b.call(sink, value.byteLength);
+        }
+      }
+    } catch (error) {
+      this.stats.bytesReceived += total;
+      (_c = sink == null ? void 0 : sink.onWire) == null ? void 0 : _c.call(sink, total);
+      throw error;
+    }
+    let wire = wireSize(url, startedAt, total);
+    if (!wire.known) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      wire = wireSize(url, startedAt, total);
+    }
+    this.stats.bytesReceived += wire.bytes;
+    if (!wire.known) {
+      this.stats.filesWithoutWireSize += 1;
+    }
+    (_d = sink == null ? void 0 : sink.onWire) == null ? void 0 : _d.call(sink, wire.bytes);
+    (_e = sink == null ? void 0 : sink.onEnd) == null ? void 0 : _e.call(sink, total, hadLength);
+    if (chunks.length === 1 && chunks[0].byteOffset === 0 && chunks[0].byteLength === chunks[0].buffer.byteLength) {
+      return chunks[0].buffer;
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return out.buffer;
   }
-  async fetchDecodeUnit(unit) {
-    var _a;
+  async fetchDecodeUnit(unit, record) {
+    var _a, _b;
+    const signal = record.controller.signal;
+    const sink = {
+      onLength: (bytes) => {
+        record.expected += bytes;
+        record.filesWithLength += 1;
+      },
+      onBytes: (delta) => {
+        record.received += delta;
+      },
+      onWire: (delta) => {
+        record.receivedWire += delta;
+      },
+      onEnd: (total, hadLength) => {
+        if (!hadLength) {
+          record.expected += total;
+          record.filesWithLength += 1;
+        }
+      }
+    };
     const dir = this.model.unitDirName(unit);
-    const metaBytes = await this.fetchFile(`${dir}/meta.json`);
+    const metaBytes = await this.fetchFile(`${dir}/meta.json`, signal, sink);
     const json = JSON.parse(
       new TextDecoder().decode(metaBytes)
     );
@@ -367,18 +684,30 @@ class SsogUnitCache {
       ...json.sh0.files,
       ...((_a = json.shN) == null ? void 0 : _a.files) ?? []
     ];
+    record.filesTotal = 1 + names.length;
     const files = {};
     await Promise.all(
       names.map(async (name) => {
-        files[name] = await this.fetchFile(`${dir}/${name}`);
+        files[name] = await this.fetchFile(`${dir}/${name}`, signal, sink);
       })
     );
+    record.fetchDone = true;
+    const paletteRel = (_b = json.shN) == null ? void 0 : _b.palette;
+    let palette;
+    if (paletteRel) {
+      const bytes = await this.getPalette(paletteRel);
+      palette = { key: paletteRel, bytes: bytes.slice(0) };
+    }
+    if (signal.aborted) {
+      throw abortError();
+    }
     this.stats.decodes += 1;
     const decoded = await workerPool.withWorker(
       async (worker) => worker.call("unpackSsogUnit", {
         json,
         files,
-        encoding: this.splatEncoding
+        encoding: this.splatEncoding,
+        palette
       })
     );
     const expected = this.model.unitSplats[unit];
@@ -389,6 +718,64 @@ class SsogUnitCache {
     }
     return decoded;
   }
+}
+function abortError() {
+  return new DOMException("ssog unit fetch aborted", "AbortError");
+}
+let timingBufferPrepared = false;
+function prepareTimingBuffer() {
+  var _a, _b;
+  if (timingBufferPrepared || typeof performance === "undefined") {
+    return;
+  }
+  timingBufferPrepared = true;
+  try {
+    (_a = performance.setResourceTimingBufferSize) == null ? void 0 : _a.call(performance, 2e4);
+    (_b = performance.addEventListener) == null ? void 0 : _b.call(performance, "resourcetimingbufferfull", () => {
+      var _a2;
+      try {
+        (_a2 = performance.clearResourceTimings) == null ? void 0 : _a2.call(performance);
+      } catch {
+      }
+    });
+  } catch {
+  }
+}
+function wireSize(url, startedAt, bodyBytes) {
+  const fallback = { bytes: bodyBytes, known: false };
+  try {
+    if (typeof performance === "undefined" || !performance.getEntriesByName) {
+      return fallback;
+    }
+    const name = typeof location !== "undefined" ? new URL(url, location.href).href : url;
+    const entries = performance.getEntriesByName(
+      name,
+      "resource"
+    );
+    let entry;
+    for (let i = entries.length - 1; i >= 0; i--) {
+      if (entries[i].startTime >= startedAt - 1) {
+        entry = entries[i];
+        break;
+      }
+    }
+    if (!entry) {
+      return fallback;
+    }
+    const transferred = entry.transferSize;
+    if (typeof transferred !== "number") {
+      return fallback;
+    }
+    if (transferred === 0 && bodyBytes > 0) {
+      return entry.encodedBodySize > 0 ? { bytes: 0, known: true } : fallback;
+    }
+    return { bytes: transferred, known: true };
+  } catch {
+    return fallback;
+  }
+}
+function isAbortError(error) {
+  return typeof error === "object" && error !== null && error.name === "AbortError";
 }
 const CUT_ROW_SPLATS = 16384;
 class SsogSplats extends PagedSplats {
@@ -428,6 +815,8 @@ class SsogSplats extends PagedSplats {
     super({ pager, fileType: SplatFileType.SSOG, maxSh });
     this.externalLod = true;
     this.numShResolved = false;
+    this.leases = /* @__PURE__ */ new Map();
+    this.releasedLeases = /* @__PURE__ */ new Map();
     this.model = model;
     this.cache = cache;
     this.budget = budget;
@@ -457,7 +846,18 @@ class SsogSplats extends PagedSplats {
       throw new Error(`ssog chunk out of range: ${chunk}`);
     }
     const { unit, block } = this.model.unitOfChunk(chunk);
-    const decoded = await this.cache.getUnit(unit);
+    const pending = this.cache.getUnit(unit);
+    this.leases.set(chunk, unit);
+    this.releasedLeases.delete(chunk);
+    let decoded;
+    try {
+      decoded = await pending;
+    } finally {
+      if (this.leases.get(chunk) === unit) {
+        this.leases.delete(chunk);
+      }
+      this.releasedLeases.delete(chunk);
+    }
     if (!this.numShResolved) {
       this.numShResolved = true;
       this.numSh = decoded.extra.sh3 ? 3 : decoded.extra.sh2 ? 2 : decoded.extra.sh1 ? 1 : 0;
@@ -487,6 +887,63 @@ class SsogSplats extends PagedSplats {
     };
   }
   /**
+   * [ssog-24] The pager no longer wants this in-flight chunk: drop its
+   * waiter on the unit download. The cache aborts the transfer when no
+   * other in-flight chunk of the unit is still wanted.
+   */
+  cancelFetchChunk(chunk) {
+    const unit = this.leases.get(chunk);
+    if (unit === void 0) {
+      return;
+    }
+    this.leases.delete(chunk);
+    const id = this.cache.unitRecordId(unit);
+    if (id !== void 0) {
+      this.releasedLeases.set(chunk, { unit, id });
+    }
+    this.cache.release(unit);
+  }
+  /**
+   * [ssog-24] The pager wants this cancelled-but-still-in-flight chunk
+   * again. Re-lease the very unit download the fetcher is awaiting; true =
+   * the lease is back and the fetcher may be un-cancelled. False = the
+   * record is gone (aborted, settled, or replaced), so the fetcher stays
+   * cancelled and the chunk restarts through the normal path.
+   */
+  resumeFetchChunk(chunk) {
+    const released = this.releasedLeases.get(chunk);
+    if (!released) {
+      return this.leases.has(chunk);
+    }
+    if (!this.cache.retain(released.unit, released.id)) {
+      return false;
+    }
+    this.releasedLeases.delete(chunk);
+    this.leases.set(chunk, released.unit);
+    return true;
+  }
+  /**
+   * [ssog-24] fetch group of a chunk = its UNIT: every chunk of one unit
+   * shares a single download, so cancelling that download for one chunk
+   * also kills the transfer a sibling chunk in the same group is waiting
+   * for. The pager uses this to keep a group alive while any chunk of it is
+   * still wanted.
+   */
+  fetchGroup(chunk) {
+    if (chunk < 0 || chunk >= this.model.totalBlocks) {
+      return null;
+    }
+    return this.model.unitOfChunk(chunk).unit;
+  }
+  /** [ssog-24] download progress (0..1) of the chunk's unit, null = unknown */
+  fetchProgress(chunk) {
+    const unit = this.leases.get(chunk);
+    if (unit === void 0) {
+      return null;
+    }
+    return this.cache.unitProgress(unit);
+  }
+  /**
    * Full teardown (final scene destruction only). Regular dispose() is
    * detach-only by inheritance — the pool outlives the view for warm
    * pano-roundtrip reattach (§2.7).
@@ -501,10 +958,14 @@ class SsogLodController {
   constructor(options) {
     this.paramsDirty = false;
     this.budgetScale = 1;
+    this.lastMotionMs = Number.NEGATIVE_INFINITY;
+    this.ssePhase = "fine";
     this.moveGateOverride = null;
     this.fetchHold = false;
     this.phase = "reveal";
     this.detached = false;
+    this.interest = null;
+    this.tmpInterest = new THREE.Vector3();
     this.heldPending = false;
     this.composedSplats = 0;
     this.displayedTotal = 0;
@@ -518,6 +979,7 @@ class SsogLodController {
     this.ticksNoProgress = 0;
     this.chunkLastNeeded = /* @__PURE__ */ new Map();
     this.chunkRefs = /* @__PURE__ */ new Map();
+    this.everDisplayed = /* @__PURE__ */ new Set();
     this.priorityChunks = /* @__PURE__ */ new Set();
     this.lastPose = {
       valid: false,
@@ -562,7 +1024,77 @@ class SsogLodController {
       revealResidentBlocks: 0,
       revealTotalBlocks: 0,
       /** [ssog-20] leaves whose resolved-coarsest ref is outside the pin tier */
-      revealHoleLeaves: 0
+      revealHoleLeaves: 0,
+      /** [ssog-23] selection policy in force */
+      lodMode: "bands",
+      /** [ssog-25] "target" while an interest point orders the fill, else "camera" */
+      interestMode: "camera",
+      /**
+       * [ssog-25] grows deferred by capacity or the pool guard that sat in the
+       * NEARER half of the ordered grow list — the subject's share of the
+       * deferrals. Non-zero at rest means the subject is being held back by
+       * the cap, not by the ordering.
+       */
+      subjectDeferrals: 0,
+      /** [ssog-23] L1 geometric error (mesh-local units) the sse mode calibrated */
+      sseErr1: 0,
+      /** [ssog-23] error tolerance (CSS px) the last selection ran at */
+      sseErrorPx: 0,
+      /** [ssog-23] "base" while moving / before dwell, "fine" at rest */
+      ssePhase: "fine",
+      /** [ssog-23] distance (world units) from which L1 is acceptable at the last selection */
+      sseD0: 0,
+      /** [ssog-24] unit downloads aborted (no in-flight chunk still wanted) — cache mirror */
+      fetchCancels: 0,
+      /** [ssog-24] EXACT Σ over aborted units of (known size − received) — cache mirror */
+      cancelSavedBytes: 0,
+      /**
+       * [ssog-24 fix E] modelled saving of the same aborts — cache mirror.
+       * Cancels are admitted early, before Content-Length headers exist, so the
+       * exact counter above reads 0 over a whole soak; this one estimates the
+       * unit's total from the running bytes-per-splat mean of completed units.
+       */
+      cancelSavedEstimateBytes: 0,
+      /**
+       * [ssog-24 fix D] WIRE bytes (PerformanceResourceTiming.transferSize,
+       * body-sum fallback) — cache mirror. 0 for a file served from the HTTP
+       * cache; compressed octets for a gzip'd meta.json.
+       */
+      bytesReceived: 0,
+      /** [ssog-24 fix D] DECODED body bytes read — cache mirror, NOT the wire */
+      decodedBytesReceived: 0,
+      /**
+       * [ssog-22 fix] shared SH palette files fetched — cache mirror. The build
+       * writes one per LEVEL, so this settles at the number of distinct levels
+       * touched; higher means the per-path memo is thrashing.
+       */
+      paletteFetches: 0,
+      /** [ssog-24] pager pages evicted whose chunk was never displayed while resident */
+      wastedChunks: 0,
+      /** [ssog-24] estimate for wastedChunks: unit bytes / blocks in the unit */
+      wastedBytes: 0,
+      /** [ssog-24] chunk-level cancel requests the pager issued — pager mirror */
+      chunkCancels: 0,
+      /**
+       * [ssog-24] chunks re-fetched within the pager's cancel cooldown of their
+       * own cancel — pager mirror. Non-zero = the cancel lever is thrashing
+       * under motion (bytes spent twice) rather than saving.
+       */
+      cancelRefetches: 0,
+      /**
+       * [ssog-24] responses seen with no Content-Length — cache mirror. While
+       * such a file is in flight its unit reports NO progress, so the ≥75%
+       * skip is measuring blind rather than finding nothing to save.
+       */
+      filesWithoutLength: 0,
+      /**
+       * [ssog-24 r4] settled files whose true WIRE size could not be read (no
+       * resource-timing entry, or a cross-origin response without
+       * Timing-Allow-Origin), so the higher decoded body sum was billed into
+       * bytesReceived instead. Non-zero means the byte figures are an
+       * over-estimate, not that little was transferred.
+       */
+      filesWithoutWireSize: 0
     };
     this.mesh = options.mesh;
     this.splats = options.splats;
@@ -586,7 +1118,35 @@ class SsogLodController {
     this.balancedLevel = new Int32Array(this.NL);
     this.bucketOf = new Int32Array(this.NL);
     this.dBucket = new Float64Array(this.NL);
+    this.tBucket = new Float64Array(this.NL);
     this.readySinceTick = new Int32Array(this.NL).fill(-1);
+    this.lodMode = options.lodMode === "sse" ? "sse" : "bands";
+    this.sseErrorPx = Math.max(0.1, options.sseErrorPx ?? 2);
+    this.sseBaseErrorPx = options.sseBaseErrorPx ?? 4;
+    this.sseDwellMs = Math.max(0, options.sseDwellMs ?? 1500);
+    this.viewportHeightPx = Math.max(64, options.viewportHeightPx ?? 1080);
+    {
+      const L = this.L;
+      const spacings = [];
+      const bounds = model.boundsFlat;
+      for (let li = 0; li < this.NL; li++) {
+        const o = li * 6;
+        const ext = Math.max(
+          bounds[o + 3] - bounds[o],
+          bounds[o + 4] - bounds[o + 1],
+          bounds[o + 5] - bounds[o + 2]
+        );
+        const n0 = model.leafLodsPre[li * L * 3] >= 0 ? model.leafLodsPre[li * L * 3 + 2] : 0;
+        if (n0 > 0 && ext > 0) {
+          spacings.push(ext / Math.sqrt(n0));
+        }
+      }
+      spacings.sort((a, b) => a - b);
+      const s0 = spacings.length > 0 ? spacings[spacings.length >> 1] : 1;
+      this.sseErr1 = 0.5 * s0 * Math.SQRT2;
+      this.stats.sseErr1 = this.sseErr1;
+      this.stats.lodMode = this.lodMode;
+    }
     this.cut = new Uint32Array(this.splats.capacitySplats);
     const pinned = [];
     for (let u = 0; u < model.numUnits; u++) {
@@ -605,6 +1165,24 @@ class SsogLodController {
     this.bucketStart = new Int32Array(65);
     this.bucketCursor = new Int32Array(64);
     const pager = this.splats.pager;
+    if (pager) {
+      pager.onPageEvicted = (s, c) => {
+        if (s !== this.splats) {
+          return;
+        }
+        const displayed = this.everDisplayed.delete(c);
+        if (displayed) {
+          return;
+        }
+        this.stats.wastedChunks += 1;
+        const { unit } = model.unitOfChunk(c);
+        const bytes = this.splats.cache.unitBytes(unit);
+        const blocks = model.blockBase[unit + 1] - model.blockBase[unit];
+        if (bytes && blocks > 0) {
+          this.stats.wastedBytes += bytes / blocks;
+        }
+      };
+    }
     if (pager && pager.maxPages < model.totalBlocks) {
       const margin = model.maxLeafBlockFootprint + pager.numFetchers;
       const guard = this.poolGuardLimit();
@@ -652,6 +1230,7 @@ class SsogLodController {
     if (this.detached) {
       return;
     }
+    this.syncByteStats();
     if (this.phase === "reveal") {
       this.revealTick(camera);
       return;
@@ -667,6 +1246,9 @@ class SsogLodController {
     const refillPager = this.splats.pager;
     if (!this.converged && refillPager && refillPager.fetchPriority.length > 0 && refillPager.fetchers.length < refillPager.numFetchers) {
       refillPager.driveFetchers();
+    }
+    if (this.lodMode === "sse" && this.ssePhase === "base" && performance.now() - this.lastMotionMs >= this.sseDwellMs) {
+      this.paramsDirty = true;
     }
     this.frameCounter += 1;
     if (this.frameCounter < this.metronomeFrames) {
@@ -715,6 +1297,36 @@ class SsogLodController {
     this.paramsDirty = true;
   }
   /**
+   * [ssog-25] Orbit-centric ordering. `point` is the camera's ORBIT TARGET in
+   * WORLD space (converted into the mesh frame with the same matrix the
+   * camera goes through); null restores the camera-centric order — the
+   * shipped behaviour, and the right one inside a first-person viewpoint,
+   * where the eye IS the target. Changes ONLY the order in which the
+   * page-capped grows and the tier-3 fetch staging are served (distance
+   * from this point instead of from the camera): never the level rule and
+   * never the budget demotion — measured on the 20M scene, target-ordering
+   * the demotion coarsens the subject (docs/features/gaussian-splatting/
+   * orbit-centric-lod-proposal-2026-09.md). Under orbit the key does not
+   * move with the camera, which also halves the per-step refetch
+   * (sim: 55 -> 28 units per 30 degrees at 144 m). No tick is forced: a
+   * target only moves together with the camera, which ticks anyway.
+   */
+  setInterest(point) {
+    if (point && Number.isFinite(point.x) && Number.isFinite(point.y) && Number.isFinite(point.z)) {
+      if (!this.interest) {
+        this.interest = new THREE.Vector3(point.x, point.y, point.z);
+      } else {
+        this.interest.set(point.x, point.y, point.z);
+      }
+    } else {
+      this.interest = null;
+    }
+  }
+  /** [ssog-25] ordering key: interest distance when set, else camera distance */
+  orderKey(li) {
+    return this.interest ? this.tBucket[li] : this.dBucket[li];
+  }
+  /**
    * [ssog-19] Hold/release tier-3 fetch staging across a scripted camera
    * flight (see the fetchHold field). Release forces a tick so the arrival
    * cut stages without waiting for a motion gate.
@@ -728,6 +1340,42 @@ class SsogLodController {
     if (!next) {
       this.paramsDirty = true;
     }
+  }
+  /**
+   * [ssog-23] Viewport height in CSS pixels — the sse projection's f_px.
+   * CSS pixels on purpose (Cesium divides its SSE by pixelRatio for the same
+   * reason): a DPR-3 phone must not fetch more than a desktop.
+   */
+  setViewportHeight(px) {
+    const next = Math.max(64, Number.isFinite(px) ? px : 1080);
+    if (next === this.viewportHeightPx) {
+      return;
+    }
+    this.viewportHeightPx = next;
+    if (this.lodMode === "sse") {
+      this.paramsDirty = true;
+    }
+  }
+  /** [ssog-23] runtime dials (A/B): fine tolerance, base tolerance, dwell */
+  setSseError(finePx, basePx, dwellMs) {
+    if (Number.isFinite(finePx) && finePx > 0) {
+      this.sseErrorPx = finePx;
+    }
+    if (typeof basePx === "number" && Number.isFinite(basePx)) {
+      this.sseBaseErrorPx = basePx;
+    }
+    if (typeof dwellMs === "number" && Number.isFinite(dwellMs)) {
+      this.sseDwellMs = Math.max(0, dwellMs);
+    }
+    if (this.lodMode === "sse") {
+      this.paramsDirty = true;
+    }
+  }
+  /** [ssog-23] the tolerance the next selection will use */
+  sseTolerance() {
+    const baseActive = this.sseDwellMs > 0 && this.sseBaseErrorPx > this.sseErrorPx && performance.now() - this.lastMotionMs < this.sseDwellMs;
+    this.ssePhase = baseActive ? "base" : "fine";
+    return baseActive ? this.sseBaseErrorPx : this.sseErrorPx;
   }
   // ---- gates ---------------------------------------------------------------
   gatesPass(camera) {
@@ -771,6 +1419,27 @@ class SsogLodController {
     this.lastPose.quat.copy(this.tmpQuat);
     this.lastPose.fov = camera.fov;
   }
+  /**
+   * [ssog-24] mirror the byte counters of the unit cache and the pager into
+   * stats every frame (not per tick: downloads finish and abort between
+   * ticks, and a converged controller stops ticking while transfers drain).
+   */
+  syncByteStats() {
+    const cs = this.splats.cache.stats;
+    this.stats.fetchCancels = cs.fetchCancels;
+    this.stats.cancelSavedBytes = cs.cancelSavedBytes;
+    this.stats.cancelSavedEstimateBytes = cs.cancelSavedEstimateBytes;
+    this.stats.bytesReceived = cs.bytesReceived;
+    this.stats.decodedBytesReceived = cs.decodedBytesReceived;
+    this.stats.paletteFetches = cs.paletteFetches;
+    this.stats.filesWithoutLength = cs.filesWithoutLength;
+    this.stats.filesWithoutWireSize = cs.filesWithoutWireSize;
+    const pager = this.splats.pager;
+    if (pager) {
+      this.stats.chunkCancels = pager.fetchCancels;
+      this.stats.cancelRefetches = pager.cancelRefetches;
+    }
+  }
   // ---- §2.3 pump contract --------------------------------------------------
   pump(priority) {
     const pager = this.splats.pager;
@@ -812,6 +1481,19 @@ class SsogLodController {
   addLeafRefs(li, level) {
     this.forEachLeafChunk(li, level, (c) => {
       this.chunkRefs.set(c, (this.chunkRefs.get(c) ?? 0) + 1);
+    });
+  }
+  /**
+   * [ssog-24] Mark a (leaf, level) ref's chunks as HAVING BEEN DISPLAYED.
+   * Deliberately NOT folded into addLeafRefs: the grow path adds refs
+   * TENTATIVELY and reverts them when the block-aware pool guard rejects the
+   * flip, so marking there counted chunks that were never composed and made
+   * wastedChunks/wastedBytes undercount exactly in the near, pool-limited
+   * regime the metric exists to measure. Only committed flips mark.
+   */
+  markDisplayed(li, level) {
+    this.forEachLeafChunk(li, level, (c) => {
+      this.everDisplayed.add(c);
     });
   }
   removeLeafRefs(li, level) {
@@ -933,6 +1615,7 @@ class SsogLodController {
     this.chunkRefs.clear();
     for (const chunk of this.pinnedChunks) {
       this.chunkRefs.set(chunk, 1);
+      this.everDisplayed.add(chunk);
     }
     let holes = 0;
     for (let li = 0; li < this.NL; li++) {
@@ -946,6 +1629,7 @@ class SsogLodController {
       this.displayed[li] = this.L - 1;
       this.displayedTotal += model.leafLods[(li * this.L + this.L - 1) * 3 + 2];
       this.addLeafRefs(li, this.L - 1);
+      this.markDisplayed(li, this.L - 1);
     }
     this.desired.set(this.displayed);
     this.stats.revealHoleLeaves = holes;
@@ -966,6 +1650,12 @@ class SsogLodController {
     this.paramsDirty = false;
     this.tickCount += 1;
     const uniformScale = this.cameraLocal(camera);
+    if (this.lodMode === "sse" && this.lastPose.valid) {
+      const moveGate = this.moveGateOverride ?? this.moveGateFactor * this.lodBaseDistance;
+      if (this.tmpPos.distanceTo(this.lastPose.pos) > moveGate || Math.abs(this.tmpQuat.dot(this.lastPose.quat)) < Math.SQRT1_2 || Math.abs(camera.fov - this.lastPose.fov) > 0.02 * Math.max(1e-6, this.lastPose.fov)) {
+        this.lastMotionMs = performance.now();
+      }
+    }
     this.selectionAndBalance(camera, uniformScale);
     if (this.scaleMoved && !this.fetchHold) {
       this.settleBudgetScale(camera, uniformScale);
@@ -1006,7 +1696,7 @@ class SsogLodController {
           pendingLeaves.push(li);
         }
       }
-      pendingLeaves.sort((a, b) => this.dBucket[a] - this.dBucket[b]);
+      pendingLeaves.sort((a, b) => this.orderKey(a) - this.orderKey(b));
       const stage = [];
       let staged = true;
       for (const li of pendingLeaves) {
@@ -1168,8 +1858,20 @@ class SsogLodController {
     const tanHalfV = Math.tan(camera.fov / 2 * Math.PI / 180);
     const tanHalfH = tanHalfV * camera.aspect;
     const fovScale = Math.min(tanHalfV, tanHalfH) / Math.tan(22.5 * Math.PI / 180);
-    const d0 = this.lodBaseDistance * this.budgetScale;
-    const mPrime = Math.max(1.2, 3 * this.budgetScale ** -0.2);
+    const interest = this.interest ? this.tmpInterest.copy(this.interest).applyMatrix4(this.tmpMat) : null;
+    this.stats.interestMode = interest ? "target" : "camera";
+    const sse = this.lodMode === "sse";
+    let sseD0 = 0;
+    if (sse) {
+      const e = this.sseTolerance();
+      const fpxRef = this.viewportHeightPx / 2 / Math.tan(22.5 * Math.PI / 180);
+      sseD0 = this.sseErr1 * uniformScale * fpxRef / e;
+      this.stats.sseErrorPx = e;
+      this.stats.ssePhase = this.ssePhase;
+      this.stats.sseD0 = sseD0;
+    }
+    const d0 = sse ? sseD0 : this.lodBaseDistance * this.budgetScale;
+    const mPrime = sse ? Math.SQRT2 : Math.max(1.2, 3 * this.budgetScale ** -0.2);
     const logM = Math.log(mPrime);
     const rb = model.rootBound;
     const cx = (rb.min[0] + rb.max[0]) / 2;
@@ -1205,6 +1907,12 @@ class SsogLodController {
       }
       const db = d * penalty * fovScale * uniformScale;
       this.dBucket[li] = db;
+      if (interest) {
+        const tx = Math.max(bounds[o], Math.min(interest.x, bounds[o + 3])) - interest.x;
+        const ty = Math.max(bounds[o + 1], Math.min(interest.y, bounds[o + 4])) - interest.y;
+        const tz = Math.max(bounds[o + 2], Math.min(interest.z, bounds[o + 5])) - interest.z;
+        this.tBucket[li] = Math.hypot(tx, ty, tz);
+      }
       this.bucketOf[li] = Math.min(
         63,
         Math.floor(64 * Math.sqrt(db) / sqrtDMax)
@@ -1320,6 +2028,9 @@ class SsogLodController {
             if (cur <= 0) {
               continue;
             }
+            if (sse && cur - 1 < this.optimalLevel[li]) {
+              continue;
+            }
             const curCount = model.leafLods[(li * L + cur) * 3 + 2];
             const finer = model.leafLods[(li * L + cur - 1) * 3 + 2];
             if (totalBalanced - curCount + finer > budget) {
@@ -1366,7 +2077,9 @@ class SsogLodController {
     this.stats.fillPageCap = fillPageCap === Number.POSITIVE_INFINITY ? 0 : fillPageCap;
     this.stats.pageLimit = wholeResident ? 0 : pageLimit;
     const ratio = totalOptimal / budget;
-    if (ratio > 1.4 || ratio < 0.6) {
+    if (sse) {
+      this.scaleMoved = false;
+    } else if (ratio > 1.4 || ratio < 0.6) {
       const before = this.budgetScale;
       this.budgetScale *= 1 + (1 / Math.sqrt(ratio) - 1) * 0.3;
       this.budgetScale = Math.max(0.01, Math.min(100, this.budgetScale));
@@ -1450,6 +2163,7 @@ class SsogLodController {
     const applyFlip = (li, to) => {
       this.removeLeafRefs(li, this.displayed[li]);
       this.addLeafRefs(li, to);
+      this.markDisplayed(li, to);
       this.displayedTotal += model.leafLods[(li * this.L + to) * 3 + 2] - this.displayedCount(li);
       this.displayed[li] = to;
       this.readySinceTick[li] = -1;
@@ -1458,13 +2172,18 @@ class SsogLodController {
     for (const li of readyShrink) {
       applyFlip(li, this.desired[li]);
     }
-    eligibleGrow.sort((a, b) => this.dBucket[a] - this.dBucket[b]);
-    for (const li of eligibleGrow) {
+    eligibleGrow.sort((a, b) => this.orderKey(a) - this.orderKey(b));
+    const subjectHalf = eligibleGrow.length >> 1;
+    for (let gi = 0; gi < eligibleGrow.length; gi++) {
+      const li = eligibleGrow[gi];
       const to = this.desired[li];
       const from = this.displayed[li];
       const delta = model.leafLods[(li * this.L + to) * 3 + 2] - this.displayedCount(li);
       if (this.displayedTotal + delta > this.splats.capacitySplats) {
         this.stats.capacityDeferrals += 1;
+        if (gi < subjectHalf) {
+          this.stats.subjectDeferrals += 1;
+        }
         continue;
       }
       this.removeLeafRefs(li, from);
@@ -1473,8 +2192,12 @@ class SsogLodController {
         this.removeLeafRefs(li, to);
         this.addLeafRefs(li, from);
         this.stats.poolDeferrals += 1;
+        if (gi < subjectHalf) {
+          this.stats.subjectDeferrals += 1;
+        }
         continue;
       }
+      this.markDisplayed(li, to);
       this.displayedTotal += delta;
       this.displayed[li] = to;
       this.readySinceTick[li] = -1;

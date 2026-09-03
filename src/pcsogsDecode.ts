@@ -22,10 +22,19 @@ import {
   setPackedSplatScales,
 } from "./packedEncode";
 
+export type DecodedImage = { rgba: Uint8Array; width: number; height: number };
+
 export async function unpackPcSogs(
   json: PcSogsJson | PcSogsV2Json,
   extraFiles: Record<string, ArrayBuffer>,
   splatEncoding: SplatEncoding,
+  options?: {
+    /**
+     * [ssog-22] decoded shared SH palette (shN_centroids image) for units that
+     * carry labels only (`json.shN.palette` set, one file in `shN.files`).
+     */
+    centroidsImage?: Promise<DecodedImage> | DecodedImage;
+  },
 ): Promise<{
   packedArray: Uint32Array;
   numSplats: number;
@@ -223,9 +232,26 @@ export async function unpackPcSogs(
     const sh3 = new Float32Array(21);
 
     const shN = json.shN;
+    // [ssog-22] Two unit shapes: classic units ship [centroids, labels]; units
+    // written against a scene-level palette ship [labels] only and the caller
+    // hands in the decoded shared palette image (SsogUnitCache fetches it once
+    // per scene, the worker decodes it once per worker). The labels plane is
+    // always the LAST file; the lookup/stride code below is shape-agnostic.
+    const shFiles = shN.files;
+    const labelsFile = shFiles[shFiles.length - 1];
+    let centroidsPromise: Promise<DecodedImage>;
+    if (options?.centroidsImage) {
+      centroidsPromise = Promise.resolve(options.centroidsImage);
+    } else if (shFiles.length >= 2) {
+      centroidsPromise = decodeImage(extraFiles[shFiles[0]]);
+    } else {
+      throw new Error(
+        "SOG unit references a shared SH palette but no palette image was supplied",
+      );
+    }
     const shNPromise = Promise.all([
-      decodeImage(extraFiles[json.shN.files[0]]),
-      decodeImage(extraFiles[json.shN.files[1]]),
+      centroidsPromise,
+      decodeImage(extraFiles[labelsFile]),
     ]).then(([centroids, labels]) => {
       const lookup =
         "codebook" in shN

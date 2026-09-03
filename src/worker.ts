@@ -24,7 +24,15 @@ import { DEFAULT_SPLAT_ENCODING } from "./defines";
 import type { ExtResult, PackedResult, SplatEncoding } from "./defines";
 // Kroscloud fork [ssog-1]: SOG unit decode for the ssog module. pcsogsDecode
 // is the three-free carve-out — three must NEVER enter this inline bundle.
-import { unpackPcSogs } from "./pcsogsDecode";
+import { unpackPcSogs, decodeImage } from "./pcsogsDecode";
+import type { DecodedImage } from "./pcsogsDecode";
+
+// Kroscloud fork [ssog-22]: decoded shared SH palettes, memoized per worker by
+// the cache's key (the palette's path relative to the ssog root). The ~1 MB
+// palette WebP is decoded once per worker instead of once per unit; the bytes
+// still arrive with every call (the pool transfers ArrayBuffers) and are
+// ignored after the first decode.
+const ssogPalettes = new Map<string, Promise<DecodedImage>>();
 
 const rpcHandlers = {
   sortSplats16,
@@ -54,12 +62,41 @@ async function unpackSsogUnit({
   json,
   files,
   encoding,
+  palette,
 }: {
   json: PcSogsJson | PcSogsV2Json;
   files: Record<string, ArrayBuffer>;
   encoding?: SplatEncoding;
+  /** [ssog-22] shared SH palette: key = relative path, bytes = the WebP */
+  palette?: { key: string; bytes?: ArrayBuffer };
 }) {
-  return await unpackPcSogs(json, files, encoding ?? DEFAULT_SPLAT_ENCODING);
+  let centroidsImage: Promise<DecodedImage> | undefined;
+  if (palette) {
+    let decoded = ssogPalettes.get(palette.key);
+    if (!decoded) {
+      if (!palette.bytes) {
+        throw new Error(
+          `ssog palette ${palette.key}: bytes missing on first use in this worker`,
+        );
+      }
+      const pending = decodeImage(palette.bytes);
+      decoded = pending;
+      pending.catch(() => {
+        // a failed decode must not poison the memo — allow the next unit to retry
+        if (ssogPalettes.get(palette.key) === pending) {
+          ssogPalettes.delete(palette.key);
+        }
+      });
+      ssogPalettes.set(palette.key, pending);
+    }
+    centroidsImage = decoded;
+  }
+  return await unpackPcSogs(
+    json,
+    files,
+    encoding ?? DEFAULT_SPLAT_ENCODING,
+    centroidsImage ? { centroidsImage } : undefined,
+  );
 }
 
 async function onMessage(event: MessageEvent) {

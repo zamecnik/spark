@@ -45,6 +45,10 @@ export declare class PagedSplats implements SplatSource {
         chunksStart: number;
     }>;
     chunkUrl(chunk: number): string;
+    cancelFetchChunk?(chunk: number): void;
+    fetchProgress?(chunk: number): number | null;
+    fetchGroup?(chunk: number): number | null;
+    resumeFetchChunk?(chunk: number): boolean;
     fetchDecodeChunk(chunk: number): Promise<PackedResult | ExtResult>;
     update(numSplats: number, indices: Uint32Array, presizeRows?: number): void;
     prepareFetchSplat(): void;
@@ -139,6 +143,10 @@ export declare class SplatPager {
         splats: PagedSplats;
         chunk: number;
         promise: Promise<void>;
+        /** [ssog-24] consecutive fetchPriority lists that did not want the chunk */
+        missCount: number;
+        /** [ssog-24] cancelFetchChunk was issued for this fetcher */
+        cancelled: boolean;
     }[];
     fetched: {
         splats: PagedSplats;
@@ -214,6 +222,42 @@ export declare class SplatPager {
     pageEvictions: number;
     chunkRefetches: number;
     private everResident;
+    /**
+     * [ssog-24] in-flight fetchers asked to cancel (chunk-level requests; the
+     * ssog cache's `fetchCancels` counts the UNIT downloads actually aborted).
+     */
+    fetchCancels: number;
+    /**
+     * [ssog-24] cancel→refetch thrash: a chunk whose fetch was cancelled and
+     * that is fetched AGAIN within `cancelCooldownTicks` pager ticks (distinct
+     * fetchPriority lists) of that cancel. Under continuous motion a cancel
+     * lever can churn instead of save; without this counter that churn hides
+     * inside the bandwidth total and looks like ordinary streaming.
+     */
+    cancelRefetches: number;
+    /** [ssog-24] window (in distinct fetchPriority lists) for cancelRefetches */
+    cancelCooldownTicks: number;
+    /** [ssog-24] distinct fetchPriority lists seen — the pager's tick clock */
+    private listTick;
+    /** [ssog-24] splats → chunk → listTick at which its fetch was cancelled */
+    private cancelTick;
+    private noteCancelTick;
+    /**
+     * [ssog-24 fix F] Forget a chunk's cancel stamp — used when a cancel is
+     * TAKEN BACK (resumeFetchChunk succeeded): no bytes were lost, so a later
+     * fetch of that chunk must not be scored as cancel→refetch thrash.
+     */
+    private clearCancelTick;
+    /** [ssog-24] a fetcher slot is being opened for (splats, chunk) */
+    private noteFetchStart;
+    /**
+     * [ssog-24] eviction hook: called with the (splats, chunk) of every
+     * resident page freed to make room for an arrival — never for
+     * clear/dispose. The ssog controller prices never-displayed evictions.
+     */
+    onPageEvicted?: (splats: PagedSplats, chunk: number) => void;
+    /** [ssog-24] wanted-set of the last DISTINCT fetchPriority list seen */
+    private wantedCache?;
     private allocateFreeable;
     private processFetched;
     processUploads(): void;

@@ -29,7 +29,7 @@ import {
 import type { SplatEncoding } from "../defines";
 import type { SsogModel } from "./SsogModel";
 import { SSOG_PAGE_SPLATS } from "./SsogModel";
-import type { SsogUnitCache } from "./SsogUnitCache";
+import type { SsogDecodedUnit, SsogUnitCache } from "./SsogUnitCache";
 
 const CUT_ROW_SPLATS = 16384; // 4096 texels × RGBA32UI = indices per cut row
 
@@ -83,6 +83,25 @@ export class SsogSplats extends PagedSplats {
 
   private numShResolved = false;
   private readonly fixedEncoding: SplatEncoding;
+
+  /**
+   * [ssog-24] chunk → unit for every fetchDecodeChunk still awaiting its
+   * unit download (one cache waiter each). A lease exists exactly while
+   * the getUnit promise is pending, so cancelFetchChunk releases the cache
+   * at most once per fetch and never for a superseded record.
+   */
+  private readonly leases: Map<number, number> = new Map();
+
+  /**
+   * [ssog-24] chunk → {unit, record id} of a lease this source RELEASED in
+   * cancelFetchChunk while its fetchDecodeChunk was still awaiting the unit.
+   * `resumeFetchChunk` re-leases from here when the pager finds the chunk
+   * wanted again; the record id pins WHICH download the fetcher awaits, so a
+   * re-lease can never land on a fresh record of the same unit (that waiter
+   * could never be released, and the unit would become uncancellable).
+   */
+  private readonly releasedLeases: Map<number, { unit: number; id: number }> =
+    new Map();
 
   constructor(options: SsogSplatsOptions) {
     const { model, cache, budget } = options;
@@ -199,7 +218,18 @@ export class SsogSplats extends PagedSplats {
       throw new Error(`ssog chunk out of range: ${chunk}`);
     }
     const { unit, block } = this.model.unitOfChunk(chunk);
-    const decoded = await this.cache.getUnit(unit);
+    const pending = this.cache.getUnit(unit);
+    this.leases.set(chunk, unit);
+    this.releasedLeases.delete(chunk);
+    let decoded: SsogDecodedUnit;
+    try {
+      decoded = await pending;
+    } finally {
+      if (this.leases.get(chunk) === unit) {
+        this.leases.delete(chunk);
+      }
+      this.releasedLeases.delete(chunk);
+    }
 
     if (!this.numShResolved) {
       this.numShResolved = true;
@@ -237,6 +267,70 @@ export class SsogSplats extends PagedSplats {
       extra,
       splatEncoding: this.fixedEncoding,
     };
+  }
+
+  /**
+   * [ssog-24] The pager no longer wants this in-flight chunk: drop its
+   * waiter on the unit download. The cache aborts the transfer when no
+   * other in-flight chunk of the unit is still wanted.
+   */
+  override cancelFetchChunk(chunk: number): void {
+    const unit = this.leases.get(chunk);
+    if (unit === undefined) {
+      return;
+    }
+    this.leases.delete(chunk);
+    // capture the record identity BEFORE release() — the last waiter leaving
+    // drops the record, and a resume must not attach to its replacement.
+    const id = this.cache.unitRecordId(unit);
+    if (id !== undefined) {
+      this.releasedLeases.set(chunk, { unit, id });
+    }
+    this.cache.release(unit);
+  }
+
+  /**
+   * [ssog-24] The pager wants this cancelled-but-still-in-flight chunk
+   * again. Re-lease the very unit download the fetcher is awaiting; true =
+   * the lease is back and the fetcher may be un-cancelled. False = the
+   * record is gone (aborted, settled, or replaced), so the fetcher stays
+   * cancelled and the chunk restarts through the normal path.
+   */
+  override resumeFetchChunk(chunk: number): boolean {
+    const released = this.releasedLeases.get(chunk);
+    if (!released) {
+      // never cancelled (or already resumed): a live lease is a no-op resume
+      return this.leases.has(chunk);
+    }
+    if (!this.cache.retain(released.unit, released.id)) {
+      return false;
+    }
+    this.releasedLeases.delete(chunk);
+    this.leases.set(chunk, released.unit);
+    return true;
+  }
+
+  /**
+   * [ssog-24] fetch group of a chunk = its UNIT: every chunk of one unit
+   * shares a single download, so cancelling that download for one chunk
+   * also kills the transfer a sibling chunk in the same group is waiting
+   * for. The pager uses this to keep a group alive while any chunk of it is
+   * still wanted.
+   */
+  override fetchGroup(chunk: number): number | null {
+    if (chunk < 0 || chunk >= this.model.totalBlocks) {
+      return null;
+    }
+    return this.model.unitOfChunk(chunk).unit;
+  }
+
+  /** [ssog-24] download progress (0..1) of the chunk's unit, null = unknown */
+  override fetchProgress(chunk: number): number | null {
+    const unit = this.leases.get(chunk);
+    if (unit === undefined) {
+      return null;
+    }
+    return this.cache.unitProgress(unit);
   }
 
   /**
