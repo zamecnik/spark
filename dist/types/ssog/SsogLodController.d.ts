@@ -54,6 +54,13 @@ export interface SsogLodControllerOptions {
      * stay ceilings. Default "bands" (byte-identical to kroscloud.31).
      */
     lodMode?: "bands" | "sse";
+    /**
+     * [ssog-26] behind-camera penalty factor k: a leaf whose closest point lies
+     * behind the camera has its selection distance scaled by 1 + k·max(0, −dot)
+     * (k = 4 → ×5 straight behind, the pre-[ssog-26] constant). 0 makes the cut
+     * rotation-invariant: turning in place costs no fetch at all. Default 4.
+     */
+    behindPenalty?: number;
     /** [ssog-23] sse: error tolerance in CSS pixels at rest (default 2) */
     sseErrorPx?: number;
     /**
@@ -209,6 +216,8 @@ export declare class SsogLodController {
      * for the page-aware balancer — allocated once, length totalBlocks.
      */
     private readonly pageRefs;
+    /** [ssog-26] behind-camera penalty factor k in `1 + k·max(0, −dot)` */
+    private behindPenalty;
     /**
      * [ssog-17 perf] per-tick scratch for the bucket-ordered leaf index
      * (counting sort, stable in li): the balancer passes visit leaves in
@@ -275,6 +284,8 @@ export declare class SsogLodController {
         lodMode: string;
         /** [ssog-25] "target" while an interest point orders the fill, else "camera" */
         interestMode: string;
+        /** [ssog-26] behind-camera penalty factor in force (4 = the ×5 legacy) */
+        behindPenalty: number;
         /**
          * [ssog-25] grows deferred by capacity or the pool guard that sat in the
          * NEARER half of the ordered grow list — the subject's share of the
@@ -377,6 +388,18 @@ export declare class SsogLodController {
      * at the current pose.
      */
     setMoveGate(units: number | null): void;
+    /**
+     * [ssog-26] Behind-camera penalty factor (see `behindPenalty` option). An
+     * app MAY lower it for first-person viewpoint sessions (Viewme: only when
+     * `?ssogpenvp` is given — default sessions keep 4), where turning in
+     * place is the primary gesture: with k = 4 every 90° turn re-cuts ~100
+     * units of the 20M reference scene (the tour simulator priced a
+     * four-turn look-around at 389 MB of fetches, 0 MB with k = 0, at a 15%
+     * row cost in the front hemisphere). A change re-arms the tick like any
+     * other parameter change.
+     */
+    setBehindPenalty(k: number): void;
+    private static clampBehindPenalty;
     /**
      * [ssog-25] Orbit-centric ordering. `point` is the camera's ORBIT TARGET in
      * WORLD space (converted into the mesh frame with the same matrix the

@@ -1048,6 +1048,8 @@ class SsogLodController {
       lodMode: "bands",
       /** [ssog-25] "target" while an interest point orders the fill, else "camera" */
       interestMode: "camera",
+      /** [ssog-26] behind-camera penalty factor in force (4 = the ×5 legacy) */
+      behindPenalty: 4,
       /**
        * [ssog-25] grows deferred by capacity or the pool guard that sat in the
        * NEARER half of the ordered grow list — the subject's share of the
@@ -1140,6 +1142,10 @@ class SsogLodController {
     this.tBucket = new Float64Array(this.NL);
     this.readySinceTick = new Int32Array(this.NL).fill(-1);
     this.lodMode = options.lodMode === "sse" ? "sse" : "bands";
+    this.behindPenalty = SsogLodController.clampBehindPenalty(
+      options.behindPenalty
+    );
+    this.stats.behindPenalty = this.behindPenalty;
     this.sseErrorPx = Math.max(0.1, options.sseErrorPx ?? 2);
     this.sseBaseErrorPx = options.sseBaseErrorPx ?? 4;
     this.sseDwellMs = Math.max(0, options.sseDwellMs ?? 1500);
@@ -1314,6 +1320,28 @@ class SsogLodController {
   setMoveGate(units) {
     this.moveGateOverride = typeof units === "number" && Number.isFinite(units) && units > 0 ? units : null;
     this.paramsDirty = true;
+  }
+  /**
+   * [ssog-26] Behind-camera penalty factor (see `behindPenalty` option). An
+   * app MAY lower it for first-person viewpoint sessions (Viewme: only when
+   * `?ssogpenvp` is given — default sessions keep 4), where turning in
+   * place is the primary gesture: with k = 4 every 90° turn re-cuts ~100
+   * units of the 20M reference scene (the tour simulator priced a
+   * four-turn look-around at 389 MB of fetches, 0 MB with k = 0, at a 15%
+   * row cost in the front hemisphere). A change re-arms the tick like any
+   * other parameter change.
+   */
+  setBehindPenalty(k) {
+    const next = SsogLodController.clampBehindPenalty(k);
+    if (next === this.behindPenalty) {
+      return;
+    }
+    this.behindPenalty = next;
+    this.stats.behindPenalty = next;
+    this.paramsDirty = true;
+  }
+  static clampBehindPenalty(k) {
+    return typeof k === "number" && Number.isFinite(k) ? Math.min(16, Math.max(0, k)) : 4;
   }
   /**
    * [ssog-25] Orbit-centric ordering. `point` is the camera's ORBIT TARGET in
@@ -1809,6 +1837,7 @@ class SsogLodController {
     const mPrime = Math.max(1.2, 3 * scale ** -0.2);
     const logM = Math.log(mPrime);
     let totalOptimal = 0;
+    const behind = this.behindPenalty;
     for (let li = 0; li < NL; li++) {
       const o = li * 6;
       const px = Math.max(bounds[o], Math.min(cam.x, bounds[o + 3]));
@@ -1819,12 +1848,12 @@ class SsogLodController {
       let dz = pz - cam.z;
       const d = Math.hypot(dx, dy, dz);
       let penalty = 1;
-      if (d > 1e-9) {
+      if (d > 1e-9 && behind > 0) {
         dx /= d;
         dy /= d;
         dz /= d;
         const dot = fwd.x * dx + fwd.y * dy + fwd.z * dz;
-        penalty = 1 + 4 * Math.max(0, -dot);
+        penalty = 1 + behind * Math.max(0, -dot);
       }
       const db = d * penalty * fovScale * uniformScale;
       let lvl = db <= d0 ? 0 : 1 + Math.floor(Math.log(db / d0) / logM);
@@ -1906,6 +1935,7 @@ class SsogLodController {
       Math.hypot(cam.x - cx, cam.y - cy, cam.z - cz) + radius
     );
     const sqrtDMax = Math.sqrt(dMax);
+    const behind = this.behindPenalty;
     let totalOptimal = 0;
     for (let li = 0; li < NL; li++) {
       const o = li * 6;
@@ -1917,12 +1947,12 @@ class SsogLodController {
       let dz = pz - cam.z;
       const d = Math.hypot(dx, dy, dz);
       let penalty = 1;
-      if (d > 1e-9) {
+      if (d > 1e-9 && behind > 0) {
         dx /= d;
         dy /= d;
         dz /= d;
         const dot = fwd.x * dx + fwd.y * dy + fwd.z * dz;
-        penalty = 1 + 4 * Math.max(0, -dot);
+        penalty = 1 + behind * Math.max(0, -dot);
       }
       const db = d * penalty * fovScale * uniformScale;
       this.dBucket[li] = db;

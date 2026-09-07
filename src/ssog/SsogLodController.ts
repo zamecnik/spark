@@ -4,8 +4,8 @@
 // pinned; structural port of the P0d-proven balancer bench
 // poc/ssog-p0/p0d-balancer.mjs where they overlap — since [ssog-14] the bench
 // DIVERGES on the promote leg: it still carries the never-past-optimal guard):
-//   - FOV-compensated distance-band selection with the ×1→×5 behind-camera
-//     penalty; d0 = lodBaseDistance·budgetScale with lodBaseDistance =
+//   - FOV-compensated distance-band selection with the ×1→×(1+k) behind-camera
+//     penalty (k = `behindPenalty`, default 4 → ×5, [ssog-26]); d0 = lodBaseDistance·budgetScale with lodBaseDistance =
 //     (5/16)·chunkExtent (C3); m′ = max(1.2, 3·budgetScale^−0.2);
 //   - 64-√bucket balancer: farthest-first demote one level per leaf per pass
 //     with early-exit, nearest-first promote-to-fill with fit-check-before-
@@ -109,6 +109,13 @@ export interface SsogLodControllerOptions {
    * stay ceilings. Default "bands" (byte-identical to kroscloud.31).
    */
   lodMode?: "bands" | "sse";
+  /**
+   * [ssog-26] behind-camera penalty factor k: a leaf whose closest point lies
+   * behind the camera has its selection distance scaled by 1 + k·max(0, −dot)
+   * (k = 4 → ×5 straight behind, the pre-[ssog-26] constant). 0 makes the cut
+   * rotation-invariant: turning in place costs no fetch at all. Default 4.
+   */
+  behindPenalty?: number;
   /** [ssog-23] sse: error tolerance in CSS pixels at rest (default 2) */
   sseErrorPx?: number;
   /**
@@ -286,6 +293,8 @@ export class SsogLodController {
    * for the page-aware balancer — allocated once, length totalBlocks.
    */
   private readonly pageRefs: Int32Array;
+  /** [ssog-26] behind-camera penalty factor k in `1 + k·max(0, −dot)` */
+  private behindPenalty: number;
 
   /**
    * [ssog-17 perf] per-tick scratch for the bucket-ordered leaf index
@@ -363,6 +372,8 @@ export class SsogLodController {
     lodMode: "bands" as string,
     /** [ssog-25] "target" while an interest point orders the fill, else "camera" */
     interestMode: "camera" as string,
+    /** [ssog-26] behind-camera penalty factor in force (4 = the ×5 legacy) */
+    behindPenalty: 4,
     /**
      * [ssog-25] grows deferred by capacity or the pool guard that sat in the
      * NEARER half of the ordered grow list — the subject's share of the
@@ -480,6 +491,10 @@ export class SsogLodController {
     // spacing (extent_max / sqrt(L0 rows), PRE-resolution refs so resolved
     // aliases don't count). Measured on the 19.92M reference scene: 0.314 m.
     this.lodMode = options.lodMode === "sse" ? "sse" : "bands";
+    this.behindPenalty = SsogLodController.clampBehindPenalty(
+      options.behindPenalty,
+    );
+    this.stats.behindPenalty = this.behindPenalty;
     this.sseErrorPx = Math.max(0.1, options.sseErrorPx ?? 2);
     this.sseBaseErrorPx = options.sseBaseErrorPx ?? 4;
     this.sseDwellMs = Math.max(0, options.sseDwellMs ?? 1500);
@@ -719,6 +734,32 @@ export class SsogLodController {
         ? units
         : null;
     this.paramsDirty = true;
+  }
+
+  /**
+   * [ssog-26] Behind-camera penalty factor (see `behindPenalty` option). An
+   * app MAY lower it for first-person viewpoint sessions (Viewme: only when
+   * `?ssogpenvp` is given — default sessions keep 4), where turning in
+   * place is the primary gesture: with k = 4 every 90° turn re-cuts ~100
+   * units of the 20M reference scene (the tour simulator priced a
+   * four-turn look-around at 389 MB of fetches, 0 MB with k = 0, at a 15%
+   * row cost in the front hemisphere). A change re-arms the tick like any
+   * other parameter change.
+   */
+  setBehindPenalty(k: number) {
+    const next = SsogLodController.clampBehindPenalty(k);
+    if (next === this.behindPenalty) {
+      return;
+    }
+    this.behindPenalty = next;
+    this.stats.behindPenalty = next;
+    this.paramsDirty = true;
+  }
+
+  private static clampBehindPenalty(k: number | undefined): number {
+    return typeof k === "number" && Number.isFinite(k)
+      ? Math.min(16, Math.max(0, k))
+      : 4;
   }
 
   /**
@@ -1430,6 +1471,7 @@ export class SsogLodController {
     const logM = Math.log(mPrime);
 
     let totalOptimal = 0;
+    const behind = this.behindPenalty;
     for (let li = 0; li < NL; li++) {
       const o = li * 6;
       const px = Math.max(bounds[o], Math.min(cam.x, bounds[o + 3]));
@@ -1440,12 +1482,12 @@ export class SsogLodController {
       let dz = pz - cam.z;
       const d = Math.hypot(dx, dy, dz);
       let penalty = 1;
-      if (d > 1e-9) {
+      if (d > 1e-9 && behind > 0) {
         dx /= d;
         dy /= d;
         dz /= d;
         const dot = fwd.x * dx + fwd.y * dy + fwd.z * dz;
-        penalty = 1 + 4 * Math.max(0, -dot);
+        penalty = 1 + behind * Math.max(0, -dot);
       }
       const db = d * penalty * fovScale * uniformScale;
       let lvl = db <= d0 ? 0 : 1 + Math.floor(Math.log(db / d0) / logM);
@@ -1557,6 +1599,9 @@ export class SsogLodController {
       Math.hypot(cam.x - cx, cam.y - cy, cam.z - cz) + radius,
     );
     const sqrtDMax = Math.sqrt(dMax);
+    // [ssog-26] k = 0 → the cut is a sphere around the camera and turning in
+    // place re-fetches nothing; k = 4 → ×5 straight behind (legacy).
+    const behind = this.behindPenalty;
 
     let totalOptimal = 0;
     for (let li = 0; li < NL; li++) {
@@ -1569,12 +1614,12 @@ export class SsogLodController {
       let dz = pz - cam.z;
       const d = Math.hypot(dx, dy, dz);
       let penalty = 1;
-      if (d > 1e-9) {
+      if (d > 1e-9 && behind > 0) {
         dx /= d;
         dy /= d;
         dz /= d;
         const dot = fwd.x * dx + fwd.y * dy + fwd.z * dz;
-        penalty = 1 + 4 * Math.max(0, -dot); // ×1 in view → ×5 straight behind
+        penalty = 1 + behind * Math.max(0, -dot); // ×1 in view → ×(1+k) behind
       }
       // §2.4 pinned: d_bucket = penalizedDistance·fovScale·uniformScale —
       // the SAME value drives selection AND bucketing.
