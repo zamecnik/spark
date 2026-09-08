@@ -738,9 +738,9 @@ export class SsogLodController {
 
   /**
    * [ssog-26] Behind-camera penalty factor (see `behindPenalty` option). An
-   * app MAY lower it for first-person viewpoint sessions (Viewme: only when
-   * `?ssogpenvp` is given — default sessions keep 4), where turning in
-   * place is the primary gesture: with k = 4 every 90° turn re-cuts ~100
+   * app MAY lower it for first-person viewpoint sessions (Viewme: 0 inside
+   * viewpoint sessions since 2026-09-08, `?ssogpenvp=k` overrides), where
+   * turning in place is the primary gesture: with k = 4 every 90° turn re-cuts ~100
    * units of the 20M reference scene (the tour simulator priced a
    * four-turn look-around at 389 MB of fetches, 0 MB with k = 0, at a 15%
    * row cost in the front hemisphere). A change re-arms the tick like any
