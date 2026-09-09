@@ -1243,6 +1243,7 @@ function scanBounds(words, offsets, count) {
 class WebGpuSplatBackend {
   constructor() {
     this.sortRadial = true;
+    this.sortKeyLog = true;
     this.freezeOrder = false;
     this.vsMinimal = 0;
     this.parityQuantize = true;
@@ -1588,6 +1589,7 @@ class WebGpuSplatBackend {
     const uCameraDir = TSL.uniform(new webgpu.Vector3(0, 0, -1));
     const uDistRange = TSL.uniform(new webgpu.Vector3(0, 1, 0));
     const sortRadial = this.sortRadial;
+    const sortKeyLog = this.sortKeyLog;
     const keygen = TSL.Fn(() => {
       const i = TSL.instanceIndex;
       TSL.If(i.greaterThanEqual(TSL.uint(Math.max(1, capacity))), () => {
@@ -1623,15 +1625,8 @@ class WebGpuSplatBackend {
       const zw = unpackHalf2x16(t.z.bitAnd(TSL.uint(65535)));
       const world = uMeshToWorld.mul(TSL.vec4(TSL.vec3(xy.x, xy.y, zw.x), 1)).xyz.toVar();
       const metric = sortRadial ? world.sub(uCameraPos).length() : world.sub(uCameraPos).dot(uCameraDir).add(100);
-      const q = TSL.uint(
-        TSL.float(1).sub(
-          TSL.clamp(
-            metric.sub(uDistRange.x).div(uDistRange.y.sub(uDistRange.x)),
-            0,
-            1
-          )
-        ).mul(quantMax)
-      );
+      const norm = sortKeyLog ? TSL.log(TSL.max(metric, uDistRange.z)).sub(uDistRange.x).div(uDistRange.y) : metric.sub(uDistRange.x).div(uDistRange.y.sub(uDistRange.x));
+      const q = TSL.uint(TSL.float(1).sub(TSL.clamp(norm, 0, 1)).mul(quantMax));
       keysNode.element(i).assign(q);
     })().compute([Math.ceil(Math.max(1, capacity) / 256)], [256]).setName("splatKeygen");
     const packLevel = projOn && (this.cachePack === 1 || this.cachePack === 2) ? this.cachePack : 0;
@@ -1909,17 +1904,10 @@ class WebGpuSplatBackend {
         });
         TSL.If(TSL.float(uWK).greaterThan(0.5), () => {
           const metric = sortRadial ? viewCenter.length() : viewCenter.z.negate().add(100);
-          const qk = TSL.uint(
-            TSL.float(1).sub(
-              TSL.clamp(
-                metric.sub(uDistRange.x).div(
-                  uDistRange.y.sub(uDistRange.x)
-                ),
-                0,
-                1
-              )
-            ).mul(quantMax)
+          const normK = sortKeyLog ? TSL.log(TSL.max(metric, uDistRange.z)).sub(uDistRange.x).div(uDistRange.y) : metric.sub(uDistRange.x).div(
+            uDistRange.y.sub(uDistRange.x)
           );
+          const qk = TSL.uint(TSL.float(1).sub(TSL.clamp(normK, 0, 1)).mul(quantMax));
           if (visOn && visCountAtomic && compactVals) {
             TSL.If(rejected.not(), () => {
               const j = TSL.atomicAdd(
@@ -2089,6 +2077,17 @@ class WebGpuSplatBackend {
         Math.min(Math.max(camObj.z, mn.z), mx.z)
       ).applyMatrix4(state.mesh.matrixWorld);
       minD = Math.max(0, closest.distanceTo(camPos));
+    }
+    if (this.sortKeyLog) {
+      const minClamp = Math.max(minD, 0.02);
+      if (maxD <= minClamp * 1.001) maxD = minClamp * 2;
+      const logMin = Math.log(minClamp);
+      state.uDistRange.value.set(
+        logMin,
+        Math.log(maxD) - logMin,
+        minClamp
+      );
+      return;
     }
     if (maxD <= minD) maxD = minD + 1;
     state.uDistRange.value.set(minD, maxD, 0);

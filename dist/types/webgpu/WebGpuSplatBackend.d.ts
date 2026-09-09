@@ -33,6 +33,7 @@ type SourceKind = "static" | "lodPacked" | "paged";
 export declare class WebGpuSplatBackend {
     placeholderMaterial: THREE.Material;
     sortRadial: boolean;
+    sortKeyLog: boolean;
     freezeOrder: boolean;
     vsMinimal: number;
     parityQuantize: boolean;
