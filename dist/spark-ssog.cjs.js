@@ -213,8 +213,16 @@ class SsogModel {
       if (avail.length === 0) {
         throw new Error(`leaf ${li} has no levels at all`);
       }
+      const coarsestReal = avail[avail.length - 1];
       for (let l = 0; l < L; l++) {
         if (leafLodsPre[(li * L + l) * 3] >= 0) {
+          continue;
+        }
+        if (l > coarsestReal) {
+          const dst2 = (li * L + l) * 3;
+          leafLods[dst2] = -1;
+          leafLods[dst2 + 1] = 0;
+          leafLods[dst2 + 2] = 0;
           continue;
         }
         let best = avail[0];
@@ -233,7 +241,8 @@ class SsogModel {
       }
       for (let l = 0; l < L; l++) {
         const o = (li * L + l) * 3;
-        if (leafLods[o] < 0 || leafLods[o + 1] < 0 || leafLods[o + 2] < 0) {
+        const emptySuffix = l > coarsestReal && leafLods[o] < 0 && leafLods[o + 2] === 0;
+        if (!emptySuffix && (leafLods[o] < 0 || leafLods[o + 1] < 0 || leafLods[o + 2] < 0)) {
           throw new Error(`leaf ${li} level ${l} unresolved`);
         }
       }
@@ -1336,6 +1345,7 @@ class SsogLodController {
     this.chunkLastNeeded = /* @__PURE__ */ new Map();
     this.chunkRefs = /* @__PURE__ */ new Map();
     this.everDisplayed = /* @__PURE__ */ new Set();
+    this.tolPxAnchor = 0;
     this.priorityChunks = /* @__PURE__ */ new Set();
     this.lastPose = {
       valid: false,
@@ -1387,6 +1397,16 @@ class SsogLodController {
       interestMode: "camera",
       /** [ssog-26] behind-camera penalty factor in force (4 = the ×5 legacy) */
       behindPenalty: 4,
+      /** [ssog-31] graded budget in force */
+      gradedBudget: true,
+      /** [ssog-31] tolerance multiplier the last selection settled at (1 = the e-px cut fit) */
+      sseTolMul: 1,
+      /** [ssog-31] effective tolerance of the last selection (CSS px) = sseErrorPx × sseTolMul */
+      sseTolPx: 0,
+      /** [ssog-31] quarter-level steps the last tolerance search took */
+      sseTolSteps: 0,
+      /** [ssog-31] distinct pages of the all-coarsest cut (= the pinned tier since the empty coarse suffix) */
+      floorPages: 0,
       /**
        * [ssog-25] grows deferred by capacity or the pool guard that sat in the
        * NEARER half of the ordered grow list — the subject's share of the
@@ -1485,12 +1505,15 @@ class SsogLodController {
     this.bucketOf = new Int32Array(this.NL);
     this.dBucket = new Float64Array(this.NL);
     this.tBucket = new Float64Array(this.NL);
+    this.levelPos = new Float64Array(this.NL);
     this.readySinceTick = new Int32Array(this.NL).fill(-1);
     this.lodMode = options.lodMode === "sse" ? "sse" : "bands";
     this.behindPenalty = SsogLodController.clampBehindPenalty(
       options.behindPenalty
     );
     this.stats.behindPenalty = this.behindPenalty;
+    this.gradedBudget = options.gradedBudget !== false;
+    this.stats.gradedBudget = this.gradedBudget;
     this.sseErrorPx = Math.max(0.1, options.sseErrorPx ?? 2);
     this.sseBaseErrorPx = options.sseBaseErrorPx ?? 4;
     this.sseDwellMs = Math.max(0, options.sseDwellMs ?? 1500);
@@ -1562,6 +1585,33 @@ class SsogLodController {
         );
       }
     }
+  }
+  /**
+   * [ssog-17]/[ssog-31] distinct pool pages of a cut — the pinned tier ∪
+   * every leaf at `levels[li]` — leaving pageRefs holding that cut's
+   * refcounts for the fill's incremental moves. Bump order (pinned, then
+   * leaves ascending) is the one the inline passes used, so the refs are
+   * bit-identical to kroscloud.38 on the non-graded path.
+   */
+  countCutPages(levels) {
+    const refs = this.pageRefs;
+    refs.fill(0);
+    let distinct = 0;
+    for (const c of this.pinnedChunks) {
+      if (refs[c] === 0) {
+        distinct++;
+      }
+      refs[c]++;
+    }
+    for (let li = 0; li < this.NL; li++) {
+      distinct = this.bumpLeafPageRefs(li, levels[li], refs, distinct, 1);
+    }
+    return distinct;
+  }
+  /** [ssog-31] pages of the all-coarsest cut (the reset floor) — HUD/diagnostics, computed once. */
+  countFloorPages() {
+    const levels = new Int32Array(this.NL).fill(this.L - 1);
+    return this.countCutPages(levels);
   }
   /**
    * [ssog-17] add (dir=+1) or remove (dir=−1) one leaf-level ref's pages
@@ -1687,6 +1737,16 @@ class SsogLodController {
   }
   static clampBehindPenalty(k) {
     return typeof k === "number" && Number.isFinite(k) ? Math.min(16, Math.max(0, k)) : 4;
+  }
+  /** [ssog-31] graded budget on/off (see the option); takes effect next tick. */
+  setGradedBudget(on) {
+    const next = on !== false;
+    if (next === this.gradedBudget) {
+      return;
+    }
+    this.gradedBudget = next;
+    this.stats.gradedBudget = next;
+    this.paramsDirty = true;
   }
   /**
    * [ssog-25] Orbit-centric ordering. `point` is the camera's ORBIT TARGET in
@@ -2315,7 +2375,9 @@ class SsogLodController {
         63,
         Math.floor(64 * Math.sqrt(db) / sqrtDMax)
       );
-      let lvl = db <= d0 ? 0 : 1 + Math.floor(Math.log(db / d0) / logM);
+      const pos = db > 0 ? Math.log(db / d0) / logM : Number.NEGATIVE_INFINITY;
+      this.levelPos[li] = pos;
+      let lvl = db <= d0 ? 0 : 1 + Math.floor(pos);
       if (lvl < 0) {
         lvl = 0;
       }
@@ -2342,6 +2404,76 @@ class SsogLodController {
     this.balancedLevel.set(this.optimalLevel);
     let totalBalanced = totalOptimal;
     const budget = this.budget;
+    const pager = this.splats.pager;
+    const wholeResident = !pager || pager.maxPages >= model.totalBlocks;
+    const pageLimit = wholeResident ? Number.POSITIVE_INFINITY : this.poolGuardLimit() - (model.maxLeafBlockFootprint + pager.numFetchers);
+    const pageRefs = this.pageRefs;
+    if (this.stats.floorPages === 0) {
+      this.stats.floorPages = this.countFloorPages();
+    }
+    let tolShift = 0;
+    let tolSteps = 0;
+    if (sse && this.gradedBudget) {
+      const K = 256;
+      const pageSlack = wholeResident ? 0 : Math.max(1, Math.round(0.04 * pageLimit));
+      const evalK = (k2, slack) => {
+        tolSteps++;
+        const shift = k2 / 4;
+        let total = 0;
+        for (let li = 0; li < NL; li++) {
+          const x = this.levelPos[li] + shift;
+          let lvl = x <= 0 ? 0 : 1 + Math.floor(x);
+          if (lvl >= L) {
+            lvl = L - 1;
+          }
+          this.balancedLevel[li] = lvl;
+          total += model.leafLods[(li * L + lvl) * 3 + 2];
+        }
+        totalBalanced = total;
+        if (total > (slack ? 0.97 * budget : budget)) {
+          return false;
+        }
+        return wholeResident || this.countCutPages(this.balancedLevel) <= (slack ? pageLimit - pageSlack : pageLimit);
+      };
+      const e = this.stats.sseErrorPx;
+      let k = this.tolPxAnchor > 0 && e > 0 ? Math.min(K, Math.max(0, Math.round(8 * Math.log2(this.tolPxAnchor / e)))) : 0;
+      if (evalK(k, false)) {
+        if (k > 0 && evalK(k - 1, true)) {
+          let lo = -1;
+          let hi = k - 1;
+          while (hi - lo > 1) {
+            const mid = lo + hi >> 1;
+            if (evalK(mid, true)) {
+              hi = mid;
+            } else {
+              lo = mid;
+            }
+          }
+          k = hi;
+        }
+        evalK(k, false);
+      } else if (evalK(K, false)) {
+        let lo = k;
+        let hi = K;
+        while (hi - lo > 1) {
+          const mid = lo + hi >> 1;
+          if (evalK(mid, false)) {
+            hi = mid;
+          } else {
+            lo = mid;
+          }
+        }
+        k = hi;
+        evalK(k, false);
+      } else {
+        k = K;
+      }
+      tolShift = k / 4;
+      this.tolPxAnchor = e * mPrime ** tolShift;
+    }
+    this.stats.sseTolMul = sse ? mPrime ** tolShift : 1;
+    this.stats.sseTolPx = sse ? this.stats.sseErrorPx * this.stats.sseTolMul : 0;
+    this.stats.sseTolSteps = tolSteps;
     if (totalBalanced > budget) {
       let passes = 0;
       demote: while (totalBalanced > budget && passes < L) {
@@ -2364,48 +2496,14 @@ class SsogLodController {
         }
       }
     }
-    const pager = this.splats.pager;
-    const wholeResident = !pager || pager.maxPages >= model.totalBlocks;
-    const pageLimit = wholeResident ? Number.POSITIVE_INFINITY : this.poolGuardLimit() - (model.maxLeafBlockFootprint + pager.numFetchers);
-    const pageRefs = this.pageRefs;
-    pageRefs.fill(0);
-    let distinctPages = 0;
-    for (const c of this.pinnedChunks) {
-      if (pageRefs[c] === 0) {
-        distinctPages++;
-      }
-      pageRefs[c]++;
-    }
-    for (let li = 0; li < NL; li++) {
-      distinctPages = this.bumpLeafPageRefs(
-        li,
-        this.balancedLevel[li],
-        pageRefs,
-        distinctPages,
-        1
-      );
-    }
+    let distinctPages = this.countCutPages(this.balancedLevel);
     if (distinctPages > pageLimit) {
       totalBalanced = 0;
-      pageRefs.fill(0);
-      distinctPages = 0;
-      for (const c of this.pinnedChunks) {
-        if (pageRefs[c] === 0) {
-          distinctPages++;
-        }
-        pageRefs[c]++;
-      }
       for (let li = 0; li < NL; li++) {
         this.balancedLevel[li] = L - 1;
         totalBalanced += model.leafLods[(li * L + L - 1) * 3 + 2];
-        distinctPages = this.bumpLeafPageRefs(
-          li,
-          L - 1,
-          pageRefs,
-          distinctPages,
-          1
-        );
       }
+      distinctPages = this.countCutPages(this.balancedLevel);
     }
     const FILL_UTILIZATION = 0.78;
     const avgPageSplats = model.count / Math.max(1, model.totalBlocks);

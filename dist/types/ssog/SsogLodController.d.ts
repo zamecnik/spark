@@ -61,6 +61,18 @@ export interface SsogLodControllerOptions {
      * rotation-invariant: turning in place costs no fetch at all. Default 4.
      */
     behindPenalty?: number;
+    /**
+     * [ssog-31] graded budget (sse only). When the e-px cut exceeds the splat
+     * budget or the page limit, RELAX THE TOLERANCE instead of demoting every
+     * leaf one level per pass: the pure sse cut at the smallest tolerance
+     * e·m (m on a quarter-level grid, ×2^(1/8) per step) that fits BOTH
+     * limits becomes the balanced target, and the promote-to-fill legs spend
+     * the residual nearest-first as before, still capped at the e-px levels.
+     * Keeps the distance gradient (near sharp, far coarse) that the
+     * one-level-per-pass demotion flattened into "everything L4". Default
+     * true; false = the kroscloud.38 balancer (A/B).
+     */
+    gradedBudget?: boolean;
     /** [ssog-23] sse: error tolerance in CSS pixels at rest (default 2) */
     sseErrorPx?: number;
     /**
@@ -218,6 +230,25 @@ export declare class SsogLodController {
     private readonly pageRefs;
     /** [ssog-26] behind-camera penalty factor k in `1 + k·max(0, −dot)` */
     private behindPenalty;
+    /** [ssog-31] graded budget on/off (see the option) */
+    private gradedBudget;
+    /**
+     * [ssog-31] per-tick scratch: each leaf's continuous level position
+     * log(db/d0)/log(m') from the selection loop, so the tolerance search
+     * re-levels every leaf per step with one add + floor instead of a log.
+     */
+    private readonly levelPos;
+    /**
+     * [ssog-31] EFFECTIVE tolerance (e·m, CSS px) the previous tick settled
+     * at, the anchor of the next search — stored in px, not as the grid
+     * index, because the base/fine phases change e (4 px moving, 2 px at
+     * rest) and the same cut then sits 8 grid steps away; anchoring on k
+     * made every phase change walk the cut down and back (harness look-
+     * around at k=0: 6 refetched units and 2.3× the flips of a stable cut).
+     * The search starts here: coarser only when the anchor no longer fits,
+     * finer only when one step finer fits WITH slack.
+     */
+    private tolPxAnchor;
     /**
      * [ssog-17 perf] per-tick scratch for the bucket-ordered leaf index
      * (counting sort, stable in li): the balancer passes visit leaves in
@@ -286,6 +317,16 @@ export declare class SsogLodController {
         interestMode: string;
         /** [ssog-26] behind-camera penalty factor in force (4 = the ×5 legacy) */
         behindPenalty: number;
+        /** [ssog-31] graded budget in force */
+        gradedBudget: boolean;
+        /** [ssog-31] tolerance multiplier the last selection settled at (1 = the e-px cut fit) */
+        sseTolMul: number;
+        /** [ssog-31] effective tolerance of the last selection (CSS px) = sseErrorPx × sseTolMul */
+        sseTolPx: number;
+        /** [ssog-31] quarter-level steps the last tolerance search took */
+        sseTolSteps: number;
+        /** [ssog-31] distinct pages of the all-coarsest cut (= the pinned tier since the empty coarse suffix) */
+        floorPages: number;
         /**
          * [ssog-25] grows deferred by capacity or the pool guard that sat in the
          * NEARER half of the ordered grow list — the subject's share of the
@@ -363,6 +404,16 @@ export declare class SsogLodController {
     };
     constructor(options: SsogLodControllerOptions);
     /**
+     * [ssog-17]/[ssog-31] distinct pool pages of a cut — the pinned tier ∪
+     * every leaf at `levels[li]` — leaving pageRefs holding that cut's
+     * refcounts for the fill's incremental moves. Bump order (pinned, then
+     * leaves ascending) is the one the inline passes used, so the refs are
+     * bit-identical to kroscloud.38 on the non-graded path.
+     */
+    private countCutPages;
+    /** [ssog-31] pages of the all-coarsest cut (the reset floor) — HUD/diagnostics, computed once. */
+    private countFloorPages;
+    /**
      * [ssog-17] add (dir=+1) or remove (dir=−1) one leaf-level ref's pages
      * to/from the final-cut refcount scratch; returns the updated distinct
      * count. Same chunk math as forEachLeafChunk, inlined for the balancer's
@@ -408,6 +459,8 @@ export declare class SsogLodController {
      */
     setBehindPenalty(k: number): void;
     private static clampBehindPenalty;
+    /** [ssog-31] graded budget on/off (see the option); takes effect next tick. */
+    setGradedBudget(on: boolean): void;
     /**
      * [ssog-25] Orbit-centric ordering. `point` is the camera's ORBIT TARGET in
      * WORLD space (converted into the mesh frame with the same matrix the
