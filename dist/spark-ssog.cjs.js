@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 const spark = require("@sparkjsdev/spark");
+const browser = require("./browser-MOWB998F.cjs");
 const THREE = require("three");
 function _interopNamespaceDefault(e) {
   const n = Object.create(null, { [Symbol.toStringTag]: { value: "Module" } });
@@ -39,6 +40,16 @@ class SsogModel {
     }
     this.hasEnvironment = meta.environment !== void 0;
     this.chunkExtent = typeof meta.chunkExtent === "number" && Number.isFinite(meta.chunkExtent) && meta.chunkExtent > 0 ? meta.chunkExtent : null;
+    const up = meta.unitPack;
+    if (up === void 0 || up === 0) {
+      this.unitPack = 0;
+    } else if (up === 1) {
+      this.unitPack = 1;
+    } else {
+      throw new Error(
+        `lod-meta unitPack ${String(up)} is not supported by this viewer (expected absent, 0 or 1) — update the viewer`
+      );
+    }
     const L = meta.lodLevels;
     const numUnits = meta.filenames.length;
     const unitCountsPerLevel = new Array(L).fill(0);
@@ -297,12 +308,237 @@ class SsogModel {
     };
   }
 }
+const SSOG_UNIT_PACK_FILE = "unit.bin";
+const SSOG_UNIT_PACK_VERSION = 1;
+const SSOG_UNIT_PACK_MEMBER_NAMES = /* @__PURE__ */ new Set([
+  "meta.json",
+  "means_l.webp",
+  "means_u.webp",
+  "quats.webp",
+  "scales.webp",
+  "sh0.webp",
+  "shN_centroids.webp",
+  "shN_labels.webp"
+]);
+const MAGIC = 1430736723;
+const HEADER = 32;
+const ENTRY = 48;
+const NAME_BYTES = 32;
+const MAX_MEMBERS = 16;
+const ALIGN = 16;
+const META_MAX = 4 << 20;
+const META_NAME = "meta.json";
+const MFLAG_DEFLATE = 1;
+class SsogUnitPackError extends Error {
+  constructor(label, reason) {
+    super(`${label}: bad unit pack — ${reason}`);
+    this.reason = reason;
+    this.name = "SsogUnitPackError";
+  }
+}
+function align16(n) {
+  return Math.ceil(n / ALIGN) * ALIGN;
+}
+function hex(n, digits) {
+  return `0x${n.toString(16).padStart(digits, "0")}`;
+}
+function parseUnitPack(buf, label) {
+  const err = (reason) => new SsogUnitPackError(label, reason);
+  const actual = buf.byteLength;
+  if (actual < HEADER) {
+    throw err(
+      `file is ${actual} bytes, shorter than the ${HEADER}-byte header`
+    );
+  }
+  const dv = new DataView(buf);
+  const magic = dv.getUint32(0, true);
+  if (magic !== MAGIC) {
+    throw err(`magic ${hex(magic, 8)} is not "SOGU"`);
+  }
+  const version = dv.getUint16(4, true);
+  if (version !== SSOG_UNIT_PACK_VERSION) {
+    throw err(`version ${version} (expected ${SSOG_UNIT_PACK_VERSION})`);
+  }
+  const flags = dv.getUint16(6, true);
+  if (flags !== 0) {
+    throw err(`flags ${hex(flags, 4)} (expected 0)`);
+  }
+  const memberCount = dv.getUint32(8, true);
+  const count = dv.getUint32(12, true);
+  const payloadOffset = dv.getUint32(16, true);
+  const fileLength = dv.getUint32(20, true);
+  if (dv.getUint32(24, true) !== 0 || dv.getUint32(28, true) !== 0) {
+    throw err("reserved header bytes are not zero");
+  }
+  if (memberCount < 1 || memberCount > MAX_MEMBERS) {
+    throw err(`memberCount ${memberCount} outside 1..${MAX_MEMBERS}`);
+  }
+  const expectedPayload = align16(HEADER + ENTRY * memberCount);
+  if (payloadOffset !== expectedPayload) {
+    throw err(
+      `payloadOffset ${payloadOffset} (expected ${expectedPayload} for ${memberCount} members)`
+    );
+  }
+  if (payloadOffset > fileLength) {
+    throw err(`payloadOffset ${payloadOffset} beyond fileLength ${fileLength}`);
+  }
+  if (fileLength !== actual) {
+    throw err(`fileLength ${fileLength} but the file is ${actual} bytes`);
+  }
+  const bytes = new Uint8Array(buf);
+  const names = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (let i = 0; i < memberCount; i++) {
+    const base = HEADER + ENTRY * i;
+    let end = -1;
+    for (let k = 0; k < NAME_BYTES; k++) {
+      if (bytes[base + k] === 0) {
+        end = k;
+        break;
+      }
+    }
+    if (end < 1) {
+      throw err(
+        `entry ${i}: name is empty or not NUL-terminated within ${NAME_BYTES} bytes`
+      );
+    }
+    let name = "";
+    for (let k = 0; k < end; k++) {
+      const c = bytes[base + k];
+      if (c < 33 || c > 126) {
+        throw err(
+          `entry ${i}: name byte ${k} (${hex(c, 2)}) is not printable ASCII`
+        );
+      }
+      name += String.fromCharCode(c);
+    }
+    for (let k = end + 1; k < NAME_BYTES; k++) {
+      if (bytes[base + k] !== 0) {
+        throw err(`entry ${i} (${name}): name padding is not zero`);
+      }
+    }
+    if (!SSOG_UNIT_PACK_MEMBER_NAMES.has(name)) {
+      throw err(`entry ${i}: unknown member name "${name}"`);
+    }
+    if (seen.has(name)) {
+      throw err(`entry ${i}: duplicate member name "${name}"`);
+    }
+    seen.add(name);
+    names.push(name);
+  }
+  if (names[0] !== META_NAME) {
+    throw err(`entry 0 is "${names[0]}", expected "${META_NAME}"`);
+  }
+  const members = /* @__PURE__ */ new Map();
+  let cursor = payloadOffset;
+  for (let i = 0; i < memberCount; i++) {
+    const base = HEADER + ENTRY * i + NAME_BYTES;
+    const name = names[i];
+    const offset = dv.getUint32(base, true);
+    const length = dv.getUint32(base + 4, true);
+    const rawLength = dv.getUint32(base + 8, true);
+    const mflags = dv.getUint32(base + 12, true);
+    const tag = `entry ${i} (${name})`;
+    if (length < 1) {
+      throw err(`${tag}: length 0`);
+    }
+    if (offset % ALIGN !== 0) {
+      throw err(`${tag}: offset ${offset} is not 16-byte aligned`);
+    }
+    if (offset < payloadOffset) {
+      throw err(
+        `${tag}: offset ${offset} before payloadOffset ${payloadOffset}`
+      );
+    }
+    if (offset < cursor) {
+      throw err(
+        `${tag}: offset ${offset} overlaps the previous member ending at ${cursor}`
+      );
+    }
+    if (offset + length > fileLength) {
+      throw err(
+        `${tag}: offset ${offset} + length ${length} exceeds fileLength ${fileLength}`
+      );
+    }
+    if ((mflags & -2) !== 0) {
+      throw err(`${tag}: mflags ${hex(mflags, 8)} has unknown bits set`);
+    }
+    const deflate = (mflags & MFLAG_DEFLATE) !== 0;
+    if (deflate && i !== 0) {
+      throw err(`${tag}: deflate is allowed only on entry 0 (meta.json)`);
+    }
+    if (!deflate && rawLength !== length) {
+      throw err(
+        `${tag}: rawLength ${rawLength} != length ${length} without deflate`
+      );
+    }
+    members.set(name, { name, offset, length, rawLength, deflate });
+    cursor = offset + length;
+  }
+  if (cursor !== fileLength) {
+    throw err(
+      `last member ends at ${cursor}, fileLength ${fileLength} (trailing bytes)`
+    );
+  }
+  const meta = members.get(META_NAME);
+  if (!meta) {
+    throw err("container has no meta.json member");
+  }
+  if (meta.length > META_MAX) {
+    throw err(
+      `meta.json stored length ${meta.length} exceeds ${META_MAX} bytes`
+    );
+  }
+  if (meta.rawLength > META_MAX) {
+    throw err(
+      `meta.json rawLength ${meta.rawLength} exceeds ${META_MAX} bytes`
+    );
+  }
+  return { count, fileLength, members };
+}
+function readUnitPackMeta(buf, index, label) {
+  const m = index.members.get(META_NAME);
+  if (!m) {
+    throw new SsogUnitPackError(label, "container has no meta.json member");
+  }
+  const stored = new Uint8Array(buf, m.offset, m.length);
+  if (!m.deflate) {
+    return stored;
+  }
+  let out;
+  try {
+    out = browser.inflateSync(stored);
+  } catch (e) {
+    throw new SsogUnitPackError(
+      label,
+      `meta.json inflate failed: ${e instanceof Error ? e.message : String(e)}`
+    );
+  }
+  if (out.length !== m.rawLength) {
+    throw new SsogUnitPackError(
+      label,
+      `meta.json inflated to ${out.length} bytes, rawLength says ${m.rawLength}`
+    );
+  }
+  return out;
+}
+function planeNames(json) {
+  var _a;
+  return [
+    ...json.means.files,
+    ...json.scales.files,
+    ...json.quats.files,
+    ...json.sh0.files,
+    ...((_a = json.shN) == null ? void 0 : _a.files) ?? []
+  ];
+}
 const UNIT_BYTES_MAX = 4096;
 class SsogUnitCache {
   constructor(options) {
     this.units = /* @__PURE__ */ new Map();
     this.unitBytesMap = /* @__PURE__ */ new Map();
     this.recordSeq = 0;
+    this.unitFailures = /* @__PURE__ */ new Map();
     this.stats = {
       fetches: 0,
       decodes: 0,
@@ -362,7 +598,15 @@ class SsogUnitCache {
        * bytesReceived is an OVER-estimate by exactly these files' compression
        * savings — a large value means the wire measurement is not working.
        */
-      filesWithoutWireSize: 0
+      filesWithoutWireSize: 0,
+      /** [ssog-27] units loaded through the ONE-file container path */
+      packedFetches: 0,
+      /** [ssog-27] containers rejected (magic/version/table/count/member set) — each also counts in fetchErrors */
+      packErrors: 0,
+      /** [ssog-27] non-abort unit failures (network, container, decode); drives the per-unit cool-down */
+      unitStrikes: 0,
+      /** [ssog-27] getUnit calls refused during a unit's cool-down (no request made) */
+      fetchRefused: 0
     };
     this.palettes = /* @__PURE__ */ new Map();
     this.completedBytes = 0;
@@ -406,6 +650,15 @@ class SsogUnitCache {
       }
       return existing.promise;
     }
+    const failure = this.unitFailures.get(unit);
+    if (failure && performance.now() < failure.until) {
+      this.stats.fetchRefused += 1;
+      return Promise.reject(
+        new Error(
+          `ssog unit ${this.model.unitDirName(unit)}: refused for ${Math.ceil((failure.until - performance.now()) / 1e3)} s after ${failure.strikes} failed attempt(s)`
+        )
+      );
+    }
     const record = {
       id: ++this.recordSeq,
       promise: void 0,
@@ -424,14 +677,25 @@ class SsogUnitCache {
       (decoded) => {
         record.settled = true;
         this.rememberUnitBytes(unit, record.receivedWire);
+        this.unitFailures.delete(unit);
         return decoded;
       },
       (error) => {
+        var _a;
         if (this.units.get(unit) === record) {
           this.units.delete(unit);
         }
         if (!record.aborted && !isAbortError(error)) {
           this.stats.fetchErrors += 1;
+          if (error instanceof SsogUnitPackError) {
+            this.stats.packErrors += 1;
+          }
+          const strikes = (((_a = this.unitFailures.get(unit)) == null ? void 0 : _a.strikes) ?? 0) + 1;
+          this.stats.unitStrikes += 1;
+          this.unitFailures.set(unit, {
+            strikes,
+            until: performance.now() + 1e3 * Math.min(300, 2 ** (strikes + 1))
+          });
         }
         throw error;
       }
@@ -572,6 +836,7 @@ class SsogUnitCache {
     this.units.clear();
     this.unitBytesMap.clear();
     this.palettes.clear();
+    this.unitFailures.clear();
   }
   /**
    * Fetch one file under the signing hook. [ssog-24] The body is read as a
@@ -671,7 +936,6 @@ class SsogUnitCache {
     return out.buffer;
   }
   async fetchDecodeUnit(unit, record) {
-    var _a, _b;
     const signal = record.controller.signal;
     const sink = {
       onLength: (bytes) => {
@@ -692,17 +956,19 @@ class SsogUnitCache {
       }
     };
     const dir = this.model.unitDirName(unit);
+    const { json, files } = this.model.unitPack === 1 ? await this.fetchPackedUnit(unit, dir, record, signal, sink) : await this.fetchClassicUnit(dir, record, signal, sink);
+    return this.decodeFetchedUnit(unit, dir, json, files, signal);
+  }
+  /**
+   * Classic loose files: meta.json first (the plane list lives in it), then
+   * every plane in parallel under the unit's abort signal.
+   */
+  async fetchClassicUnit(dir, record, signal, sink) {
     const metaBytes = await this.fetchFile(`${dir}/meta.json`, signal, sink);
     const json = JSON.parse(
       new TextDecoder().decode(metaBytes)
     );
-    const names = [
-      ...json.means.files,
-      ...json.scales.files,
-      ...json.quats.files,
-      ...json.sh0.files,
-      ...((_a = json.shN) == null ? void 0 : _a.files) ?? []
-    ];
+    const names = planeNames(json);
     record.filesTotal = 1 + names.length;
     const files = {};
     await Promise.all(
@@ -711,7 +977,78 @@ class SsogUnitCache {
       })
     );
     record.fetchDone = true;
-    const paletteRel = (_b = json.shN) == null ? void 0 : _b.palette;
+    return { json, files };
+  }
+  /**
+   * [ssog-27] ONE file per unit, known BEFORE the request starts: filesTotal=1
+   * now, expected on the first Content-Length header (identity octet-stream)
+   * → unitProgress is real from the first byte, never null for the whole
+   * transfer. A content-encoded response still counts as length-unknown
+   * (fetchFile) and is settled by onEnd — the safe direction is preserved.
+   * The container is verified (header, directory, meta bound) and its counts
+   * are checked against the model BEFORE any decode; every violation rejects
+   * with an SsogUnitPackError, which the strike/cool-down then bounds.
+   */
+  async fetchPackedUnit(unit, dir, record, signal, sink) {
+    record.filesTotal = 1;
+    const buf = await this.fetchFile(
+      `${dir}/${SSOG_UNIT_PACK_FILE}`,
+      signal,
+      sink
+    );
+    record.fetchDone = true;
+    const label = `ssog unit ${dir}`;
+    const pack = parseUnitPack(buf, label);
+    const rows = this.model.unitSplats[unit];
+    if (pack.count !== rows) {
+      throw new SsogUnitPackError(
+        label,
+        `header count ${pack.count}, model derives ${rows}`
+      );
+    }
+    const metaText = new TextDecoder().decode(
+      readUnitPackMeta(buf, pack, label)
+    );
+    let json;
+    try {
+      json = JSON.parse(metaText);
+    } catch (e) {
+      throw new SsogUnitPackError(
+        label,
+        `meta.json is not valid JSON: ${e.message}`
+      );
+    }
+    if (json.count !== rows) {
+      throw new SsogUnitPackError(
+        label,
+        `meta count ${json.count}, model derives ${rows}`
+      );
+    }
+    const names = planeNames(json);
+    if (pack.members.size !== names.length + 1) {
+      throw new SsogUnitPackError(
+        label,
+        `${pack.members.size - 1} plane members, meta lists ${names.length}`
+      );
+    }
+    const files = {};
+    for (const name of names) {
+      const m = pack.members.get(name);
+      if (!m || m.deflate) {
+        throw new SsogUnitPackError(
+          label,
+          `plane ${name} missing from container or compressed`
+        );
+      }
+      files[name] = buf.slice(m.offset, m.offset + m.length);
+    }
+    this.stats.packedFetches += 1;
+    return { json, files };
+  }
+  /** shared tail of both shapes: palette memo → worker decode → P0b count gate */
+  async decodeFetchedUnit(unit, dir, json, files, signal) {
+    var _a;
+    const paletteRel = (_a = json.shN) == null ? void 0 : _a.palette;
     let palette;
     if (paletteRel) {
       const bytes = await this.getPalette(paletteRel);
@@ -1115,7 +1452,15 @@ class SsogLodController {
        * bytesReceived instead. Non-zero means the byte figures are an
        * over-estimate, not that little was transferred.
        */
-      filesWithoutWireSize: 0
+      filesWithoutWireSize: 0,
+      /** [ssog-27] units loaded through the ONE-file container path — cache mirror */
+      packedFetches: 0,
+      /** [ssog-27] containers rejected (magic/version/table/count/member set) — cache mirror */
+      packErrors: 0,
+      /** [ssog-27] non-abort unit failures that started a per-unit cool-down — cache mirror */
+      unitStrikes: 0,
+      /** [ssog-27] getUnit calls refused during a unit's cool-down (no request made) — cache mirror */
+      fetchRefused: 0
     };
     this.mesh = options.mesh;
     this.splats = options.splats;
@@ -1323,9 +1668,9 @@ class SsogLodController {
   }
   /**
    * [ssog-26] Behind-camera penalty factor (see `behindPenalty` option). An
-   * app MAY lower it for first-person viewpoint sessions (Viewme: only when
-   * `?ssogpenvp` is given — default sessions keep 4), where turning in
-   * place is the primary gesture: with k = 4 every 90° turn re-cuts ~100
+   * app MAY lower it for first-person viewpoint sessions (Viewme: 0 inside
+   * viewpoint sessions since 2026-09-08, `?ssogpenvp=k` overrides), where
+   * turning in place is the primary gesture: with k = 4 every 90° turn re-cuts ~100
    * units of the 20M reference scene (the tour simulator priced a
    * four-turn look-around at 389 MB of fetches, 0 MB with k = 0, at a 15%
    * row cost in the front hemisphere). A change re-arms the tick like any
@@ -1481,6 +1826,10 @@ class SsogLodController {
     this.stats.paletteFetches = cs.paletteFetches;
     this.stats.filesWithoutLength = cs.filesWithoutLength;
     this.stats.filesWithoutWireSize = cs.filesWithoutWireSize;
+    this.stats.packedFetches = cs.packedFetches;
+    this.stats.packErrors = cs.packErrors;
+    this.stats.unitStrikes = cs.unitStrikes;
+    this.stats.fetchRefused = cs.fetchRefused;
     const pager = this.splats.pager;
     if (pager) {
       this.stats.chunkCancels = pager.fetchCancels;
@@ -2374,8 +2723,15 @@ class SsogLodController {
   }
 }
 exports.SSOG_PAGE_SPLATS = SSOG_PAGE_SPLATS;
+exports.SSOG_UNIT_PACK_FILE = SSOG_UNIT_PACK_FILE;
+exports.SSOG_UNIT_PACK_MEMBER_NAMES = SSOG_UNIT_PACK_MEMBER_NAMES;
+exports.SSOG_UNIT_PACK_VERSION = SSOG_UNIT_PACK_VERSION;
 exports.SsogLodController = SsogLodController;
 exports.SsogModel = SsogModel;
 exports.SsogSplats = SsogSplats;
 exports.SsogUnitCache = SsogUnitCache;
+exports.SsogUnitPackError = SsogUnitPackError;
+exports.parseUnitPack = parseUnitPack;
+exports.planeNames = planeNames;
+exports.readUnitPackMeta = readUnitPackMeta;
 //# sourceMappingURL=spark-ssog.cjs.js.map

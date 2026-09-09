@@ -44,6 +44,15 @@ export declare class SsogUnitCache {
     private unitBytesMap;
     /** [ssog-24] monotonic UnitRecord id source (see UnitRecord.id) */
     private recordSeq;
+    /**
+     * [ssog-27] unit → {strikes, until(ms)}: after a non-abort failure the unit
+     * is refused for min(300 s, 2^(strikes+1) s). The pager treats every
+     * non-abort rejection as transient (warn, short backoff, re-issue) and the
+     * failed record is dropped, so without this a permanently bad unit would
+     * be re-downloaded whole every ~0.5 s; a dead unit now costs zero network
+     * after the 3rd attempt and shows up in `fetchRefused` / `unitStrikes`.
+     */
+    private unitFailures;
     /** counters for the HUD/harness (all cumulative since construction) */
     stats: {
         fetches: number;
@@ -105,6 +114,14 @@ export declare class SsogUnitCache {
          * savings — a large value means the wire measurement is not working.
          */
         filesWithoutWireSize: number;
+        /** [ssog-27] units loaded through the ONE-file container path */
+        packedFetches: number;
+        /** [ssog-27] containers rejected (magic/version/table/count/member set) — each also counts in fetchErrors */
+        packErrors: number;
+        /** [ssog-27] non-abort unit failures (network, container, decode); drives the per-unit cool-down */
+        unitStrikes: number;
+        /** [ssog-27] getUnit calls refused during a unit's cool-down (no request made) */
+        fetchRefused: number;
     };
     /**
      * [ssog-22 fix] shared SH palettes, keyed by relative path. The build writes
@@ -201,4 +218,22 @@ export declare class SsogUnitCache {
      */
     private fetchFile;
     private fetchDecodeUnit;
+    /**
+     * Classic loose files: meta.json first (the plane list lives in it), then
+     * every plane in parallel under the unit's abort signal.
+     */
+    private fetchClassicUnit;
+    /**
+     * [ssog-27] ONE file per unit, known BEFORE the request starts: filesTotal=1
+     * now, expected on the first Content-Length header (identity octet-stream)
+     * → unitProgress is real from the first byte, never null for the whole
+     * transfer. A content-encoded response still counts as length-unknown
+     * (fetchFile) and is settled by onEnd — the safe direction is preserved.
+     * The container is verified (header, directory, meta bound) and its counts
+     * are checked against the model BEFORE any decode; every violation rejects
+     * with an SsogUnitPackError, which the strike/cool-down then bounds.
+     */
+    private fetchPackedUnit;
+    /** shared tail of both shapes: palette memo → worker decode → P0b count gate */
+    private decodeFetchedUnit;
 }

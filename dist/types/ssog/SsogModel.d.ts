@@ -26,6 +26,12 @@ export interface SsogLodMeta {
      * ACTUAL tree instead of the CLI default (16).
      */
     chunkExtent?: number;
+    /**
+     * [ssog-27] pipeline packer stamp: 1 = every unit is ONE SOGU container
+     * `{L}_{i}/unit.bin`; absent/0 = classic loose files. Any other value is
+     * rejected at construction (never sniffed, never silently downgraded).
+     */
+    unitPack?: number;
     tree: SsogLodMetaNode & {
         bound: SsogLodMetaBound;
     };
@@ -39,6 +45,8 @@ export declare class SsogModel {
     readonly hasEnvironment: boolean;
     /** [ssog-16] builder chunk extent from the meta stamp; null on old bundles */
     readonly chunkExtent: number | null;
+    /** [ssog-27] unit container format: 0 = classic loose files, 1 = `unit.bin` per unit */
+    readonly unitPack: 0 | 1;
     readonly numLeaves: number;
     /** [leaf*6 .. leaf*6+5] = minX,minY,minZ,maxX,maxY,maxZ */
     readonly boundsFlat: Float32Array;

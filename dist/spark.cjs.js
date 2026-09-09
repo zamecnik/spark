@@ -1,6 +1,7 @@
 "use strict";
 Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 const THREE = require("three");
+const browser = require("./browser-MOWB998F.cjs");
 const Pass_js = require("three/addons/postprocessing/Pass.js");
 const kcRegrowDebug = require("./kcRegrowDebug-C_gpgxNu.cjs");
 var _documentCurrentScript = typeof document !== "undefined" ? document.currentScript : null;
@@ -80,527 +81,6 @@ function WorkerWrapper$1(options) {
   } finally {
     objURL && (self.URL || self.webkitURL).revokeObjectURL(objURL);
   }
-}
-var u8 = Uint8Array, u16 = Uint16Array, i32 = Int32Array;
-var fleb = new u8([
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  1,
-  1,
-  1,
-  1,
-  2,
-  2,
-  2,
-  2,
-  3,
-  3,
-  3,
-  3,
-  4,
-  4,
-  4,
-  4,
-  5,
-  5,
-  5,
-  5,
-  0,
-  /* unused */
-  0,
-  0,
-  /* impossible */
-  0
-]);
-var fdeb = new u8([
-  0,
-  0,
-  0,
-  0,
-  1,
-  1,
-  2,
-  2,
-  3,
-  3,
-  4,
-  4,
-  5,
-  5,
-  6,
-  6,
-  7,
-  7,
-  8,
-  8,
-  9,
-  9,
-  10,
-  10,
-  11,
-  11,
-  12,
-  12,
-  13,
-  13,
-  /* unused */
-  0,
-  0
-]);
-var clim = new u8([16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]);
-var freb = function(eb, start) {
-  var b = new u16(31);
-  for (var i = 0; i < 31; ++i) {
-    b[i] = start += 1 << eb[i - 1];
-  }
-  var r = new i32(b[30]);
-  for (var i = 1; i < 30; ++i) {
-    for (var j = b[i]; j < b[i + 1]; ++j) {
-      r[j] = j - b[i] << 5 | i;
-    }
-  }
-  return { b, r };
-};
-var _a = freb(fleb, 2), fl = _a.b, revfl = _a.r;
-fl[28] = 258, revfl[258] = 28;
-var _b = freb(fdeb, 0), fd = _b.b;
-var rev = new u16(32768);
-for (var i = 0; i < 32768; ++i) {
-  var x = (i & 43690) >> 1 | (i & 21845) << 1;
-  x = (x & 52428) >> 2 | (x & 13107) << 2;
-  x = (x & 61680) >> 4 | (x & 3855) << 4;
-  rev[i] = ((x & 65280) >> 8 | (x & 255) << 8) >> 1;
-}
-var hMap = function(cd, mb, r) {
-  var s = cd.length;
-  var i = 0;
-  var l = new u16(mb);
-  for (; i < s; ++i) {
-    if (cd[i])
-      ++l[cd[i] - 1];
-  }
-  var le = new u16(mb);
-  for (i = 1; i < mb; ++i) {
-    le[i] = le[i - 1] + l[i - 1] << 1;
-  }
-  var co;
-  if (r) {
-    co = new u16(1 << mb);
-    var rvb = 15 - mb;
-    for (i = 0; i < s; ++i) {
-      if (cd[i]) {
-        var sv = i << 4 | cd[i];
-        var r_1 = mb - cd[i];
-        var v = le[cd[i] - 1]++ << r_1;
-        for (var m = v | (1 << r_1) - 1; v <= m; ++v) {
-          co[rev[v] >> rvb] = sv;
-        }
-      }
-    }
-  } else {
-    co = new u16(s);
-    for (i = 0; i < s; ++i) {
-      if (cd[i]) {
-        co[i] = rev[le[cd[i] - 1]++] >> 15 - cd[i];
-      }
-    }
-  }
-  return co;
-};
-var flt = new u8(288);
-for (var i = 0; i < 144; ++i)
-  flt[i] = 8;
-for (var i = 144; i < 256; ++i)
-  flt[i] = 9;
-for (var i = 256; i < 280; ++i)
-  flt[i] = 7;
-for (var i = 280; i < 288; ++i)
-  flt[i] = 8;
-var fdt = new u8(32);
-for (var i = 0; i < 32; ++i)
-  fdt[i] = 5;
-var flrm = /* @__PURE__ */ hMap(flt, 9, 1);
-var fdrm = /* @__PURE__ */ hMap(fdt, 5, 1);
-var max$1 = function(a) {
-  var m = a[0];
-  for (var i = 1; i < a.length; ++i) {
-    if (a[i] > m)
-      m = a[i];
-  }
-  return m;
-};
-var bits = function(d, p, m) {
-  var o = p / 8 | 0;
-  return (d[o] | d[o + 1] << 8) >> (p & 7) & m;
-};
-var bits16 = function(d, p) {
-  var o = p / 8 | 0;
-  return (d[o] | d[o + 1] << 8 | d[o + 2] << 16) >> (p & 7);
-};
-var shft = function(p) {
-  return (p + 7) / 8 | 0;
-};
-var slc = function(v, s, e) {
-  if (s == null || s < 0)
-    s = 0;
-  if (e == null || e > v.length)
-    e = v.length;
-  return new u8(v.subarray(s, e));
-};
-var ec = [
-  "unexpected EOF",
-  "invalid block type",
-  "invalid length/literal",
-  "invalid distance",
-  "stream finished",
-  "no stream handler",
-  ,
-  "no callback",
-  "invalid UTF-8 data",
-  "extra field too long",
-  "date not in range 1980-2099",
-  "filename too long",
-  "stream finishing",
-  "invalid zip data"
-  // determined by unknown compression method
-];
-var err = function(ind, msg, nt) {
-  var e = new Error(msg || ec[ind]);
-  e.code = ind;
-  if (Error.captureStackTrace)
-    Error.captureStackTrace(e, err);
-  if (!nt)
-    throw e;
-  return e;
-};
-var inflt = function(dat, st, buf, dict) {
-  var sl = dat.length, dl = dict ? dict.length : 0;
-  if (!sl || st.f && !st.l)
-    return buf || new u8(0);
-  var noBuf = !buf;
-  var resize = noBuf || st.i != 2;
-  var noSt = st.i;
-  if (noBuf)
-    buf = new u8(sl * 3);
-  var cbuf = function(l2) {
-    var bl = buf.length;
-    if (l2 > bl) {
-      var nbuf = new u8(Math.max(bl * 2, l2));
-      nbuf.set(buf);
-      buf = nbuf;
-    }
-  };
-  var final = st.f || 0, pos = st.p || 0, bt = st.b || 0, lm = st.l, dm = st.d, lbt = st.m, dbt = st.n;
-  var tbts = sl * 8;
-  do {
-    if (!lm) {
-      final = bits(dat, pos, 1);
-      var type = bits(dat, pos + 1, 3);
-      pos += 3;
-      if (!type) {
-        var s = shft(pos) + 4, l = dat[s - 4] | dat[s - 3] << 8, t = s + l;
-        if (t > sl) {
-          if (noSt)
-            err(0);
-          break;
-        }
-        if (resize)
-          cbuf(bt + l);
-        buf.set(dat.subarray(s, t), bt);
-        st.b = bt += l, st.p = pos = t * 8, st.f = final;
-        continue;
-      } else if (type == 1)
-        lm = flrm, dm = fdrm, lbt = 9, dbt = 5;
-      else if (type == 2) {
-        var hLit = bits(dat, pos, 31) + 257, hcLen = bits(dat, pos + 10, 15) + 4;
-        var tl = hLit + bits(dat, pos + 5, 31) + 1;
-        pos += 14;
-        var ldt = new u8(tl);
-        var clt = new u8(19);
-        for (var i = 0; i < hcLen; ++i) {
-          clt[clim[i]] = bits(dat, pos + i * 3, 7);
-        }
-        pos += hcLen * 3;
-        var clb = max$1(clt), clbmsk = (1 << clb) - 1;
-        var clm = hMap(clt, clb, 1);
-        for (var i = 0; i < tl; ) {
-          var r = clm[bits(dat, pos, clbmsk)];
-          pos += r & 15;
-          var s = r >> 4;
-          if (s < 16) {
-            ldt[i++] = s;
-          } else {
-            var c = 0, n = 0;
-            if (s == 16)
-              n = 3 + bits(dat, pos, 3), pos += 2, c = ldt[i - 1];
-            else if (s == 17)
-              n = 3 + bits(dat, pos, 7), pos += 3;
-            else if (s == 18)
-              n = 11 + bits(dat, pos, 127), pos += 7;
-            while (n--)
-              ldt[i++] = c;
-          }
-        }
-        var lt = ldt.subarray(0, hLit), dt = ldt.subarray(hLit);
-        lbt = max$1(lt);
-        dbt = max$1(dt);
-        lm = hMap(lt, lbt, 1);
-        dm = hMap(dt, dbt, 1);
-      } else
-        err(1);
-      if (pos > tbts) {
-        if (noSt)
-          err(0);
-        break;
-      }
-    }
-    if (resize)
-      cbuf(bt + 131072);
-    var lms = (1 << lbt) - 1, dms = (1 << dbt) - 1;
-    var lpos = pos;
-    for (; ; lpos = pos) {
-      var c = lm[bits16(dat, pos) & lms], sym = c >> 4;
-      pos += c & 15;
-      if (pos > tbts) {
-        if (noSt)
-          err(0);
-        break;
-      }
-      if (!c)
-        err(2);
-      if (sym < 256)
-        buf[bt++] = sym;
-      else if (sym == 256) {
-        lpos = pos, lm = null;
-        break;
-      } else {
-        var add2 = sym - 254;
-        if (sym > 264) {
-          var i = sym - 257, b = fleb[i];
-          add2 = bits(dat, pos, (1 << b) - 1) + fl[i];
-          pos += b;
-        }
-        var d = dm[bits16(dat, pos) & dms], dsym = d >> 4;
-        if (!d)
-          err(3);
-        pos += d & 15;
-        var dt = fd[dsym];
-        if (dsym > 3) {
-          var b = fdeb[dsym];
-          dt += bits16(dat, pos) & (1 << b) - 1, pos += b;
-        }
-        if (pos > tbts) {
-          if (noSt)
-            err(0);
-          break;
-        }
-        if (resize)
-          cbuf(bt + 131072);
-        var end = bt + add2;
-        if (bt < dt) {
-          var shift = dl - dt, dend = Math.min(dt, end);
-          if (shift + bt < 0)
-            err(3);
-          for (; bt < dend; ++bt)
-            buf[bt] = dict[shift + bt];
-        }
-        for (; bt < end; ++bt)
-          buf[bt] = buf[bt - dt];
-      }
-    }
-    st.l = lm, st.p = lpos, st.b = bt, st.f = final;
-    if (lm)
-      final = 1, st.m = lbt, st.d = dm, st.n = dbt;
-  } while (!final);
-  return bt != buf.length && noBuf ? slc(buf, 0, bt) : buf.subarray(0, bt);
-};
-var et = /* @__PURE__ */ new u8(0);
-var b2 = function(d, b) {
-  return d[b] | d[b + 1] << 8;
-};
-var b4 = function(d, b) {
-  return (d[b] | d[b + 1] << 8 | d[b + 2] << 16 | d[b + 3] << 24) >>> 0;
-};
-var b8 = function(d, b) {
-  return b4(d, b) + b4(d, b + 4) * 4294967296;
-};
-var gzs = function(d) {
-  if (d[0] != 31 || d[1] != 139 || d[2] != 8)
-    err(6, "invalid gzip data");
-  var flg = d[3];
-  var st = 10;
-  if (flg & 4)
-    st += (d[10] | d[11] << 8) + 2;
-  for (var zs = (flg >> 3 & 1) + (flg >> 4 & 1); zs > 0; zs -= !d[st++])
-    ;
-  return st + (flg & 2);
-};
-var Inflate = /* @__PURE__ */ function() {
-  function Inflate2(opts, cb) {
-    if (typeof opts == "function")
-      cb = opts, opts = {};
-    this.ondata = cb;
-    var dict = opts && opts.dictionary && opts.dictionary.subarray(-32768);
-    this.s = { i: 0, b: dict ? dict.length : 0 };
-    this.o = new u8(32768);
-    this.p = new u8(0);
-    if (dict)
-      this.o.set(dict);
-  }
-  Inflate2.prototype.e = function(c) {
-    if (!this.ondata)
-      err(5);
-    if (this.d)
-      err(4);
-    if (!this.p.length)
-      this.p = c;
-    else if (c.length) {
-      var n = new u8(this.p.length + c.length);
-      n.set(this.p), n.set(c, this.p.length), this.p = n;
-    }
-  };
-  Inflate2.prototype.c = function(final) {
-    this.s.i = +(this.d = final || false);
-    var bts = this.s.b;
-    var dt = inflt(this.p, this.s, this.o);
-    this.ondata(slc(dt, bts, this.s.b), this.d);
-    this.o = slc(dt, this.s.b - 32768), this.s.b = this.o.length;
-    this.p = slc(this.p, this.s.p / 8 | 0), this.s.p &= 7;
-  };
-  Inflate2.prototype.push = function(chunk, final) {
-    this.e(chunk), this.c(final);
-  };
-  return Inflate2;
-}();
-function inflateSync(data, opts) {
-  return inflt(data, { i: 2 }, opts && opts.out, opts && opts.dictionary);
-}
-var Gunzip = /* @__PURE__ */ function() {
-  function Gunzip2(opts, cb) {
-    this.v = 1;
-    this.r = 0;
-    Inflate.call(this, opts, cb);
-  }
-  Gunzip2.prototype.push = function(chunk, final) {
-    Inflate.prototype.e.call(this, chunk);
-    this.r += chunk.length;
-    if (this.v) {
-      var p = this.p.subarray(this.v - 1);
-      var s = p.length > 3 ? gzs(p) : 4;
-      if (s > p.length) {
-        if (!final)
-          return;
-      } else if (this.v > 1 && this.onmember) {
-        this.onmember(this.r - p.length);
-      }
-      this.p = p.subarray(s), this.v = 0;
-    }
-    Inflate.prototype.c.call(this, final);
-    if (this.s.f && !this.s.l && !final) {
-      this.v = shft(this.s.p) + 9;
-      this.s = { i: 0 };
-      this.o = new u8(0);
-      this.push(new u8(0), final);
-    }
-  };
-  return Gunzip2;
-}();
-var td = typeof TextDecoder != "undefined" && /* @__PURE__ */ new TextDecoder();
-var tds = 0;
-try {
-  td.decode(et, { stream: true });
-  tds = 1;
-} catch (e) {
-}
-var dutf8 = function(d) {
-  for (var r = "", i = 0; ; ) {
-    var c = d[i++];
-    var eb = (c > 127) + (c > 223) + (c > 239);
-    if (i + eb > d.length)
-      return { s: r, r: slc(d, i - 1) };
-    if (!eb)
-      r += String.fromCharCode(c);
-    else if (eb == 3) {
-      c = ((c & 15) << 18 | (d[i++] & 63) << 12 | (d[i++] & 63) << 6 | d[i++] & 63) - 65536, r += String.fromCharCode(55296 | c >> 10, 56320 | c & 1023);
-    } else if (eb & 1)
-      r += String.fromCharCode((c & 31) << 6 | d[i++] & 63);
-    else
-      r += String.fromCharCode((c & 15) << 12 | (d[i++] & 63) << 6 | d[i++] & 63);
-  }
-};
-function strFromU8(dat, latin1) {
-  if (latin1) {
-    var r = "";
-    for (var i = 0; i < dat.length; i += 16384)
-      r += String.fromCharCode.apply(null, dat.subarray(i, i + 16384));
-    return r;
-  } else if (td) {
-    return td.decode(dat);
-  } else {
-    var _a2 = dutf8(dat), s = _a2.s, r = _a2.r;
-    if (r.length)
-      err(8);
-    return s;
-  }
-}
-var slzh = function(d, b) {
-  return b + 30 + b2(d, b + 26) + b2(d, b + 28);
-};
-var zh = function(d, b, z) {
-  var fnl = b2(d, b + 28), fn = strFromU8(d.subarray(b + 46, b + 46 + fnl), !(b2(d, b + 8) & 2048)), es = b + 46 + fnl, bs = b4(d, b + 20);
-  var _a2 = z && bs == 4294967295 ? z64e(d, es) : [bs, b4(d, b + 24), b4(d, b + 42)], sc = _a2[0], su = _a2[1], off = _a2[2];
-  return [b2(d, b + 10), sc, su, fn, es + b2(d, b + 30) + b2(d, b + 32), off];
-};
-var z64e = function(d, b) {
-  for (; b2(d, b) != 1; b += 4 + b2(d, b + 2))
-    ;
-  return [b8(d, b + 12), b8(d, b + 4), b8(d, b + 20)];
-};
-function unzipSync(data, opts) {
-  var files = {};
-  var e = data.length - 22;
-  for (; b4(data, e) != 101010256; --e) {
-    if (!e || data.length - e > 65558)
-      err(13);
-  }
-  var c = b2(data, e + 8);
-  if (!c)
-    return {};
-  var o = b4(data, e + 16);
-  var z = o == 4294967295 || c == 65535;
-  if (z) {
-    var ze = b4(data, e - 12);
-    z = b4(data, ze) == 101075792;
-    if (z) {
-      c = b4(data, ze + 32);
-      o = b4(data, ze + 48);
-    }
-  }
-  var fltr = opts && opts.filter;
-  for (var i = 0; i < c; ++i) {
-    var _a2 = zh(data, o, z), c_2 = _a2[0], sc = _a2[1], su = _a2[2], fn = _a2[3], no = _a2[4], off = _a2[5], b = slzh(data, off);
-    o = no;
-    if (!fltr || fltr({
-      name: fn,
-      size: sc,
-      originalSize: su,
-      compression: c_2
-    })) {
-      if (!c_2)
-        files[fn] = slc(data, b, b + sc);
-      else if (c_2 == 8)
-        files[fn] = inflateSync(data.subarray(b, b + sc), { out: new u8(su) });
-      else
-        err(14, "unknown compression type " + c_2);
-    }
-  }
-  return files;
 }
 const LN_SCALE_MIN = -12;
 const LN_SCALE_MAX = 9;
@@ -1080,10 +560,10 @@ class Dyno {
     this.globals = globals;
     this.statements = statements;
     this.generate = generate ?? (({ inputs: inputs2, outputs, compile }) => {
-      var _a2, _b2;
+      var _a, _b;
       return {
-        globals: (_a2 = this.globals) == null ? void 0 : _a2.call(this, { inputs: inputs2, outputs, compile }),
-        statements: (_b2 = this.statements) == null ? void 0 : _b2.call(this, { inputs: inputs2, outputs, compile })
+        globals: (_a = this.globals) == null ? void 0 : _a.call(this, { inputs: inputs2, outputs, compile }),
+        statements: (_b = this.statements) == null ? void 0 : _b.call(this, { inputs: inputs2, outputs, compile })
       };
     });
   }
@@ -1168,7 +648,7 @@ class DynoBlock extends Dyno {
     outputs,
     compile
   }) {
-    var _a2, _b2;
+    var _a, _b;
     const blockInputs = {};
     const blockOutputs = {};
     for (const key in inputs) {
@@ -1183,7 +663,7 @@ class DynoBlock extends Dyno {
     }
     const options = { roots: [] };
     const returned = this.construct(blockInputs, blockOutputs, options);
-    for (const global of ((_a2 = this.globals) == null ? void 0 : _a2.call(this, { inputs, outputs, compile })) ?? []) {
+    for (const global of ((_a = this.globals) == null ? void 0 : _a.call(this, { inputs, outputs, compile })) ?? []) {
       compile.globals.add(global);
     }
     const ordering = [];
@@ -1250,7 +730,7 @@ class DynoBlock extends Dyno {
             if (value instanceof DynoLiteral) {
               inputs2[key] = value.getLiteral();
             } else if (value instanceof DynoOutput) {
-              const source = (_b2 = nodeOuts.get(value.dyno)) == null ? void 0 : _b2.outNames.get(value.key);
+              const source = (_b = nodeOuts.get(value.dyno)) == null ? void 0 : _b.outNames.get(value.key);
               if (!source) {
                 throw new Error(
                   `Source not found for ${value.dyno.constructor.name}.${value.key}`
@@ -1317,7 +797,7 @@ function dynoDeclare(name, type, count) {
   return `${typeStr} ${name}${count != null ? `[${count}]` : ""}`;
 }
 function unindentLines(s) {
-  var _a2;
+  var _a;
   let seenNonEmpty = false;
   const lines = s.split("\n").map((line) => {
     const trimmedLine = line.trimEnd();
@@ -1336,7 +816,7 @@ function unindentLines(s) {
   if (lines.length === 0) {
     return [];
   }
-  const indent = (_a2 = lines[0].match(/^\s*/)) == null ? void 0 : _a2[0];
+  const indent = (_a = lines[0].match(/^\s*/)) == null ? void 0 : _a[0];
   if (!indent) {
     return lines;
   }
@@ -1410,10 +890,10 @@ function toHalfNative(f) {
 }
 function toHalfJS(f) {
   f32buffer$1[0] = f;
-  const bits2 = u32buffer$1[0];
-  const sign2 = bits2 >> 31 & 1;
-  const exp3 = bits2 >> 23 & 255;
-  const frac = bits2 & 8388607;
+  const bits = u32buffer$1[0];
+  const sign2 = bits >> 31 & 1;
+  const exp3 = bits >> 23 & 255;
+  const frac = bits & 8388607;
   const halfSign = sign2 << 15;
   if (exp3 === 255) {
     if (frac !== 0) {
@@ -1596,10 +1076,10 @@ function computeMaxSplats(numSplats) {
   const depth = Math.ceil(numSplats / (width * height));
   return width * height * depth;
 }
-function packSint8Bytes(b0, b1, b22, b3) {
+function packSint8Bytes(b0, b1, b2, b3) {
   const clampedB0 = Math.round(Math.max(-127, Math.min(127, b0 * 127)));
   const clampedB1 = Math.round(Math.max(-127, Math.min(127, b1 * 127)));
-  const clampedB2 = Math.round(Math.max(-127, Math.min(127, b22 * 127)));
+  const clampedB2 = Math.round(Math.max(-127, Math.min(127, b2 * 127)));
   const clampedB3 = Math.round(Math.max(-127, Math.min(127, b3 * 127)));
   return clampedB0 & 255 | (clampedB1 & 255) << 8 | (clampedB2 & 255) << 16 | (clampedB3 & 255) << 24;
 }
@@ -2329,7 +1809,7 @@ function decompressPartialGzip(fileBytes, numBytes) {
   const chunks = [];
   let totalBytes = 0;
   let result = null;
-  const gunzip = new Gunzip((data, final) => {
+  const gunzip = new browser.Gunzip((data, final) => {
     chunks.push(data);
     totalBytes += data.length;
     if (final || totalBytes >= numBytes) {
@@ -2581,7 +2061,7 @@ const _SplatWorker = class _SplatWorker {
     this.worker.onmessage = (event) => this.onMessage(event);
   }
   onMessage(event) {
-    var _a2;
+    var _a;
     const { id, result, error, status } = event.data;
     const promise = this.messages[id];
     if (promise) {
@@ -2589,7 +2069,7 @@ const _SplatWorker = class _SplatWorker {
         delete this.messages[id];
         promise.reject(error);
       } else if (status !== void 0) {
-        (_a2 = promise.onStatus) == null ? void 0 : _a2.call(promise, status);
+        (_a = promise.onStatus) == null ? void 0 : _a.call(promise, status);
       } else {
         delete this.messages[id];
         promise.resolve(result);
@@ -3169,7 +2649,7 @@ class CombineGsplat extends Dyno {
           z: z2,
           r: r2,
           g: g2,
-          b: b22
+          b: b2
         } = inputs;
         return [
           `${outGsplat}.flags = ${flags2 ?? (gsplat2 ? `${gsplat2}.flags` : "0u")};`,
@@ -3185,7 +2665,7 @@ class CombineGsplat extends Dyno {
           !z2 ? null : `${outGsplat}.center.z = ${z2};`,
           !r2 ? null : `${outGsplat}.rgba.r = ${r2};`,
           !g2 ? null : `${outGsplat}.rgba.g = ${g2};`,
-          !b22 ? null : `${outGsplat}.rgba.b = ${b22};`
+          !b2 ? null : `${outGsplat}.rgba.b = ${b2};`
         ].filter(Boolean);
       }
     });
@@ -3418,7 +2898,7 @@ class CombineCovSplat extends Dyno {
           z: z2,
           r: r2,
           g: g2,
-          b: b22
+          b: b2
         } = inputs;
         return [
           `${outCovSplat}.flags = ${flags2 ?? (covsplat2 ? `${covsplat2}.flags` : "0u")};`,
@@ -3432,7 +2912,7 @@ class CombineCovSplat extends Dyno {
           !z2 ? null : `${outCovSplat}.center.z = ${z2};`,
           !r2 ? null : `${outCovSplat}.rgba.r = ${r2};`,
           !g2 ? null : `${outCovSplat}.rgba.g = ${g2};`,
-          !b22 ? null : `${outCovSplat}.rgba.b = ${b22};`,
+          !b2 ? null : `${outCovSplat}.rgba.b = ${b2};`,
           `${outCovSplat}.xxyyzz = ${covsplat2 ? `${covsplat2}.xxyyzz` : "vec3(0.0, 0.0, 0.0)"};`,
           `${outCovSplat}.xyxzyz = ${covsplat2 ? `${covsplat2}.xyxzyz` : "vec3(0.0, 0.0, 0.0)"};`
         ].filter(Boolean);
@@ -4777,8 +4257,8 @@ class Mix extends TrinaryOp {
   constructor({ a, b, t }) {
     super({ a, b, c: t, outKey: "mix", outTypeFunc: mixOutputType });
     this.statements = ({ inputs, outputs }) => {
-      const { a: a2, b: b22, c: t2 } = inputs;
-      return [`${outputs.mix} = mix(${a2}, ${b22}, ${t2});`];
+      const { a: a2, b: b2, c: t2 } = inputs;
+      return [`${outputs.mix} = mix(${a2}, ${b2}, ${t2});`];
     };
   }
 }
@@ -5737,7 +5217,7 @@ class Combine extends Dyno {
         w: w2,
         r: r2,
         g: g2,
-        b: b22,
+        b: b2,
         a: a2
       } = inputs2;
       const statements = [
@@ -5746,7 +5226,7 @@ class Combine extends Dyno {
       ];
       if (dim >= 3)
         statements.push(
-          `${vector2}.z = ${z2 ?? b22 ?? (input ? `${input}.z` : literalZero(elType))};`
+          `${vector2}.z = ${z2 ?? b2 ?? (input ? `${input}.z` : literalZero(elType))};`
         );
       if (dim >= 4)
         statements.push(
@@ -7532,9 +7012,9 @@ class DynoExtSplats extends DynoUniform {
         numSplats: 0
       },
       update: (value) => {
-        var _a2, _b2, _c;
-        value.textureArray1 = ((_a2 = this.extSplats) == null ? void 0 : _a2.textures[0]) ?? ExtSplats.emptyTexture;
-        value.textureArray2 = ((_b2 = this.extSplats) == null ? void 0 : _b2.textures[1]) ?? ExtSplats.emptyTexture;
+        var _a, _b, _c;
+        value.textureArray1 = ((_a = this.extSplats) == null ? void 0 : _a.textures[0]) ?? ExtSplats.emptyTexture;
+        value.textureArray2 = ((_b = this.extSplats) == null ? void 0 : _b.textures[1]) ?? ExtSplats.emptyTexture;
         value.numSplats = ((_c = this.extSplats) == null ? void 0 : _c.numSplats) ?? 0;
         return value;
       }
@@ -8263,8 +7743,8 @@ const _Readback = class _Readback {
     return promise;
   }
   getTexture() {
-    var _a2;
-    return (_a2 = this.target) == null ? void 0 : _a2.texture;
+    var _a;
+    return (_a = this.target) == null ? void 0 : _a.texture;
   }
 };
 _Readback.programTemplate = null;
@@ -8325,8 +7805,8 @@ const _RgbaArray = class _RgbaArray {
   }
   // Ensure that our array is large enough to hold capacity RGBA8 values.
   ensureCapacity(capacity) {
-    var _a2;
-    if (!this.array || capacity > (((_a2 = this.array) == null ? void 0 : _a2.length) ?? 0) / 4) {
+    var _a;
+    if (!this.array || capacity > (((_a = this.array) == null ? void 0 : _a.length) ?? 0) / 4) {
       this.capacity = getTextureSize(capacity).maxSplats;
       const newArray2 = new Uint8Array(this.capacity * 4);
       if (this.array) {
@@ -8338,8 +7818,8 @@ const _RgbaArray = class _RgbaArray {
   }
   // Get the THREE.DataArrayTexture from either the readback or the source.
   getTexture() {
-    var _a2;
-    let texture2 = (_a2 = this.readback) == null ? void 0 : _a2.getTexture();
+    var _a;
+    let texture2 = (_a = this.readback) == null ? void 0 : _a.getTexture();
     if (this.source || this.array) {
       texture2 = this.maybeUpdateSource();
     }
@@ -9584,7 +9064,7 @@ const _SplatAccumulator = class _SplatAccumulator {
     previous,
     lodInstances
   }) {
-    var _a2;
+    var _a;
     this.viewToWorld.copy(camera.matrixWorld);
     camera.getWorldPosition(this.viewOrigin);
     camera.getWorldDirection(this.viewDirection);
@@ -9616,7 +9096,7 @@ const _SplatAccumulator = class _SplatAccumulator {
     const globalEdits = Array.from(globalEditsSet);
     for (const object of allGenerators) {
       try {
-        (_a2 = object.frameUpdate) == null ? void 0 : _a2.call(object, {
+        (_a = object.frameUpdate) == null ? void 0 : _a.call(object, {
           renderer,
           object,
           time: this.time,
@@ -10119,14 +9599,14 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     }
   }
   setDirty() {
-    var _a2;
+    var _a;
     if (!this.dirty) {
       this.dirty = true;
-      (_a2 = this.onDirty) == null ? void 0 : _a2.call(this);
+      (_a = this.onDirty) == null ? void 0 : _a.call(this);
     }
   }
   onBeforeRender(renderer, scene, camera) {
-    var _a2;
+    var _a;
     const spark = _SparkRenderer.sparkOverride ?? this;
     const frame = renderer.info.render.frame ?? renderer.info.frame;
     const isNewFrame = frame !== spark.lastFrame;
@@ -10137,7 +9617,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
       const renderSize = renderer.getDrawingBufferSize(spark.renderSize);
       if (renderer.xr.isPresenting) {
         if (renderSize.x === 1 && renderSize.y === 1) {
-          const baseLayer = (_a2 = renderer.xr.getSession()) == null ? void 0 : _a2.renderState.baseLayer;
+          const baseLayer = (_a = renderer.xr.getSession()) == null ? void 0 : _a.renderState.baseLayer;
           if (baseLayer) {
             renderSize.x = baseLayer.framebufferWidth;
             renderSize.y = baseLayer.framebufferHeight;
@@ -10472,7 +9952,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     camera,
     scene
   }) {
-    var _a2, _b2;
+    var _a, _b;
     const defaultSplatCount = this.defaultSplatTarget();
     const splatCount = this.lodSplatCount ?? defaultSplatCount;
     const maxSplats = splatCount * this.lodSplatScale;
@@ -10511,8 +9991,8 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
       }
     }
     const lodMeshes = !this.enableLod ? [] : visibleGenerators.filter((generator) => {
-      var _a3, _b3, _c;
-      return generator instanceof SplatMesh && (((_a3 = generator.packedSplats) == null ? void 0 : _a3.lodSplats) || ((_b3 = generator.extSplats) == null ? void 0 : _b3.lodSplats) || generator.paged) && generator.enableLod !== false && // Kroscloud fork [ssog-3]: externally-LOD'd paged sources (ssog)
+      var _a2, _b2, _c;
+      return generator instanceof SplatMesh && (((_a2 = generator.packedSplats) == null ? void 0 : _a2.lodSplats) || ((_b2 = generator.extSplats) == null ? void 0 : _b2.lodSplats) || generator.paged) && generator.enableLod !== false && // Kroscloud fork [ssog-3]: externally-LOD'd paged sources (ssog)
       // are driven by their own controller, never by driveLod.
       ((_c = generator.paged) == null ? void 0 : _c.externalLod) !== true;
     });
@@ -10533,7 +10013,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     this.lodInitQueue = [];
     const now = performance.now();
     for (const mesh of lodMeshes) {
-      const splats = ((_a2 = mesh.packedSplats) == null ? void 0 : _a2.lodSplats) ?? ((_b2 = mesh.extSplats) == null ? void 0 : _b2.lodSplats) ?? mesh.paged;
+      const splats = ((_a = mesh.packedSplats) == null ? void 0 : _a.lodSplats) ?? ((_b = mesh.extSplats) == null ? void 0 : _b.lodSplats) ?? mesh.paged;
       if (splats) {
         const record = this.lodIds.get(splats);
         if (record) {
@@ -10654,10 +10134,10 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     );
     const instances = lodMeshes.reduce(
       (instances2, mesh) => {
-        var _a2, _b2;
+        var _a, _b;
         uuidToMesh.set(mesh.uuid, mesh);
         const viewToObject = mesh.matrixWorld.clone().invert().multiply(cameraToWorld);
-        const splats = ((_a2 = mesh.packedSplats) == null ? void 0 : _a2.lodSplats) ?? ((_b2 = mesh.extSplats) == null ? void 0 : _b2.lodSplats) ?? mesh.paged;
+        const splats = ((_a = mesh.packedSplats) == null ? void 0 : _a.lodSplats) ?? ((_b = mesh.extSplats) == null ? void 0 : _b.lodSplats) ?? mesh.paged;
         if (!splats) {
           return instances2;
         }
@@ -10781,7 +10261,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     await worker.call("disposeLodTree", { lodId: oldest.lodId });
   }
   updateLodIndices(uuidToMesh, keyIndices) {
-    var _a2, _b2;
+    var _a, _b;
     const budgetSplats = (this.lodSplatCount ?? this.defaultSplatTarget()) * this.lodSplatScale;
     const presizeRows = kcRegrowDebug.kcInitialCutRows(budgetSplats);
     for (const [uuid, countIndices] of Object.entries(keyIndices)) {
@@ -10808,7 +10288,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
           let texRows = rows;
           let texData = indices;
           if (this.webgpuBackend) {
-            const lodTotal = ((_b2 = (_a2 = mesh.packedSplats) == null ? void 0 : _a2.lodSplats) == null ? void 0 : _b2.numSplats) ?? 0;
+            const lodTotal = ((_b = (_a = mesh.packedSplats) == null ? void 0 : _a.lodSplats) == null ? void 0 : _b.numSplats) ?? 0;
             const sceneRows = lodTotal > 0 ? Math.ceil(lodTotal / 16384) : Number.POSITIVE_INFINITY;
             texRows = Math.min(
               Math.max(rows, prevRows * 2, Math.min(presizeRows, sceneRows)),
@@ -11129,7 +10609,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     hideObjects = [],
     update = true
   }) {
-    var _a2;
+    var _a;
     const cubeTexture = await this.renderCubeMap({
       scene,
       worldCenter,
@@ -11143,7 +10623,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     if (!_SparkRenderer.pmrem) {
       _SparkRenderer.pmrem = new THREE__namespace.PMREMGenerator(this.renderer);
     }
-    return (_a2 = _SparkRenderer.pmrem) == null ? void 0 : _a2.fromCubemap(cubeTexture).texture;
+    return (_a = _SparkRenderer.pmrem) == null ? void 0 : _a.fromCubemap(cubeTexture).texture;
   }
   // Utility function to recursively set the envMap property for any
   // THREE.MeshStandardMaterial within the subtree of root.
@@ -11165,7 +10645,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     });
   }
   async getLodTreeLevel(splats, level, pageColoring = false) {
-    var _a2, _b2;
+    var _a, _b;
     const instance = this.lodInstances.get(splats);
     if (!instance) {
       return null;
@@ -11176,14 +10656,14 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
         level
       });
     });
-    if ((_a2 = splats.packedSplats) == null ? void 0 : _a2.lodSplats) {
+    if ((_a = splats.packedSplats) == null ? void 0 : _a.lodSplats) {
       const newSplats = splats.packedSplats.lodSplats.extractSplats(
         result.indices,
         pageColoring
       );
       return new SplatMesh({ packedSplats: newSplats });
     }
-    if ((_b2 = splats.extSplats) == null ? void 0 : _b2.lodSplats) {
+    if ((_b = splats.extSplats) == null ? void 0 : _b.lodSplats) {
       const newSplats = splats.extSplats.lodSplats.extractSplats(
         result.indices,
         pageColoring
@@ -11222,7 +10702,7 @@ function isWebGPURenderer(renderer) {
 }
 class PagedSplats {
   constructor(options) {
-    var _a2;
+    var _a;
     this.externalLod = false;
     this.totalFileSplats = 0;
     this.pager = options.pager;
@@ -11230,7 +10710,7 @@ class PagedSplats {
     this.requestHeader = options.requestHeader;
     this.withCredentials = options.withCredentials;
     this.numSh = 0;
-    this.maxSh = ((_a2 = options.pager) == null ? void 0 : _a2.maxSh) ?? 3;
+    this.maxSh = ((_a = options.pager) == null ? void 0 : _a.maxSh) ?? 3;
     this.numSplats = 0;
     this.dynoNumSplats = new DynoInt({ value: 0 });
     this.dynoIndices = new DynoUsampler2D({
@@ -11373,7 +10853,7 @@ class PagedSplats {
       throw new Error("No url or fileBytes provided");
     }
     return await workerPool.withWorker(async (worker) => {
-      var _a2, _b2, _c, _d, _e;
+      var _a, _b, _c, _d, _e;
       if (!this.pager) {
         throw new Error("PagedSplats.pager not set");
       }
@@ -11381,8 +10861,8 @@ class PagedSplats {
         const result2 = await worker.call("loadPackedSplats", {
           fileBytes: decodeBytes,
           pathName: this.chunkUrl(chunk),
-          sh1Codes: (_a2 = this.sh1Codes) == null ? void 0 : _a2.slice(),
-          sh2Codes: (_b2 = this.sh2Codes) == null ? void 0 : _b2.slice(),
+          sh1Codes: (_a = this.sh1Codes) == null ? void 0 : _a.slice(),
+          sh2Codes: (_b = this.sh2Codes) == null ? void 0 : _b.slice(),
           sh3Codes: (_c = this.sh3Codes) == null ? void 0 : _c.slice()
         });
         const lodSplats2 = result2.lodSplats;
@@ -12083,7 +11563,7 @@ const _SplatPager = class _SplatPager {
     return texture2;
   }
   driveFetchers() {
-    var _a2, _b2, _c, _d, _e, _f, _g, _h, _i;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i;
     const needed = [];
     const overflow = [];
     let numPages = 0;
@@ -12150,7 +11630,7 @@ const _SplatPager = class _SplatPager {
     }
     {
       const list = this.fetchPriority;
-      if (((_a2 = this.wantedCache) == null ? void 0 : _a2.list) !== list) {
+      if (((_a = this.wantedCache) == null ? void 0 : _a.list) !== list) {
         const wanted = /* @__PURE__ */ new Map();
         const groups = /* @__PURE__ */ new Map();
         for (const { splats, chunk } of list) {
@@ -12180,7 +11660,7 @@ const _SplatPager = class _SplatPager {
         this.wantedCache = { list, wanted, groups };
         this.listTick += 1;
         for (const fetcher of this.fetchers) {
-          if ((_b2 = wanted.get(fetcher.splats)) == null ? void 0 : _b2.has(fetcher.chunk)) {
+          if ((_b = wanted.get(fetcher.splats)) == null ? void 0 : _b.has(fetcher.chunk)) {
             fetcher.missCount = 0;
             if (fetcher.cancelled) {
               if ((_d = (_c = fetcher.splats).resumeFetchChunk) == null ? void 0 : _d.call(_c, fetcher.chunk)) {
@@ -12244,8 +11724,8 @@ const _SplatPager = class _SplatPager {
    * fetch of that chunk must not be scored as cancel→refetch thrash.
    */
   clearCancelTick(splats, chunk) {
-    var _a2;
-    (_a2 = this.cancelTick.get(splats)) == null ? void 0 : _a2.delete(chunk);
+    var _a;
+    (_a = this.cancelTick.get(splats)) == null ? void 0 : _a.delete(chunk);
   }
   /** [ssog-24] a fetcher slot is being opened for (splats, chunk) */
   noteFetchStart(splats, chunk) {
@@ -12263,7 +11743,7 @@ const _SplatPager = class _SplatPager {
     }
   }
   allocateFreeable() {
-    var _a2;
+    var _a;
     const page = this.freeablePages.shift();
     if (page === void 0) {
       return void 0;
@@ -12274,7 +11754,7 @@ const _SplatPager = class _SplatPager {
       throw new Error(`splatsChunk not found for page: ${page}`);
     }
     const { splats, chunk } = splatsChunk;
-    (_a2 = this.onPageEvicted) == null ? void 0 : _a2.call(this, splats, chunk);
+    (_a = this.onPageEvicted) == null ? void 0 : _a.call(this, splats, chunk);
     this.removeSplatsChunkPage(splats, chunk, page);
     this.lodTreeUpdates.push({
       splats,
@@ -12677,8 +12157,8 @@ const _SplatMesh = class _SplatMesh extends SplatGenerator {
   // the packedSplats, call .packedSplats.setSplat(index, center, scales,
   // quaternion, opacity, color).
   forEachSplat(callback) {
-    var _a2;
-    (_a2 = this.splats) == null ? void 0 : _a2.forEachSplat(callback);
+    var _a;
+    (_a = this.splats) == null ? void 0 : _a.forEachSplat(callback);
   }
   // Call this when you are finished with the SplatMesh and want to free
   // any buffers it holds (via packedSplats).
@@ -12700,7 +12180,7 @@ const _SplatMesh = class _SplatMesh extends SplatGenerator {
   // only the centers of the splats are used to compute the bounding box.
   // IMPORTANT: This should only be called after the SplatMesh is initialized.
   getBoundingBox(centers_only = true) {
-    var _a2;
+    var _a;
     if (!this.initialized) {
       throw new Error(
         "Cannot get bounding box before SplatMesh is initialized"
@@ -12736,7 +12216,7 @@ const _SplatMesh = class _SplatMesh extends SplatGenerator {
         }
       }
     }
-    (_a2 = this.splats) == null ? void 0 : _a2.forEachSplat(callback);
+    (_a = this.splats) == null ? void 0 : _a.forEachSplat(callback);
     const box = new THREE__namespace.Box3(minVec, maxVec);
     return box;
   }
@@ -12892,7 +12372,7 @@ const _SplatMesh = class _SplatMesh extends SplatGenerator {
     globalEdits,
     lodIndices
   }) {
-    var _a2, _b2, _c;
+    var _a, _b, _c;
     this.context.time.value = time;
     this.context.deltaTime.value = deltaTime;
     _SplatMesh.dynoTime.value = time;
@@ -12903,7 +12383,7 @@ const _SplatMesh = class _SplatMesh extends SplatGenerator {
     }
     this.numSplats = this.context.splats.getNumSplats();
     let updated = false;
-    const lodSplats = ((_a2 = this.packedSplats) == null ? void 0 : _a2.lodSplats) ?? ((_b2 = this.extSplats) == null ? void 0 : _b2.lodSplats);
+    const lodSplats = ((_a = this.packedSplats) == null ? void 0 : _a.lodSplats) ?? ((_b = this.extSplats) == null ? void 0 : _b.lodSplats);
     this.context.enableLod.value = lodSplats != null && lodIndices != null;
     if (this.enableLod === false) {
       this.context.enableLod.value = false;
@@ -13020,12 +12500,12 @@ const _SplatMesh = class _SplatMesh extends SplatGenerator {
   // intersections using this method to populate the provided intersects[] array
   // with each intersection point.
   raycast(raycaster, intersects) {
-    var _a2, _b2, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w;
     if (!_SplatMesh.isStaticInitialized || !this.raycastable || !this.packedSplats && !this.extSplats && !this.paged) {
       return;
     }
     const paged = this.paged != null;
-    const ext = paged ? ((_b2 = (_a2 = this.paged) == null ? void 0 : _a2.pager) == null ? void 0 : _b2.extSplats) ?? false : this.extSplats != null;
+    const ext = paged ? ((_b = (_a = this.paged) == null ? void 0 : _a.pager) == null ? void 0 : _b.extSplats) ?? false : this.extSplats != null;
     const { near, far, ray } = raycaster;
     const worldToMesh = this.matrixWorld.clone().invert();
     const worldToMeshRot = new THREE__namespace.Matrix3().setFromMatrix4(worldToMesh);
@@ -14281,7 +13761,7 @@ function tryPcSogsZip(input) {
   try {
     const fileBytes = input instanceof ArrayBuffer ? new Uint8Array(input) : input;
     let metaFilename = null;
-    const unzipped = unzipSync(fileBytes, {
+    const unzipped = browser.unzipSync(fileBytes, {
       filter: ({ name }) => {
         const filename = name.split(/[\\/]/).pop();
         if (filename === "meta.json") {
@@ -14520,10 +14000,10 @@ const _PackedSplats = class _PackedSplats {
       key: "rgbMinMaxLnScaleMinMax",
       value: new THREE__namespace.Vector4(0, 1, LN_SCALE_MIN, LN_SCALE_MAX),
       update: (value) => {
-        var _a2, _b2, _c, _d;
+        var _a, _b, _c, _d;
         value.set(
-          ((_a2 = this.splatEncoding) == null ? void 0 : _a2.rgbMin) ?? 0,
-          ((_b2 = this.splatEncoding) == null ? void 0 : _b2.rgbMax) ?? 1,
+          ((_a = this.splatEncoding) == null ? void 0 : _a.rgbMin) ?? 0,
+          ((_b = this.splatEncoding) == null ? void 0 : _b.rgbMax) ?? 1,
           ((_c = this.splatEncoding) == null ? void 0 : _c.lnScaleMin) ?? LN_SCALE_MIN,
           ((_d = this.splatEncoding) == null ? void 0 : _d.lnScaleMax) ?? LN_SCALE_MAX
         );
@@ -14541,10 +14021,10 @@ const _PackedSplats = class _PackedSplats {
       key: "shMax",
       value: new THREE__namespace.Vector3(),
       update: (value) => {
-        var _a2, _b2, _c;
+        var _a, _b, _c;
         value.set(
-          ((_a2 = this.splatEncoding) == null ? void 0 : _a2.sh1Max) ?? 1,
-          ((_b2 = this.splatEncoding) == null ? void 0 : _b2.sh2Max) ?? 1,
+          ((_a = this.splatEncoding) == null ? void 0 : _a.sh1Max) ?? 1,
+          ((_b = this.splatEncoding) == null ? void 0 : _b.sh2Max) ?? 1,
           ((_c = this.splatEncoding) == null ? void 0 : _c.sh3Max) ?? 1
         );
         return value;
@@ -15217,9 +14697,9 @@ class DynoPackedSplats extends DynoUniform {
         lodOpacity: false
       },
       update: (value) => {
-        var _a2, _b2, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l;
-        value.textureArray = ((_a2 = this.packedSplats) == null ? void 0 : _a2.getTexture()) ?? PackedSplats.getEmptyArray;
-        value.numSplats = ((_b2 = this.packedSplats) == null ? void 0 : _b2.numSplats) ?? 0;
+        var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l;
+        value.textureArray = ((_a = this.packedSplats) == null ? void 0 : _a.getTexture()) ?? PackedSplats.getEmptyArray;
+        value.numSplats = ((_b = this.packedSplats) == null ? void 0 : _b.numSplats) ?? 0;
         value.rgbMinMaxLnScaleMinMax.set(
           ((_d = (_c = this.packedSplats) == null ? void 0 : _c.splatEncoding) == null ? void 0 : _d.rgbMin) ?? 0,
           ((_f = (_e = this.packedSplats) == null ? void 0 : _e.splatEncoding) == null ? void 0 : _f.rgbMax) ?? 1,
@@ -15483,7 +14963,7 @@ const _OldSparkViewpoint = class _OldSparkViewpoint {
   // Call this when you are done with the SparkViewpoint and want to
   // free up its resources (GPU targets, pixel buffers, etc.)
   dispose() {
-    var _a2;
+    var _a;
     this.setAutoUpdate(false);
     if (this.target) {
       this.target.dispose();
@@ -15498,7 +14978,7 @@ const _OldSparkViewpoint = class _OldSparkViewpoint {
       this.display.geometry.dispose();
       this.display = null;
     }
-    if ((_a2 = this.pending) == null ? void 0 : _a2.accumulator) {
+    if ((_a = this.pending) == null ? void 0 : _a.accumulator) {
       this.spark.releaseAccumulator(this.pending.accumulator);
       this.pending = null;
     }
@@ -15557,7 +15037,7 @@ const _OldSparkViewpoint = class _OldSparkViewpoint {
     scene,
     camera
   }) {
-    var _a2;
+    var _a;
     const target = this.back ?? this.target;
     if (!target) {
       throw new Error("Must initialize SparkViewpoint with target");
@@ -15585,7 +15065,7 @@ const _OldSparkViewpoint = class _OldSparkViewpoint {
     if (target !== this.target) {
       [this.target, this.back] = [this.back, this.target];
     }
-    (_a2 = this.onTextureUpdated) == null ? void 0 : _a2.call(this, target.texture);
+    (_a = this.onTextureUpdated) == null ? void 0 : _a.call(this, target.texture);
   }
   // Read back the previously rendered target image as a Uint8Array of packed
   // RGBA values (in that order). If superXY was set greater than 1 then
@@ -15678,7 +15158,7 @@ const _OldSparkViewpoint = class _OldSparkViewpoint {
   // The method cannot be private because then SparkRenderer would
   // not be able to call it.
   autoPoll({ accumulator }) {
-    var _a2, _b2, _c;
+    var _a, _b, _c;
     if (this.camera) {
       this.camera.updateMatrixWorld();
       this.viewToWorld = this.camera.matrixWorld.clone();
@@ -15701,7 +15181,7 @@ const _OldSparkViewpoint = class _OldSparkViewpoint {
         }
       }
     }
-    const latestView = ((_a2 = this.sorting) == null ? void 0 : _a2.viewToWorld) ?? ((_b2 = this.display) == null ? void 0 : _b2.viewToWorld);
+    const latestView = ((_a = this.sorting) == null ? void 0 : _a.viewToWorld) ?? ((_b = this.display) == null ? void 0 : _b.viewToWorld);
     if (latestView && !withinCoorientDist({
       matrix1: this.viewToWorld,
       matrix2: latestView,
@@ -15728,7 +15208,7 @@ const _OldSparkViewpoint = class _OldSparkViewpoint {
     this.driveSort();
   }
   async driveSort() {
-    var _a2;
+    var _a;
     while (true) {
       if (this.sorting || !this.pending) {
         return;
@@ -15736,7 +15216,7 @@ const _OldSparkViewpoint = class _OldSparkViewpoint {
       const { viewToWorld, displayed } = this.pending;
       let accumulator = this.pending.accumulator;
       if (!accumulator) {
-        accumulator = ((_a2 = this.display) == null ? void 0 : _a2.accumulator) ?? this.spark.active;
+        accumulator = ((_a = this.display) == null ? void 0 : _a.accumulator) ?? this.spark.active;
         accumulator.refCount += 1;
       }
       this.pending = null;
@@ -16250,7 +15730,7 @@ const _OldSparkRenderer = class _OldSparkRenderer extends THREE__namespace.Mesh 
     return new OldSparkViewpoint({ ...options, spark: this });
   }
   onBeforeRender(renderer, scene, camera) {
-    var _a2, _b2;
+    var _a, _b;
     const time = this.time ?? this.clock.getElapsedTime();
     const deltaTime = time - (this.viewpoint.lastTime ?? time);
     this.viewpoint.lastTime = time;
@@ -16295,7 +15775,7 @@ const _OldSparkRenderer = class _OldSparkRenderer extends THREE__namespace.Mesh 
         this.uniforms.renderSize.value
       );
       if (renderSize.x === 1 && renderSize.y === 1) {
-        const baseLayer = (_a2 = renderer.xr.getSession()) == null ? void 0 : _a2.renderState.baseLayer;
+        const baseLayer = (_a = renderer.xr.getSession()) == null ? void 0 : _a.renderState.baseLayer;
         if (baseLayer) {
           renderSize.x = baseLayer.framebufferWidth;
           renderSize.y = baseLayer.framebufferHeight;
@@ -16352,7 +15832,7 @@ const _OldSparkRenderer = class _OldSparkRenderer extends THREE__namespace.Mesh 
       this.uniforms.splatTexEnable.value = false;
       this.uniforms.splatTexture.value = _OldSparkRenderer.EMPTY_SPLAT_TEXTURE;
     }
-    const accumToWorld = ((_b2 = viewpoint.display) == null ? void 0 : _b2.accumulator.toWorld) ?? new THREE__namespace.Matrix4();
+    const accumToWorld = ((_b = viewpoint.display) == null ? void 0 : _b.accumulator.toWorld) ?? new THREE__namespace.Matrix4();
     const worldToCamera = camera.matrixWorld.clone().invert();
     const originToCamera = accumToWorld.clone().premultiply(worldToCamera);
     originToCamera.decompose(
@@ -16366,15 +15846,15 @@ const _OldSparkRenderer = class _OldSparkRenderer extends THREE__namespace.Mesh 
   // to update the canvas, so we must switch the viewpoint back to
   // defaultView when we're finished.
   prepareViewpoint(viewpoint) {
-    var _a2, _b2, _c, _d;
+    var _a, _b, _c, _d;
     this.viewpoint = viewpoint ?? this.viewpoint;
     if (this.viewpoint.display) {
       const { accumulator, geometry } = this.viewpoint.display;
       this.uniforms.numSplats.value = accumulator.splats.numSplats;
       this.uniforms.packedSplats.value = accumulator.splats.getTexture();
       this.uniforms.rgbMinMaxLnScaleMinMax.value.set(
-        ((_a2 = accumulator.splats.splatEncoding) == null ? void 0 : _a2.rgbMin) ?? 0,
-        ((_b2 = accumulator.splats.splatEncoding) == null ? void 0 : _b2.rgbMax) ?? 1,
+        ((_a = accumulator.splats.splatEncoding) == null ? void 0 : _a.rgbMin) ?? 0,
+        ((_b = accumulator.splats.splatEncoding) == null ? void 0 : _b.rgbMax) ?? 1,
         ((_c = accumulator.splats.splatEncoding) == null ? void 0 : _c.lnScaleMin) ?? LN_SCALE_MIN,
         ((_d = accumulator.splats.splatEncoding) == null ? void 0 : _d.lnScaleMax) ?? LN_SCALE_MAX
       );
@@ -16427,7 +15907,7 @@ const _OldSparkRenderer = class _OldSparkRenderer extends THREE__namespace.Mesh 
     originToWorld,
     viewToWorld
   }) {
-    var _a2;
+    var _a;
     if (!this.canAllocAccumulator()) {
       return false;
     }
@@ -16444,7 +15924,7 @@ const _OldSparkRenderer = class _OldSparkRenderer extends THREE__namespace.Mesh 
     }, /* @__PURE__ */ new Map());
     const { generators: generators2, visibleGenerators, globalEdits } = this.compileScene(scene);
     for (const object of generators2) {
-      (_a2 = object.frameUpdate) == null ? void 0 : _a2.call(object, {
+      (_a = object.frameUpdate) == null ? void 0 : _a.call(object, {
         renderer: this.renderer,
         object,
         time,
@@ -16468,8 +15948,8 @@ const _OldSparkRenderer = class _OldSparkRenderer extends THREE__namespace.Mesh 
       maxDistance: this.originDistance
     });
     const needsUpdate = this.needsUpdate || originUpdate || generators2.length !== activeMapping.size || generators2.some((g) => {
-      var _a3;
-      return g.version !== ((_a3 = activeMapping.get(g)) == null ? void 0 : _a3.version);
+      var _a2;
+      return g.version !== ((_a2 = activeMapping.get(g)) == null ? void 0 : _a2.version);
     });
     this.needsUpdate = false;
     let accumulator = null;
@@ -16585,7 +16065,7 @@ const _OldSparkRenderer = class _OldSparkRenderer extends THREE__namespace.Mesh 
     hideObjects = [],
     update = false
   }) {
-    var _a2, _b2;
+    var _a, _b;
     if (!this.envViewpoint) {
       this.envViewpoint = this.newViewpoint({ sort360: true });
     }
@@ -16607,7 +16087,7 @@ const _OldSparkRenderer = class _OldSparkRenderer extends THREE__namespace.Mesh 
       );
     }
     const viewToWorld = new THREE__namespace.Matrix4().setPosition(worldCenter);
-    await ((_a2 = this.envViewpoint) == null ? void 0 : _a2.prepare({ scene, viewToWorld, update }));
+    await ((_a = this.envViewpoint) == null ? void 0 : _a.prepare({ scene, viewToWorld, update }));
     const { target, camera } = _OldSparkRenderer.cubeRender;
     camera.position.copy(worldCenter);
     const objectVisibility = /* @__PURE__ */ new Map();
@@ -16621,7 +16101,7 @@ const _OldSparkRenderer = class _OldSparkRenderer extends THREE__namespace.Mesh 
     for (const [object, visible] of objectVisibility.entries()) {
       object.visible = visible;
     }
-    return (_b2 = _OldSparkRenderer.pmrem) == null ? void 0 : _b2.fromCubemap(target.texture).texture;
+    return (_b = _OldSparkRenderer.pmrem) == null ? void 0 : _b.fromCubemap(target.texture).texture;
   }
   // Utility function to recursively set the envMap property for any
   // THREE.MeshStandardMaterial within the subtree of root.
@@ -16718,7 +16198,7 @@ function decodeAntiSplat(fileBytes, initNumSplats, splatCallback) {
   }
   const f32 = new Float32Array(fileBytes.buffer);
   for (let i = 0; i < numSplats; ++i) {
-    const i322 = i * 32;
+    const i32 = i * 32;
     const i8 = i * 8;
     const x = f32[i8 + 0];
     const y = f32[i8 + 1];
@@ -16726,14 +16206,14 @@ function decodeAntiSplat(fileBytes, initNumSplats, splatCallback) {
     const scaleX = f32[i8 + 3];
     const scaleY = f32[i8 + 4];
     const scaleZ = f32[i8 + 5];
-    const r = fileBytes[i322 + 24] / 255;
-    const g = fileBytes[i322 + 25] / 255;
-    const b = fileBytes[i322 + 26] / 255;
-    const opacity = fileBytes[i322 + 27] / 255;
-    const quatW = (fileBytes[i322 + 28] - 128) / 128;
-    const quatX = (fileBytes[i322 + 29] - 128) / 128;
-    const quatY = (fileBytes[i322 + 30] - 128) / 128;
-    const quatZ = (fileBytes[i322 + 31] - 128) / 128;
+    const r = fileBytes[i32 + 24] / 255;
+    const g = fileBytes[i32 + 25] / 255;
+    const b = fileBytes[i32 + 26] / 255;
+    const opacity = fileBytes[i32 + 27] / 255;
+    const quatW = (fileBytes[i32 + 28] - 128) / 128;
+    const quatX = (fileBytes[i32 + 29] - 128) / 128;
+    const quatY = (fileBytes[i32 + 30] - 128) / 128;
+    const quatZ = (fileBytes[i32 + 31] - 128) / 128;
     splatCallback(
       i,
       x,
@@ -16798,7 +16278,7 @@ const KSPLAT_SH_DEGREE_TO_COMPONENTS = {
   3: 45
 };
 function decodeKsplat(fileBytes, initNumSplats, splatCallback, shCallback) {
-  var _a2;
+  var _a;
   const HEADER_BYTES = 4096;
   const SECTION_BYTES = 1024;
   let headerOffset = 0;
@@ -16847,7 +16327,7 @@ function decodeKsplat(fileBytes, initNumSplats, splatCallback, shCallback) {
     const bucketCount = section2.getUint32(12, true);
     const bucketBlockSize = section2.getFloat32(16, true);
     const bucketStorageSizeBytes = section2.getUint16(20, true);
-    const compressionScaleRange = (section2.getUint32(24, true) || ((_a2 = KSPLAT_COMPRESSION[compressionLevel]) == null ? void 0 : _a2.scaleRange)) ?? 1;
+    const compressionScaleRange = (section2.getUint32(24, true) || ((_a = KSPLAT_COMPRESSION[compressionLevel]) == null ? void 0 : _a.scaleRange)) ?? 1;
     const fullBucketCount = section2.getUint32(32, true);
     const fullBucketSplats = fullBucketCount * bucketSize;
     const partiallyFilledBucketCount = section2.getUint32(36, true);
@@ -17314,9 +16794,9 @@ class SpzWriter {
     this.view.setUint8(base + 2, comp >> 16 & 255);
     this.view.setUint8(base + 3, comp >>> 24 & 255);
   }
-  static quantizeSh(sh, bits2) {
+  static quantizeSh(sh, bits) {
     const value = Math.round(sh * 128) + 128;
-    const bucketSize = 1 << 8 - bits2;
+    const bucketSize = 1 << 8 - bits;
     const quantized = Math.floor((value + bucketSize / 2) / bucketSize) * bucketSize;
     return Math.max(0, Math.min(255, quantized));
   }
@@ -17361,7 +16841,7 @@ class SpzWriter {
   }
 }
 async function transcodeSpz(input) {
-  var _a2, _b2, _c;
+  var _a, _b, _c;
   const splats = new SplatData();
   const {
     inputs,
@@ -17387,9 +16867,9 @@ async function transcodeSpz(input) {
     }, withinOpacity = function(opacity) {
       return opacityThreshold !== void 0 ? opacity >= opacityThreshold : true;
     };
-    const scale = ((_a2 = input2.transform) == null ? void 0 : _a2.scale) ?? 1;
+    const scale = ((_a = input2.transform) == null ? void 0 : _a.scale) ?? 1;
     const quaternion = new THREE__namespace.Quaternion().fromArray(
-      ((_b2 = input2.transform) == null ? void 0 : _b2.quaternion) ?? [0, 0, 0, 1]
+      ((_b = input2.transform) == null ? void 0 : _b.quaternion) ?? [0, 0, 0, 1]
     );
     const translate = new THREE__namespace.Vector3().fromArray(
       ((_c = input2.transform) == null ? void 0 : _c.translate) ?? [0, 0, 0]
@@ -18766,24 +18246,24 @@ const DEFAULT_CONTROLLER_FAST_MULTIPLIER = 5;
 const DEFAULT_CONTROLLER_SLOW_MULTIPLIER = 1 / 5;
 const DEFAULT_CONTROLLER_MOVE_HEADING = false;
 const DEFAULT_CONTROLLER_GETMOVE = (gamepads, sparkXr) => {
-  var _a2, _b2, _c, _d;
+  var _a, _b, _c, _d;
   return gamepads.leftIsHand ? new THREE__namespace.Vector3() : new THREE__namespace.Vector3(
-    ((_a2 = gamepads.left) == null ? void 0 : _a2.axes[2]) ?? 0,
-    (((_b2 = gamepads.left) == null ? void 0 : _b2.buttons[0].value) ?? 0) - (((_c = gamepads.left) == null ? void 0 : _c.buttons[1].value) ?? 0),
+    ((_a = gamepads.left) == null ? void 0 : _a.axes[2]) ?? 0,
+    (((_b = gamepads.left) == null ? void 0 : _b.buttons[0].value) ?? 0) - (((_c = gamepads.left) == null ? void 0 : _c.buttons[1].value) ?? 0),
     ((_d = gamepads.left) == null ? void 0 : _d.axes[3]) ?? 0
   );
 };
 const DEFAULT_CONTROLLER_GETROTATE = (gamepads, sparkXr) => {
-  var _a2;
-  return gamepads.rightIsHand ? new THREE__namespace.Vector3() : new THREE__namespace.Vector3(((_a2 = gamepads.right) == null ? void 0 : _a2.axes[2]) ?? 0, 0, 0);
+  var _a;
+  return gamepads.rightIsHand ? new THREE__namespace.Vector3() : new THREE__namespace.Vector3(((_a = gamepads.right) == null ? void 0 : _a.axes[2]) ?? 0, 0, 0);
 };
 const DEFAULT_CONTROLLER_GETFAST = (gamepads, sparkXr) => {
-  var _a2, _b2;
-  return gamepads.rightIsHand ? false : ((_b2 = (_a2 = gamepads.right) == null ? void 0 : _a2.buttons[0]) == null ? void 0 : _b2.pressed) ?? false;
+  var _a, _b;
+  return gamepads.rightIsHand ? false : ((_b = (_a = gamepads.right) == null ? void 0 : _a.buttons[0]) == null ? void 0 : _b.pressed) ?? false;
 };
 const DEFAULT_CONTROLLER_GETSLOW = (gamepads, sparkXr) => {
-  var _a2, _b2;
-  return gamepads.rightIsHand ? false : ((_b2 = (_a2 = gamepads.right) == null ? void 0 : _a2.buttons[1]) == null ? void 0 : _b2.pressed) ?? false;
+  var _a, _b;
+  return gamepads.rightIsHand ? false : ((_b = (_a = gamepads.right) == null ? void 0 : _a.buttons[1]) == null ? void 0 : _b.pressed) ?? false;
 };
 var JointEnum$1 = /* @__PURE__ */ ((JointEnum2) => {
   JointEnum2["w"] = "wrist";
@@ -18919,7 +18399,7 @@ const _SparkXr = class _SparkXr {
     this.enableHands = options.enableHands ?? false;
     this.controllers = options.controllers;
     Promise.resolve().then(() => {
-      var _a2;
+      var _a;
       if (!this.xr) {
         this.mode = "not_supported";
         return;
@@ -18954,7 +18434,7 @@ const _SparkXr = class _SparkXr {
       element.classList.add("hidden");
       this.button = button;
       this.element = element;
-      const opacity = (_a2 = options.onMouseLeaveOpacity) == null ? void 0 : _a2.toString();
+      const opacity = (_a = options.onMouseLeaveOpacity) == null ? void 0 : _a.toString();
       if (opacity !== void 0) {
         element.addEventListener("mouseleave", () => {
           element.style.opacity = opacity;
@@ -18965,14 +18445,14 @@ const _SparkXr = class _SparkXr {
       }
       return this.initializeXr(options);
     }).then(() => {
-      var _a2;
-      return (_a2 = options.onReady) == null ? void 0 : _a2.call(options, this.mode !== "not_supported");
+      var _a;
+      return (_a = options.onReady) == null ? void 0 : _a.call(options, this.mode !== "not_supported");
     }).catch((error) => {
       alert(`Error initializing SparkXr: ${error}`);
     });
   }
   async initializeXr(options) {
-    var _a2, _b2;
+    var _a, _b;
     if (!this.xr || !this.element) {
       return;
     }
@@ -19006,11 +18486,11 @@ const _SparkXr = class _SparkXr {
     }
     const frameBufferScaleFactor = options.frameBufferScaleFactor ?? 0.5;
     this.renderer.xr.setFramebufferScaleFactor(frameBufferScaleFactor);
-    const optionalFeatures = ((_a2 = options.sessionInit) == null ? void 0 : _a2.optionalFeatures) ?? [];
+    const optionalFeatures = ((_a = options.sessionInit) == null ? void 0 : _a.optionalFeatures) ?? [];
     if (options.enableHands) {
       optionalFeatures.push("hand-tracking");
     }
-    const requiredFeatures = ((_b2 = options.sessionInit) == null ? void 0 : _b2.requiredFeatures) ?? [];
+    const requiredFeatures = ((_b = options.sessionInit) == null ? void 0 : _b.requiredFeatures) ?? [];
     requiredFeatures.push(referenceSpaceType);
     this.sessionInit = {
       ...options.sessionInit,
@@ -19023,7 +18503,7 @@ const _SparkXr = class _SparkXr {
     this.updateElement();
   }
   async toggleXr() {
-    var _a2, _b2, _c;
+    var _a, _b, _c;
     if (!this.xr || !this.sessionInit) {
       return;
     }
@@ -19033,12 +18513,12 @@ const _SparkXr = class _SparkXr {
         const session = await this.xr.requestSession(mode, this.sessionInit);
         this.session = session;
         const onSessionEnded = () => {
-          var _a3;
+          var _a2;
           session == null ? void 0 : session.removeEventListener("end", onSessionEnded);
           session == null ? void 0 : session.removeEventListener("visibilitychange", visibilityChanged);
           this.session = void 0;
           this.updateElement();
-          (_a3 = this.onExitXr) == null ? void 0 : _a3.call(this);
+          (_a2 = this.onExitXr) == null ? void 0 : _a2.call(this);
         };
         let lastVisibilityState = session.visibilityState;
         const visibilityChanged = () => {
@@ -19047,8 +18527,8 @@ const _SparkXr = class _SparkXr {
           }
           lastVisibilityState = session == null ? void 0 : session.visibilityState;
         };
-        (_a2 = this.session) == null ? void 0 : _a2.addEventListener("end", onSessionEnded);
-        (_b2 = this.session) == null ? void 0 : _b2.addEventListener("visibilitychange", visibilityChanged);
+        (_a = this.session) == null ? void 0 : _a.addEventListener("end", onSessionEnded);
+        (_b = this.session) == null ? void 0 : _b.addEventListener("visibilitychange", visibilityChanged);
         await this.renderer.xr.setSession(this.session);
         return (_c = this.onEnterXr) == null ? void 0 : _c.call(this);
       } catch (error) {
@@ -19122,13 +18602,13 @@ const _SparkXr = class _SparkXr {
     return this.hands[1];
   }
   updateControllers(camera) {
-    var _a2, _b2, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l;
     const cameraFrame = camera.parent;
     const now = performance.now();
     const deltaTime = (now - (this.lastControllersUpdate || now)) / 1e3;
     this.lastControllersUpdate = now;
     const xrGamepads = {};
-    for (const source of ((_a2 = this.renderer.xr.getSession()) == null ? void 0 : _a2.inputSources) ?? []) {
+    for (const source of ((_a = this.renderer.xr.getSession()) == null ? void 0 : _a.inputSources) ?? []) {
       const gamepad = source.gamepad;
       if (gamepad && (source.handedness === "left" || source.handedness === "right")) {
         xrGamepads[source.handedness] = gamepad;
@@ -19139,7 +18619,7 @@ const _SparkXr = class _SparkXr {
         }
       }
     }
-    const rotate = (((_b2 = this.controllers) == null ? void 0 : _b2.getRotate) ?? DEFAULT_CONTROLLER_GETROTATE)(xrGamepads, this);
+    const rotate = (((_b = this.controllers) == null ? void 0 : _b.getRotate) ?? DEFAULT_CONTROLLER_GETROTATE)(xrGamepads, this);
     rotate.multiply(
       new THREE__namespace.Vector3(
         ((_c = this.controllers) == null ? void 0 : _c.rotateSpeed) ?? DEFAULT_CONTROLLER_ROTATE_SPEED,
@@ -19249,10 +18729,10 @@ const _SparkXr = class _SparkXr {
     return mesh;
   }
   snapshotHands(time) {
-    var _a2, _b2;
+    var _a, _b;
     const hands = [
-      (_a2 = this.hands[0]) == null ? void 0 : _a2.snapshotJoints(),
-      (_b2 = this.hands[1]) == null ? void 0 : _b2.snapshotJoints()
+      (_a = this.hands[0]) == null ? void 0 : _a.snapshotJoints(),
+      (_b = this.hands[1]) == null ? void 0 : _b.snapshotJoints()
     ];
     return { time, hands };
   }
@@ -19791,12 +19271,12 @@ class HandMovement {
     this.rotateInertia = rotateInertia ?? DEFAULT_ROTATE_INERTIA$1;
   }
   update(deltaTime) {
-    var _a2, _b2, _c, _d, _e;
+    var _a, _b, _c, _d, _e;
     const grip = {};
     for (const handedness of HANDS) {
       const hand = this.xrHands.hands[handedness];
       if (hand && this.xrHands.tests[`${handedness}MiddleThumb`]) {
-        grip[handedness] = new THREE.Vector3().add(((_a2 = hand.t3) == null ? void 0 : _a2.position) ?? new THREE.Vector3()).add(((_b2 = hand.i4) == null ? void 0 : _b2.position) ?? new THREE.Vector3()).add(((_c = hand.m4) == null ? void 0 : _c.position) ?? new THREE.Vector3()).add(((_d = hand.r4) == null ? void 0 : _d.position) ?? new THREE.Vector3()).add(((_e = hand.p4) == null ? void 0 : _e.position) ?? new THREE.Vector3()).multiplyScalar(1 / 5);
+        grip[handedness] = new THREE.Vector3().add(((_a = hand.t3) == null ? void 0 : _a.position) ?? new THREE.Vector3()).add(((_b = hand.i4) == null ? void 0 : _b.position) ?? new THREE.Vector3()).add(((_c = hand.m4) == null ? void 0 : _c.position) ?? new THREE.Vector3()).add(((_d = hand.r4) == null ? void 0 : _d.position) ?? new THREE.Vector3()).add(((_e = hand.p4) == null ? void 0 : _e.position) ?? new THREE.Vector3()).multiplyScalar(1 / 5);
       }
     }
     if (grip.left && grip.right && this.lastGrip.left && this.lastGrip.right) {
@@ -19968,7 +19448,7 @@ class FpsMovement {
   // (`THREE.Camera` or a `THREE.Object3D` that contains it), with `deltaTime`
   // in seconds since the last update.
   update(deltaTime, control) {
-    var _a2, _b2;
+    var _a, _b;
     if (!this.enable) {
       return false;
     }
@@ -19979,7 +19459,7 @@ class FpsMovement {
       sticks[1].set(gamepad.axes[2], gamepad.axes[3]);
     }
     const gamepadButtons = (gamepad == null ? void 0 : gamepad.buttons.map((button) => button.pressed)) || [];
-    const xrSources = Array.from(((_b2 = (_a2 = this.xr) == null ? void 0 : _a2.getSession()) == null ? void 0 : _b2.inputSources) ?? []);
+    const xrSources = Array.from(((_b = (_a = this.xr) == null ? void 0 : _a.getSession()) == null ? void 0 : _b.inputSources) ?? []);
     for (const source of xrSources) {
       const gamepad2 = source.gamepad;
       if (gamepad2) {
@@ -20208,15 +19688,15 @@ class PointerControls {
       }
     });
     const pointerUp = (event) => {
-      var _a2, _b2;
-      if (((_a2 = this.rotating) == null ? void 0 : _a2.pointerId) === event.pointerId) {
+      var _a, _b;
+      if (((_a = this.rotating) == null ? void 0 : _a.pointerId) === event.pointerId) {
         this.rotating = null;
         canvas.releasePointerCapture(event.pointerId);
         if (this.dualPress && this.sliding) {
           canvas.releasePointerCapture(this.sliding.pointerId);
           this.sliding = null;
         }
-      } else if (((_b2 = this.sliding) == null ? void 0 : _b2.pointerId) === event.pointerId) {
+      } else if (((_b = this.sliding) == null ? void 0 : _b.pointerId) === event.pointerId) {
         this.sliding = null;
         canvas.releasePointerCapture(event.pointerId);
         if (this.dualPress && this.rotating) {
@@ -20244,10 +19724,10 @@ class PointerControls {
     document.addEventListener("pointerup", pointerUp);
     document.addEventListener("pointercancel", pointerUp);
     document.addEventListener("pointermove", (event) => {
-      var _a2, _b2;
-      if (((_a2 = this.rotating) == null ? void 0 : _a2.pointerId) === event.pointerId) {
+      var _a, _b;
+      if (((_a = this.rotating) == null ? void 0 : _a.pointerId) === event.pointerId) {
         this.rotating.position = this.getPointerPosition(event);
-      } else if (((_b2 = this.sliding) == null ? void 0 : _b2.pointerId) === event.pointerId) {
+      } else if (((_b = this.sliding) == null ? void 0 : _b.pointerId) === event.pointerId) {
         this.sliding.position = this.getPointerPosition(event);
       }
     });
@@ -20269,7 +19749,7 @@ class PointerControls {
     );
   }
   update(deltaTime, control, camera) {
-    var _a2, _b2;
+    var _a, _b;
     if (!this.enable) {
       return false;
     }
@@ -20382,7 +19862,7 @@ class PointerControls {
       } else {
         const target = new THREE__namespace.Vector3();
         if (this.sliding || this.rotating) {
-          const point = ((_a2 = this.lastDown) == null ? void 0 : _a2.last) ?? new THREE__namespace.Vector2();
+          const point = ((_a = this.lastDown) == null ? void 0 : _a.last) ?? new THREE__namespace.Vector2();
           const theCamera = camera ?? (control instanceof THREE__namespace.Camera ? control : void 0);
           if (theCamera) {
             const ndcPoint = this.pressMoveCenter ? new THREE__namespace.Vector2(0, 0) : new THREE__namespace.Vector2(
@@ -20396,7 +19876,7 @@ class PointerControls {
           if (!this.doublePressed) {
             let intensity = 0;
             if (this.lastDown) {
-              intensity = (now - (((_b2 = this.lastDown) == null ? void 0 : _b2.timeStamp) ?? now) - this.pressMoveDelayMs) / this.pressMoveAccelMs;
+              intensity = (now - (((_b = this.lastDown) == null ? void 0 : _b.timeStamp) ?? now) - this.pressMoveDelayMs) / this.pressMoveAccelMs;
               if (this.lastDown.position.distanceTo(this.lastDown.initial) < this.doublePressDistance) {
                 if (this.pressHeld === void 0) {
                   if (intensity > 0) {
