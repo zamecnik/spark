@@ -327,6 +327,20 @@ export class WebGpuSplatBackend {
   // Sort by radial distance (true, Spark default) or view-z + 100.0 bias.
   sortRadial = true;
 
+  // [ssog-30] Quantize the sort key on a LOG distance scale (true) instead
+  // of linearly over [minD, maxD]. Linear 16-bit keys over a scene whose
+  // bounding box spans hundreds of metres give ~1 cm buckets; zoomed in,
+  // dense splats a few millimetres apart tie, and the compact sort appends
+  // tied keys in nondeterministic order, so tied neighbours swap draw order
+  // on every sort — sorting runs every frame while the camera moves and not
+  // at rest, which reads as sparkle that vanishes when the camera stops
+  // (owner report 2026-09-09, 20M scene, WebGPU only; WebGL2's CPU sort is
+  // exact). Log keys give the near field sub-millimetre buckets (0.15 mm at
+  // 1 m, 1.5 mm at 10 m over a 900 m range) and coarse ones only far away,
+  // where splats are tiny. Monotonic in distance, so non-tied order is
+  // unchanged. `?sortkey=linear` (app) restores the old mapping for A/B.
+  sortKeyLog = true;
+
   // Testing hook (harness stale-order regression): freeze the order producer.
   freezeOrder = false;
 
@@ -932,6 +946,7 @@ export class WebGpuSplatBackend {
     const uDistRange = uniform(new Vector3(0, 1, 0)); // (min, max, unused)
 
     const sortRadial = this.sortRadial;
+    const sortKeyLog = this.sortKeyLog;
     const keygen = (Fn(() => {
       const i = instanceIndex;
       If(i.greaterThanEqual(uint(Math.max(1, capacity))), () => {
@@ -980,19 +995,16 @@ export class WebGpuSplatBackend {
         : world.sub(uCameraPos).dot(uCameraDir).add(100.0);
       // INVERTED: the radix sort is ascending, compositing draws
       // back-to-front, so far splats need the smallest keys.
-      const q = uint(
-        float(1.0)
-          .sub(
-            clamp(
-              metric
-                .sub((uDistRange as TslNode).x)
-                .div((uDistRange as TslNode).y.sub((uDistRange as TslNode).x)),
-              0.0,
-              1.0,
-            ),
-          )
-          .mul(quantMax),
-      );
+      // [ssog-30] log keys: uDistRange = (log minClamp, log span, minClamp);
+      // linear keys: uDistRange = (minD, maxD, 0) as before.
+      const norm = sortKeyLog
+        ? log(max(metric, (uDistRange as TslNode).z))
+            .sub((uDistRange as TslNode).x)
+            .div((uDistRange as TslNode).y)
+        : metric
+            .sub((uDistRange as TslNode).x)
+            .div((uDistRange as TslNode).y.sub((uDistRange as TslNode).x));
+      const q = uint(float(1.0).sub(clamp(norm, 0.0, 1.0)).mul(quantMax));
       keysNode.element(i).assign(q);
     })() as TslNode)
       .compute([Math.ceil(Math.max(1, capacity) / 256)], [256])
@@ -1355,21 +1367,17 @@ export class WebGpuSplatBackend {
           const metric = sortRadial
             ? viewCenter.length()
             : viewCenter.z.negate().add(100.0);
-          const qk = uint(
-            float(1.0)
-              .sub(
-                clamp(
-                  metric
-                    .sub((uDistRange as TslNode).x)
-                    .div(
-                      (uDistRange as TslNode).y.sub((uDistRange as TslNode).x),
-                    ),
-                  0.0,
-                  1.0,
-                ),
-              )
-              .mul(quantMax),
-          );
+          // [ssog-30] same mapping as keygen (log or linear, baked)
+          const normK = sortKeyLog
+            ? log(max(metric, (uDistRange as TslNode).z))
+                .sub((uDistRange as TslNode).x)
+                .div((uDistRange as TslNode).y)
+            : metric
+                .sub((uDistRange as TslNode).x)
+                .div(
+                  (uDistRange as TslNode).y.sub((uDistRange as TslNode).x),
+                );
+          const qk = uint(float(1.0).sub(clamp(normK, 0.0, 1.0)).mul(quantMax));
           if (visOn && visCountAtomic && compactVals) {
             // [vc] compact append: only NON-rejected splats enter the sort
             // domain. atomicAdd hands each visible splat a unique compact
@@ -1604,6 +1612,21 @@ export class WebGpuSplatBackend {
         Math.min(Math.max(camObj.z, mn.z), mx.z),
       ).applyMatrix4(state.mesh.matrixWorld);
       minD = Math.max(0, closest.distanceTo(camPos));
+    }
+    if (this.sortKeyLog) {
+      // [ssog-30] log-distance keys: everything nearer than minClamp shares
+      // the nearest bucket (2 cm — inside any camera near plane); the span
+      // is log(maxD/minClamp), ~10.7 on a 900 m scene, so the bucket at
+      // distance d is d·span/65535 (0.16 mm at 1 m, 15 cm at 900 m).
+      const minClamp = Math.max(minD, 0.02);
+      if (maxD <= minClamp * 1.001) maxD = minClamp * 2;
+      const logMin = Math.log(minClamp);
+      (state.uDistRange.value as THREE.Vector3).set(
+        logMin,
+        Math.log(maxD) - logMin,
+        minClamp,
+      );
+      return;
     }
     if (maxD <= minD) maxD = minD + 1;
     (state.uDistRange.value as THREE.Vector3).set(minD, maxD, 0);
