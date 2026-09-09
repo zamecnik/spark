@@ -43,6 +43,12 @@ export interface SsogLodMeta {
    * ACTUAL tree instead of the CLI default (16).
    */
   chunkExtent?: number;
+  /**
+   * [ssog-27] pipeline packer stamp: 1 = every unit is ONE SOGU container
+   * `{L}_{i}/unit.bin`; absent/0 = classic loose files. Any other value is
+   * rejected at construction (never sniffed, never silently downgraded).
+   */
+  unitPack?: number;
   tree: SsogLodMetaNode & { bound: SsogLodMetaBound };
 }
 
@@ -55,6 +61,8 @@ export class SsogModel {
   readonly hasEnvironment: boolean;
   /** [ssog-16] builder chunk extent from the meta stamp; null on old bundles */
   readonly chunkExtent: number | null;
+  /** [ssog-27] unit container format: 0 = classic loose files, 1 = `unit.bin` per unit */
+  readonly unitPack: 0 | 1;
 
   readonly numLeaves: number;
   /** [leaf*6 .. leaf*6+5] = minX,minY,minZ,maxX,maxY,maxZ */
@@ -110,6 +118,19 @@ export class SsogModel {
       meta.chunkExtent > 0
         ? meta.chunkExtent
         : null;
+    // [ssog-27] unit container stamp — see SsogLodMeta.unitPack. Absent/0 is
+    // classic, 1 is packed, anything else is a format this viewer cannot
+    // read: fail loud here rather than 404 on every unit later.
+    const up = meta.unitPack;
+    if (up === undefined || up === 0) {
+      this.unitPack = 0;
+    } else if (up === 1) {
+      this.unitPack = 1;
+    } else {
+      throw new Error(
+        `lod-meta unitPack ${String(up)} is not supported by this viewer (expected absent, 0 or 1) — update the viewer`,
+      );
+    }
 
     const L = meta.lodLevels;
     const numUnits = meta.filenames.length;

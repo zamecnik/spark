@@ -19,12 +19,35 @@
 // null — cancellable — until EVERY file of the unit has a known size, so a
 // chunked (gzip'd, Content-Length-less) response can never read as ~1.0 and
 // silently switch cancellation off for that unit.
+//
+// [ssog-27] one file per unit: when the manifest is stamped `unitPack: 1`
+// every unit is ONE container `{dir}/unit.bin` (SsogUnitPack.ts, SOGU v1)
+// instead of meta.json + planes. `fetchPackedUnit` sets `filesTotal = 1`
+// BEFORE the request starts, so `unitProgress` is real from the first
+// Content-Length header (identity octet-stream) instead of null for most of
+// the unit's life; the container is parsed on the main thread (header +
+// directory, meta.json inflated with fflate), header count and meta count
+// are checked against `unitSplats` before any decode, and every plane is
+// `slice()`d into a standalone ArrayBuffer for the UNCHANGED `unpackSsogUnit`
+// RPC. The classic path is the previous code verbatim. Any non-abort failure
+// of a unit (network, container, decode) now records a strike and refuses
+// that unit for 4/8/16…300 s (`fetchRefused`, `unitStrikes`), so a
+// permanently bad container never loops the pager's transient-retry at full
+// bandwidth. `stats.fetches` therefore counts units + palettes on a packed
+// scene (the "÷8 = units" framing is retired).
 
 import { workerPool } from "@sparkjsdev/spark";
 import { defines } from "@sparkjsdev/spark";
 import type { PcSogsJson, PcSogsV2Json } from "../SplatLoader";
 import type { SplatEncoding } from "../defines";
 import type { SsogModel } from "./SsogModel";
+import {
+  SSOG_UNIT_PACK_FILE,
+  SsogUnitPackError,
+  parseUnitPack,
+  planeNames,
+  readUnitPackMeta,
+} from "./SsogUnitPack";
 
 export type SsogResolvedUrl =
   | string
@@ -88,8 +111,9 @@ interface UnitRecord {
    */
   expected: number;
   /**
-   * Files this unit will fetch: 0 = NOT YET KNOWN (meta.json not parsed, so
-   * the plane list is still unknown), else 1 (meta) + plane files.
+   * Files this unit will fetch: 0 = NOT YET KNOWN (classic: meta.json not
+   * parsed, so the plane list is still unknown), else 1 (meta) + plane
+   * files; [ssog-27] a packed unit sets 1 before the request starts.
    */
   filesTotal: number;
   /** files of this unit whose size is known (header or completion) */
@@ -98,6 +122,22 @@ interface UnitRecord {
   fetchDone: boolean;
   /** release() aborted this record */
   aborted: boolean;
+}
+
+/** [ssog-24] per-file byte callbacks `fetchFile` reports into a unit record */
+interface FetchSink {
+  onLength?: (bytes: number) => void;
+  onBytes?: (delta: number) => void;
+  /** file settled; delta = its WIRE size (0 for an HTTP-cache hit) */
+  onWire?: (delta: number) => void;
+  /** file finished; hadLength = a Content-Length header was seen */
+  onEnd?: (total: number, hadLength: boolean) => void;
+}
+
+/** a unit's meta + plane bytes, whichever shape they were fetched in */
+interface FetchedUnit {
+  json: PcSogsJson | PcSogsV2Json;
+  files: Record<string, ArrayBuffer>;
 }
 
 /** bytes-per-unit memory for the wasted-bytes estimate (bounded) */
@@ -125,6 +165,17 @@ export class SsogUnitCache {
 
   /** [ssog-24] monotonic UnitRecord id source (see UnitRecord.id) */
   private recordSeq = 0;
+
+  /**
+   * [ssog-27] unit → {strikes, until(ms)}: after a non-abort failure the unit
+   * is refused for min(300 s, 2^(strikes+1) s). The pager treats every
+   * non-abort rejection as transient (warn, short backoff, re-issue) and the
+   * failed record is dropped, so without this a permanently bad unit would
+   * be re-downloaded whole every ~0.5 s; a dead unit now costs zero network
+   * after the 3rd attempt and shows up in `fetchRefused` / `unitStrikes`.
+   */
+  private unitFailures: Map<number, { strikes: number; until: number }> =
+    new Map();
 
   /** counters for the HUD/harness (all cumulative since construction) */
   stats = {
@@ -187,6 +238,14 @@ export class SsogUnitCache {
      * savings — a large value means the wire measurement is not working.
      */
     filesWithoutWireSize: 0,
+    /** [ssog-27] units loaded through the ONE-file container path */
+    packedFetches: 0,
+    /** [ssog-27] containers rejected (magic/version/table/count/member set) — each also counts in fetchErrors */
+    packErrors: 0,
+    /** [ssog-27] non-abort unit failures (network, container, decode); drives the per-unit cool-down */
+    unitStrikes: 0,
+    /** [ssog-27] getUnit calls refused during a unit's cool-down (no request made) */
+    fetchRefused: 0,
   };
 
   /**
@@ -249,6 +308,17 @@ export class SsogUnitCache {
       return existing.promise;
     }
 
+    // [ssog-27] cool-down after repeated failures: refuse without a request
+    const failure = this.unitFailures.get(unit);
+    if (failure && performance.now() < failure.until) {
+      this.stats.fetchRefused += 1;
+      return Promise.reject(
+        new Error(
+          `ssog unit ${this.model.unitDirName(unit)}: refused for ${Math.ceil((failure.until - performance.now()) / 1000)} s after ${failure.strikes} failed attempt(s)`,
+        ),
+      );
+    }
+
     const record: UnitRecord = {
       id: ++this.recordSeq,
       promise: undefined as unknown as Promise<SsogDecodedUnit>,
@@ -268,6 +338,8 @@ export class SsogUnitCache {
         record.settled = true;
         // [ssog-24 r4] wire, not decoded: see UnitRecord.receivedWire
         this.rememberUnitBytes(unit, record.receivedWire);
+        // [ssog-27] a success clears the unit's strike history
+        this.unitFailures.delete(unit);
         return decoded;
       },
       (error) => {
@@ -278,6 +350,16 @@ export class SsogUnitCache {
         // [ssog-24] an abort is a deliberate cancel, not a fetch error
         if (!record.aborted && !isAbortError(error)) {
           this.stats.fetchErrors += 1;
+          // [ssog-27] strike + exponential cool-down (4, 8, 16 … 300 s)
+          if (error instanceof SsogUnitPackError) {
+            this.stats.packErrors += 1;
+          }
+          const strikes = (this.unitFailures.get(unit)?.strikes ?? 0) + 1;
+          this.stats.unitStrikes += 1;
+          this.unitFailures.set(unit, {
+            strikes,
+            until: performance.now() + 1000 * Math.min(300, 2 ** (strikes + 1)),
+          });
         }
         throw error;
       },
@@ -452,6 +534,7 @@ export class SsogUnitCache {
     this.units.clear();
     this.unitBytesMap.clear();
     this.palettes.clear();
+    this.unitFailures.clear();
   }
 
   /**
@@ -477,14 +560,7 @@ export class SsogUnitCache {
   private async fetchFile(
     relativePath: string,
     signal?: AbortSignal,
-    sink?: {
-      onLength?: (bytes: number) => void;
-      onBytes?: (delta: number) => void;
-      /** file settled; delta = its WIRE size (0 for an HTTP-cache hit) */
-      onWire?: (delta: number) => void;
-      /** file finished; hadLength = a Content-Length header was seen */
-      onEnd?: (total: number, hadLength: boolean) => void;
-    },
+    sink?: FetchSink,
   ): Promise<ArrayBuffer> {
     const resolved = await this.resolver(relativePath);
     if (signal?.aborted) {
@@ -616,18 +692,30 @@ export class SsogUnitCache {
       },
     };
     const dir = this.model.unitDirName(unit);
+    // [ssog-27] the manifest stamp decides the shape; the decode is shared
+    const { json, files } =
+      this.model.unitPack === 1
+        ? await this.fetchPackedUnit(unit, dir, record, signal, sink)
+        : await this.fetchClassicUnit(dir, record, signal, sink);
+    return this.decodeFetchedUnit(unit, dir, json, files, signal);
+  }
+
+  /**
+   * Classic loose files: meta.json first (the plane list lives in it), then
+   * every plane in parallel under the unit's abort signal.
+   */
+  private async fetchClassicUnit(
+    dir: string,
+    record: UnitRecord,
+    signal: AbortSignal,
+    sink: FetchSink,
+  ): Promise<FetchedUnit> {
     const metaBytes = await this.fetchFile(`${dir}/meta.json`, signal, sink);
     const json = JSON.parse(
       new TextDecoder().decode(metaBytes),
     ) as PcSogsJson | PcSogsV2Json;
 
-    const names: string[] = [
-      ...json.means.files,
-      ...json.scales.files,
-      ...json.quats.files,
-      ...json.sh0.files,
-      ...(json.shN?.files ?? []),
-    ];
+    const names = planeNames(json);
     // the plane list is known only now: until this line unitProgress has to
     // report null (filesTotal 0), whatever meta.json's own length said.
     record.filesTotal = 1 + names.length;
@@ -638,7 +726,96 @@ export class SsogUnitCache {
       }),
     );
     record.fetchDone = true;
+    return { json, files };
+  }
 
+  /**
+   * [ssog-27] ONE file per unit, known BEFORE the request starts: filesTotal=1
+   * now, expected on the first Content-Length header (identity octet-stream)
+   * → unitProgress is real from the first byte, never null for the whole
+   * transfer. A content-encoded response still counts as length-unknown
+   * (fetchFile) and is settled by onEnd — the safe direction is preserved.
+   * The container is verified (header, directory, meta bound) and its counts
+   * are checked against the model BEFORE any decode; every violation rejects
+   * with an SsogUnitPackError, which the strike/cool-down then bounds.
+   */
+  private async fetchPackedUnit(
+    unit: number,
+    dir: string,
+    record: UnitRecord,
+    signal: AbortSignal,
+    sink: FetchSink,
+  ): Promise<FetchedUnit> {
+    record.filesTotal = 1;
+    const buf = await this.fetchFile(
+      `${dir}/${SSOG_UNIT_PACK_FILE}`,
+      signal,
+      sink,
+    );
+    // nothing left to save by aborting; the parse below is synchronous
+    record.fetchDone = true;
+    const label = `ssog unit ${dir}`;
+    const pack = parseUnitPack(buf, label); // throws SsogUnitPackError with the reason
+    const rows = this.model.unitSplats[unit];
+    // pre-decode gate: header count vs the model-derived per-unit count
+    if (pack.count !== rows) {
+      throw new SsogUnitPackError(
+        label,
+        `header count ${pack.count}, model derives ${rows}`,
+      );
+    }
+    // a container whose meta inflates but is not JSON is a CONTAINER defect
+    // (packErrors), same reason string as the packer's readUnitPack
+    const metaText = new TextDecoder().decode(
+      readUnitPackMeta(buf, pack, label),
+    );
+    let json: PcSogsJson | PcSogsV2Json;
+    try {
+      json = JSON.parse(metaText) as PcSogsJson | PcSogsV2Json;
+    } catch (e) {
+      throw new SsogUnitPackError(
+        label,
+        `meta.json is not valid JSON: ${(e as Error).message}`,
+      );
+    }
+    if ((json as PcSogsV2Json).count !== rows) {
+      throw new SsogUnitPackError(
+        label,
+        `meta count ${(json as PcSogsV2Json).count}, model derives ${rows}`,
+      );
+    }
+    const names = planeNames(json);
+    if (pack.members.size !== names.length + 1) {
+      throw new SsogUnitPackError(
+        label,
+        `${pack.members.size - 1} plane members, meta lists ${names.length}`,
+      );
+    }
+    const files: Record<string, ArrayBuffer> = {};
+    for (const name of names) {
+      const m = pack.members.get(name);
+      if (!m || m.deflate) {
+        throw new SsogUnitPackError(
+          label,
+          `plane ${name} missing from container or compressed`,
+        );
+      }
+      // one standalone ArrayBuffer per plane: the worker pool TRANSFERS every
+      // buffer in the call args and getTransferable dedups VIEWS, not buffers
+      files[name] = buf.slice(m.offset, m.offset + m.length);
+    }
+    this.stats.packedFetches += 1;
+    return { json, files };
+  }
+
+  /** shared tail of both shapes: palette memo → worker decode → P0b count gate */
+  private async decodeFetchedUnit(
+    unit: number,
+    dir: string,
+    json: PcSogsJson | PcSogsV2Json,
+    files: Record<string, ArrayBuffer>,
+    signal: AbortSignal,
+  ): Promise<SsogDecodedUnit> {
     // [ssog-22] units written against the scene palette carry labels only and
     // name the shared centroids file (relative to the ssog root). The worker
     // pool TRANSFERS every ArrayBuffer in the call args, so hand over a COPY of

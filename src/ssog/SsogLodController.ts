@@ -440,6 +440,14 @@ export class SsogLodController {
      * over-estimate, not that little was transferred.
      */
     filesWithoutWireSize: 0,
+    /** [ssog-27] units loaded through the ONE-file container path — cache mirror */
+    packedFetches: 0,
+    /** [ssog-27] containers rejected (magic/version/table/count/member set) — cache mirror */
+    packErrors: 0,
+    /** [ssog-27] non-abort unit failures that started a per-unit cool-down — cache mirror */
+    unitStrikes: 0,
+    /** [ssog-27] getUnit calls refused during a unit's cool-down (no request made) — cache mirror */
+    fetchRefused: 0,
   };
 
   constructor(options: SsogLodControllerOptions) {
@@ -930,6 +938,10 @@ export class SsogLodController {
     this.stats.paletteFetches = cs.paletteFetches;
     this.stats.filesWithoutLength = cs.filesWithoutLength;
     this.stats.filesWithoutWireSize = cs.filesWithoutWireSize;
+    this.stats.packedFetches = cs.packedFetches;
+    this.stats.packErrors = cs.packErrors;
+    this.stats.unitStrikes = cs.unitStrikes;
+    this.stats.fetchRefused = cs.fetchRefused;
     const pager = this.splats.pager;
     if (pager) {
       this.stats.chunkCancels = pager.fetchCancels;
