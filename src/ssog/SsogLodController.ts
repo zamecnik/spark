@@ -18,6 +18,8 @@
 //   - 10-frame free-running metronome, latched, with motion gates (moved >
 //     0.2·lodBaseDistance, rotated > 90°, FOV Δ > 2%, resource-arrival,
 //     params-dirty, not-yet-converged);
+//     [ssog-31] sse over budget/pages → tolerance search (graded budget),
+//     the one-level-per-pass demotion is the bands/fallback path only;
 //   - keep-old-until-resident swap state machine with cancel/retarget: a leaf
 //     never leaves the cut (pop, never hole); desired = the balanced target
 //     DIRECTLY (kroscloud.10 flip-visibility alignment — upstream
@@ -116,6 +118,18 @@ export interface SsogLodControllerOptions {
    * rotation-invariant: turning in place costs no fetch at all. Default 4.
    */
   behindPenalty?: number;
+  /**
+   * [ssog-31] graded budget (sse only). When the e-px cut exceeds the splat
+   * budget or the page limit, RELAX THE TOLERANCE instead of demoting every
+   * leaf one level per pass: the pure sse cut at the smallest tolerance
+   * e·m (m on a quarter-level grid, ×2^(1/8) per step) that fits BOTH
+   * limits becomes the balanced target, and the promote-to-fill legs spend
+   * the residual nearest-first as before, still capped at the e-px levels.
+   * Keeps the distance gradient (near sharp, far coarse) that the
+   * one-level-per-pass demotion flattened into "everything L4". Default
+   * true; false = the kroscloud.38 balancer (A/B).
+   */
+  gradedBudget?: boolean;
   /** [ssog-23] sse: error tolerance in CSS pixels at rest (default 2) */
   sseErrorPx?: number;
   /**
@@ -295,6 +309,25 @@ export class SsogLodController {
   private readonly pageRefs: Int32Array;
   /** [ssog-26] behind-camera penalty factor k in `1 + k·max(0, −dot)` */
   private behindPenalty: number;
+  /** [ssog-31] graded budget on/off (see the option) */
+  private gradedBudget: boolean;
+  /**
+   * [ssog-31] per-tick scratch: each leaf's continuous level position
+   * log(db/d0)/log(m') from the selection loop, so the tolerance search
+   * re-levels every leaf per step with one add + floor instead of a log.
+   */
+  private readonly levelPos: Float64Array;
+  /**
+   * [ssog-31] EFFECTIVE tolerance (e·m, CSS px) the previous tick settled
+   * at, the anchor of the next search — stored in px, not as the grid
+   * index, because the base/fine phases change e (4 px moving, 2 px at
+   * rest) and the same cut then sits 8 grid steps away; anchoring on k
+   * made every phase change walk the cut down and back (harness look-
+   * around at k=0: 6 refetched units and 2.3× the flips of a stable cut).
+   * The search starts here: coarser only when the anchor no longer fits,
+   * finer only when one step finer fits WITH slack.
+   */
+  private tolPxAnchor = 0;
 
   /**
    * [ssog-17 perf] per-tick scratch for the bucket-ordered leaf index
@@ -374,6 +407,16 @@ export class SsogLodController {
     interestMode: "camera" as string,
     /** [ssog-26] behind-camera penalty factor in force (4 = the ×5 legacy) */
     behindPenalty: 4,
+    /** [ssog-31] graded budget in force */
+    gradedBudget: true,
+    /** [ssog-31] tolerance multiplier the last selection settled at (1 = the e-px cut fit) */
+    sseTolMul: 1,
+    /** [ssog-31] effective tolerance of the last selection (CSS px) = sseErrorPx × sseTolMul */
+    sseTolPx: 0,
+    /** [ssog-31] quarter-level steps the last tolerance search took */
+    sseTolSteps: 0,
+    /** [ssog-31] distinct pages of the all-coarsest cut (= the pinned tier since the empty coarse suffix) */
+    floorPages: 0,
     /**
      * [ssog-25] grows deferred by capacity or the pool guard that sat in the
      * NEARER half of the ordered grow list — the subject's share of the
@@ -493,6 +536,7 @@ export class SsogLodController {
     this.bucketOf = new Int32Array(this.NL);
     this.dBucket = new Float64Array(this.NL);
     this.tBucket = new Float64Array(this.NL);
+    this.levelPos = new Float64Array(this.NL);
     this.readySinceTick = new Int32Array(this.NL).fill(-1);
 
     // [ssog-23] SSE calibration from the artifact itself: median L0 leaf
@@ -503,6 +547,8 @@ export class SsogLodController {
       options.behindPenalty,
     );
     this.stats.behindPenalty = this.behindPenalty;
+    this.gradedBudget = options.gradedBudget !== false;
+    this.stats.gradedBudget = this.gradedBudget;
     this.sseErrorPx = Math.max(0.1, options.sseErrorPx ?? 2);
     this.sseBaseErrorPx = options.sseBaseErrorPx ?? 4;
     this.sseDwellMs = Math.max(0, options.sseDwellMs ?? 1500);
@@ -591,6 +637,35 @@ export class SsogLodController {
         );
       }
     }
+  }
+
+  /**
+   * [ssog-17]/[ssog-31] distinct pool pages of a cut — the pinned tier ∪
+   * every leaf at `levels[li]` — leaving pageRefs holding that cut's
+   * refcounts for the fill's incremental moves. Bump order (pinned, then
+   * leaves ascending) is the one the inline passes used, so the refs are
+   * bit-identical to kroscloud.38 on the non-graded path.
+   */
+  private countCutPages(levels: Int32Array): number {
+    const refs = this.pageRefs;
+    refs.fill(0);
+    let distinct = 0;
+    for (const c of this.pinnedChunks) {
+      if (refs[c] === 0) {
+        distinct++;
+      }
+      refs[c]++;
+    }
+    for (let li = 0; li < this.NL; li++) {
+      distinct = this.bumpLeafPageRefs(li, levels[li], refs, distinct, 1);
+    }
+    return distinct;
+  }
+
+  /** [ssog-31] pages of the all-coarsest cut (the reset floor) — HUD/diagnostics, computed once. */
+  private countFloorPages(): number {
+    const levels = new Int32Array(this.NL).fill(this.L - 1);
+    return this.countCutPages(levels);
   }
 
   /**
@@ -768,6 +843,17 @@ export class SsogLodController {
     return typeof k === "number" && Number.isFinite(k)
       ? Math.min(16, Math.max(0, k))
       : 4;
+  }
+
+  /** [ssog-31] graded budget on/off (see the option); takes effect next tick. */
+  setGradedBudget(on: boolean) {
+    const next = on !== false;
+    if (next === this.gradedBudget) {
+      return;
+    }
+    this.gradedBudget = next;
+    this.stats.gradedBudget = next;
+    this.paramsDirty = true;
   }
 
   /**
@@ -1175,6 +1261,10 @@ export class SsogLodController {
     // Those leaves now display NOTHING until the normal ladder reaches
     // them, so the composed cut is exact — no missing-page compose noise
     // masking a real R7 stale-cut failure in the soak counters.
+    // [ssog-31] SsogModel now leaves such coarse-suffix slots EMPTY (count
+    // 0), so pinnedResident is true for them via the count test and the
+    // hole count below reads 0 on every builder-produced tree; the branch
+    // stays for manifests with a resolved-finer coarsest ref (middle gaps).
     // mesh.raycastIndices below is UNCHANGED by this: compose() used to
     // break out on the first non-resident chunk, so those rows never made
     // it into the published set either way.
@@ -1652,7 +1742,11 @@ export class SsogLodController {
         63,
         Math.floor((64 * Math.sqrt(db)) / sqrtDMax),
       );
-      let lvl = db <= d0 ? 0 : 1 + Math.floor(Math.log(db / d0) / logM);
+      // [ssog-31] continuous level position, kept for the tolerance search
+      // (a shift of +1 = one level coarser = tolerance ×m')
+      const pos = db > 0 ? Math.log(db / d0) / logM : Number.NEGATIVE_INFINITY;
+      this.levelPos[li] = pos;
+      let lvl = db <= d0 ? 0 : 1 + Math.floor(pos);
       if (lvl < 0) {
         lvl = 0;
       }
@@ -1686,30 +1780,6 @@ export class SsogLodController {
     this.balancedLevel.set(this.optimalLevel);
     let totalBalanced = totalOptimal;
     const budget = this.budget;
-    if (totalBalanced > budget) {
-      let passes = 0;
-      demote: while (totalBalanced > budget && passes < L) {
-        passes++;
-        for (let b = 63; b >= 0; b--) {
-          for (let i = bucketStart[b]; i < bucketStart[b + 1]; i++) {
-            const li = bucketOrder[i];
-            const cur = this.balancedLevel[li];
-            if (cur >= L - 1) {
-              continue;
-            }
-            const curCount = model.leafLods[(li * L + cur) * 3 + 2];
-            const nextCount = model.leafLods[(li * L + cur + 1) * 3 + 2];
-            this.balancedLevel[li] = cur + 1;
-            totalBalanced += nextCount - curCount; // aliased demote may free 0
-            if (totalBalanced <= budget) {
-              break demote;
-            }
-          }
-        }
-        // exhaustion: soft target (§2.4) — all at coarsest is legal; the
-        // capacity policy absorbs it
-      }
-    }
 
     // ---- [ssog-17] page-feasibility + page-aware promote-to-fill ----------
     // (kroscloud.27 — 2026-08-31 pool-binder verification on the live 20M
@@ -1756,48 +1826,161 @@ export class SsogLodController {
         (model.maxLeafBlockFootprint + pager.numFetchers);
 
     const pageRefs = this.pageRefs;
-    pageRefs.fill(0);
-    let distinctPages = 0;
-    for (const c of this.pinnedChunks) {
-      if (pageRefs[c] === 0) {
-        distinctPages++;
-      }
-      pageRefs[c]++;
-    }
-    for (let li = 0; li < NL; li++) {
-      distinctPages = this.bumpLeafPageRefs(
-        li,
-        this.balancedLevel[li],
-        pageRefs,
-        distinctPages,
-        1,
-      );
+    if (this.stats.floorPages === 0) {
+      this.stats.floorPages = this.countFloorPages();
     }
 
-    if (distinctPages > pageLimit) {
-      // page-infeasible target: reset to per-leaf coarsest (its refs are
-      // ≈ the pinned tier — resolved-missing coarsest slots can point at a
-      // finer unit, so refs are recomputed, not assumed) and rebuild below.
-      totalBalanced = 0;
-      pageRefs.fill(0);
-      distinctPages = 0;
-      for (const c of this.pinnedChunks) {
-        if (pageRefs[c] === 0) {
-          distinctPages++;
+    // ---- [ssog-31] graded budget: tolerance search (sse) -----------------
+    // The e-px cut of a 20M scene is 5–20× over any budget (d0 ≈ 140 m at
+    // 2 px on a phone), and the one-level-per-pass demotion below then
+    // shifts EVERY leaf by the same 3–4 levels — a flat field where the
+    // ground at the user's feet sits at the level of a house 20 m away
+    // (owner's phone report 2026-09-09; sim: near L4.5 / far L5.5 at 1M).
+    // Relaxing the tolerance instead keeps the sse shape: the pure cut at
+    // e·m (level = f(distance·m)) is the equal-screen-error allocation at
+    // the coarser tolerance — near leaves keep fine levels, the far field
+    // pays. Walk m up a quarter-level grid until the pure cut fits BOTH the
+    // splat budget and the page limit (rows are cheap to sum; pages are
+    // counted only when rows fit), and hand that cut to the fill. The fill's
+    // ceilings stay the e-px levels, so the residual still goes nearest-first.
+    // Sim (76vx-derived 8-level ladder, phone 1042 px portrait, 1M/pf 3.5):
+    // shipped L4.8/4.3/4.4/4.4/4.6 at ≤2/2–5/5–10/10–20/20–40 m → graded
+    // L0.0/2.6/3.6/4.2/5.5, composed 0.72M → 1.00M; desktop 4M fpv: near
+    // L2.0 → L0.0, 20–40 m L2.8 → L3.9, composed 3.06M → 4.00M; orbit-from-
+    // the-air poses (the e-px cut already fits) are unchanged.
+    // Search: over the grid index k (shift = k/4, k ∈ [0, 256] — the leaves
+    // the camera stands in sit 20–40 levels below d0, so the shift that
+    // frees their neighbours' pages can exceed L; k = 256 is all-coarsest
+    // for every leaf with db > 0), ANCHORED at the previous tick's k:
+    //   - k still fits → try k−1 WITH SLACK (rows ≤ 0.97·budget, pages ≤
+    //     limit − max(1, 4% of it)); if that fits, binary-search [0, k−1]
+    //     for the smallest slack-fitting k; else keep k;
+    //   - k no longer fits → binary-search [k, 256] for the smallest
+    //     fitting k (no slack: the cut must fit NOW).
+    // The slack band absorbs per-tick jitter so a moving camera does not
+    // re-quantize every shell by a quarter level each tick; at a fixed pose
+    // the anchor converges within two ticks (deterministic given the pose,
+    // so allAtTarget still latches). Feasibility is monotone in rows and
+    // near-monotone in pages, so each bracket lands on the smallest fitting
+    // grid point or its neighbour — ≤ 10 evaluations, each O(NL) plus one
+    // page pass when rows fit; 1–2 when nothing changed.
+    let tolShift = 0;
+    let tolSteps = 0;
+    if (sse && this.gradedBudget) {
+      const K = 256;
+      const pageSlack = wholeResident ? 0 : Math.max(1, Math.round(0.04 * pageLimit));
+      const evalK = (k: number, slack: boolean): boolean => {
+        tolSteps++;
+        const shift = k / 4;
+        let total = 0;
+        for (let li = 0; li < NL; li++) {
+          const x = this.levelPos[li] + shift;
+          let lvl = x <= 0 ? 0 : 1 + Math.floor(x);
+          if (lvl >= L) {
+            lvl = L - 1;
+          }
+          this.balancedLevel[li] = lvl;
+          total += model.leafLods[(li * L + lvl) * 3 + 2];
         }
-        pageRefs[c]++;
+        totalBalanced = total;
+        if (total > (slack ? 0.97 * budget : budget)) {
+          return false;
+        }
+        return (
+          wholeResident ||
+          this.countCutPages(this.balancedLevel) <=
+            (slack ? pageLimit - pageSlack : pageLimit)
+        );
+      };
+      // anchor: e·m_prev expressed on THIS tick's grid (8 steps per ×2 of e)
+      const e = this.stats.sseErrorPx;
+      let k =
+        this.tolPxAnchor > 0 && e > 0
+          ? Math.min(K, Math.max(0, Math.round(8 * Math.log2(this.tolPxAnchor / e))))
+          : 0;
+      if (evalK(k, false)) {
+        if (k > 0 && evalK(k - 1, true)) {
+          // finer with slack: smallest slack-fitting k in [0, k−1]
+          let lo = -1; // "infeasible" sentinel below the grid
+          let hi = k - 1; // slack-feasible
+          while (hi - lo > 1) {
+            const mid = (lo + hi) >> 1;
+            if (evalK(mid, true)) {
+              hi = mid;
+            } else {
+              lo = mid;
+            }
+          }
+          k = hi;
+        }
+        evalK(k, false); // leave balancedLevel/totalBalanced at the answer
+      } else if (evalK(K, false)) {
+        // coarser: smallest fitting k in (k, K]
+        let lo = k; // infeasible
+        let hi = K; // feasible
+        while (hi - lo > 1) {
+          const mid = (lo + hi) >> 1;
+          if (evalK(mid, false)) {
+            hi = mid;
+          } else {
+            lo = mid;
+          }
+        }
+        k = hi;
+        evalK(k, false);
+      } else {
+        // not even all-coarsest fits: leave that cut in place — the
+        // breadth demotion and the page reset below take over
+        k = K;
       }
+      tolShift = k / 4;
+      this.tolPxAnchor = e * mPrime ** tolShift;
+    }
+    this.stats.sseTolMul = sse ? mPrime ** tolShift : 1;
+    this.stats.sseTolPx = sse ? this.stats.sseErrorPx * this.stats.sseTolMul : 0;
+    this.stats.sseTolSteps = tolSteps;
+
+    // ---- breadth demotion: bands mode, ?ssoggraded=0, or the floor itself
+    // over budget (the graded search then ends at all-coarsest) ------------
+    if (totalBalanced > budget) {
+      let passes = 0;
+      demote: while (totalBalanced > budget && passes < L) {
+        passes++;
+        for (let b = 63; b >= 0; b--) {
+          for (let i = bucketStart[b]; i < bucketStart[b + 1]; i++) {
+            const li = bucketOrder[i];
+            const cur = this.balancedLevel[li];
+            if (cur >= L - 1) {
+              continue;
+            }
+            const curCount = model.leafLods[(li * L + cur) * 3 + 2];
+            const nextCount = model.leafLods[(li * L + cur + 1) * 3 + 2];
+            this.balancedLevel[li] = cur + 1;
+            totalBalanced += nextCount - curCount; // aliased demote may free 0
+            if (totalBalanced <= budget) {
+              break demote;
+            }
+          }
+        }
+        // exhaustion: soft target (§2.4) — all at coarsest is legal; the
+        // capacity policy absorbs it
+      }
+    }
+
+    let distinctPages = this.countCutPages(this.balancedLevel);
+
+    if (distinctPages > pageLimit) {
+      // page-infeasible target: reset to per-leaf coarsest and let the fill
+      // rebuild nearest-first. [ssog-31] the coarse suffix is empty since
+      // kroscloud.39, so this IS the pinned tier (refs still recomputed,
+      // never assumed). Unreachable on the graded path unless the pinned
+      // tier alone exceeds the page limit.
+      totalBalanced = 0;
       for (let li = 0; li < NL; li++) {
         this.balancedLevel[li] = L - 1;
         totalBalanced += model.leafLods[(li * L + L - 1) * 3 + 2];
-        distinctPages = this.bumpLeafPageRefs(
-          li,
-          L - 1,
-          pageRefs,
-          distinctPages,
-          1,
-        );
       }
+      distinctPages = this.countCutPages(this.balancedLevel);
     }
 
     // [ssog-14] promote-to-fill (supersplat GSplatBudgetBalancer parity —

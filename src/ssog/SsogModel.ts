@@ -308,8 +308,18 @@ export class SsogModel {
         blockBase[u] + Math.ceil(unitSplats[u] / SSOG_PAGE_SPLATS);
     }
 
-    // ---- missing-level resolution (AT LOAD; runtime never sees -1) ---------
-    // nearest available level; tie → the coarser one (conservative for budget)
+    // ---- missing-level resolution (AT LOAD) --------------------------------
+    // nearest available level; tie → the coarser one (conservative for budget).
+    // [ssog-31] EXCEPT the coarse suffix: a level coarser than the leaf's
+    // coarsest real level stays EMPTY (file −1, offset 0, count 0 — the only
+    // −1 the runtime ever sees, always with count 0, and every consumer
+    // checks count first). The old rule resolved it to a FINER unit, so the
+    // all-coarsest floor touched every unit those few-splat outskirts leaves
+    // live in: 66 pool pages on the 76vx 20M scene against a 22-page pinned
+    // tier (559 leaves with no L5 rows), ~80 pages on an 8-level ladder —
+    // more than a phone pool holds (32 pages at 1M/pf 1.8), so the balancer
+    // could never promote anything there. Middle gaps (never produced by the
+    // builder: per-leaf counts halve monotonically) keep the nearest rule.
     const leafLods = leafLodsPre.slice();
     const leafLevelCount = new Uint32Array(numLeaves);
     for (let li = 0; li < numLeaves; li++) {
@@ -323,8 +333,16 @@ export class SsogModel {
       if (avail.length === 0) {
         throw new Error(`leaf ${li} has no levels at all`);
       }
+      const coarsestReal = avail[avail.length - 1];
       for (let l = 0; l < L; l++) {
         if (leafLodsPre[(li * L + l) * 3] >= 0) {
+          continue;
+        }
+        if (l > coarsestReal) {
+          const dst = (li * L + l) * 3;
+          leafLods[dst] = -1;
+          leafLods[dst + 1] = 0;
+          leafLods[dst + 2] = 0;
           continue;
         }
         let best = avail[0];
@@ -343,7 +361,12 @@ export class SsogModel {
       }
       for (let l = 0; l < L; l++) {
         const o = (li * L + l) * 3;
-        if (leafLods[o] < 0 || leafLods[o + 1] < 0 || leafLods[o + 2] < 0) {
+        const emptySuffix =
+          l > coarsestReal && leafLods[o] < 0 && leafLods[o + 2] === 0;
+        if (
+          !emptySuffix &&
+          (leafLods[o] < 0 || leafLods[o + 1] < 0 || leafLods[o + 2] < 0)
+        ) {
           throw new Error(`leaf ${li} level ${l} unresolved`);
         }
       }
