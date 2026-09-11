@@ -288,7 +288,14 @@ export class SplatMesh extends SplatGenerator {
   editable: boolean;
   raycastable: boolean;
   minRaycastOpacity: number;
-  raycastIndices?: { numSplats: number; indices: Uint32Array };
+  /**
+   * Raycast over a SUBSET of the splats: `indices` into the mesh's own array
+   * (static) or the LOD tree / pool (lodSplats / paged). [full-2] `packed`:
+   * an optional CONTIGUOUS pre-gathered copy of those splats (numSplats x 4
+   * words) - the per-ray gather over a strided index set is cache-hostile
+   * (~6 ms per 65,536-splat chunk at 20M), a memcpy from the copy is not.
+   */
+  raycastIndices?: { numSplats: number; indices: Uint32Array; packed?: Uint32Array };
   // Compiled SplatEdits for applying SDF edits to splat RGBA + centers
   rgbaDisplaceEdits: SplatEdits | null = null;
   // Optional RgbaArray to overwrite splat RGBA values with custom values.
@@ -1051,7 +1058,12 @@ export class SplatMesh extends SplatGenerator {
       const packed = paged
         ? (this.paged?.pager?.packedTexture.value.image.data as Uint32Array)
         : indices
-          ? this.packedSplats?.lodSplats?.packedArray
+          ? // [full-1] `raycastIndices` on a STATIC mesh (no LOD tree) index
+            // the mesh's own packedArray - the full-detail loader hands a
+            // uniform-stride subsample so a 20M-splat click stays responsive;
+            // before this fallback the raycast returned nothing at all there.
+            (this.packedSplats?.lodSplats?.packedArray ??
+            this.packedSplats?.packedArray)
           : this.packedSplats?.packedArray;
       if (!packed) {
         return;
@@ -1059,10 +1071,14 @@ export class SplatMesh extends SplatGenerator {
       const splatEncoding = paged
         ? this.paged?.splatEncoding
         : this.packedSplats?.splatEncoding;
+      const prePacked = this.raycastIndices?.packed;
       for (let base = 0; base < numSplats; base += bufferSize) {
         const count = Math.min(bufferSize, numSplats - base);
         if (!indices) {
           buffer.set(packed.subarray(base * 4, (base + count) * 4));
+        } else if (prePacked) {
+          // [full-2] contiguous pre-gathered subset: one memcpy per chunk
+          buffer.set(prePacked.subarray(base * 4, (base + count) * 4));
         } else {
           for (let i = 0; i < count; ++i) {
             const index = indices[base + i];
