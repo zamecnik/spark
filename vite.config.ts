@@ -127,6 +127,8 @@ export default defineConfig(({ mode }) => {
           spark: path.resolve(__dirname, "src/index.ts"),
           "spark-webgpu": path.resolve(__dirname, "src/webgpu/index.ts"),
           "spark-ssog": path.resolve(__dirname, "src/ssog/index.ts"),
+          // [full-1]: the full-detail (no-LOD) module, core external like ssog
+          "spark-full": path.resolve(__dirname, "src/full/index.ts"),
         },
         name: "spark",
         formats: ["es", "cjs"],

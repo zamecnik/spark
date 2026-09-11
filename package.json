@@ -22,6 +22,11 @@
       "types": "./dist/types/ssog/index.d.ts",
       "import": "./dist/spark-ssog.module.js",
       "require": "./dist/spark-ssog.cjs.js"
+    },
+    "./full": {
+      "types": "./dist/types/full/index.d.ts",
+      "import": "./dist/spark-full.module.js",
+      "require": "./dist/spark-full.cjs.js"
     }
   },
   "scripts": {

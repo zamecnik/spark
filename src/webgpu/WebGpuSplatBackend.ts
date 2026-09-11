@@ -317,6 +317,27 @@ function scanBounds(
   };
 }
 
+// [full-1] Workgroup-count shaping for the per-splat kernels (keygen and the
+// fused projector). Both are dispatched with an explicit ARRAY size, which
+// three r185 passes verbatim to dispatchWorkgroups (only NUMBER sizes are
+// auto-split), so above maxComputeWorkgroupsPerDimension (65,535 groups =
+// 16,776,960 splats at 256 per group) the dispatch is rejected at validation,
+// the whole keygen+radix submission is dropped, the order buffer stays zero
+// and every instance draws splat slot 0 - not a slow frame, a wrong one. For
+// g <= 65,535 the result is the exact single-dimension argument used before
+// (byte-identical dispatch for every streamed capacity, 8M x 1.15 = 35,938
+// groups); above it the same group count is laid out on two axes. The WGSL
+// is unchanged either way: three derives instanceIndex from
+// globalId.x + globalId.y * (256 * numWorkgroups.x) whenever a second axis
+// is present, and every kernel already returns for i >= capacity, which
+// absorbs the ceil(g / y) * y - g overshoot.
+function dispatch2d(groups: number): number[] {
+  const MAX_PER_DIM = 65535;
+  if (groups <= MAX_PER_DIM) return [groups];
+  const y = Math.ceil(groups / MAX_PER_DIM);
+  return [Math.ceil(groups / y), y];
+}
+
 export class WebGpuSplatBackend {
   // Assigned by SparkRenderer's ctor until the first real material exists.
   // MUST stay visible: an invisible material would stop three from ever
@@ -1007,7 +1028,7 @@ export class WebGpuSplatBackend {
       const q = uint(float(1.0).sub(clamp(norm, 0.0, 1.0)).mul(quantMax));
       keysNode.element(i).assign(q);
     })() as TslNode)
-      .compute([Math.ceil(Math.max(1, capacity) / 256)], [256])
+      .compute(dispatch2d(Math.ceil(Math.max(1, capacity) / 256)), [256])
       .setName("splatKeygen");
 
     // [proj] the projector cache, indexed by cut slot (the keygen's domain).
@@ -1453,7 +1474,7 @@ export class WebGpuSplatBackend {
           });
         }
       })() as TslNode)
-        .compute([Math.ceil(Math.max(1, capacity) / 256)], [256])
+        .compute(dispatch2d(Math.ceil(Math.max(1, capacity) / 256)), [256])
         .setName("splatProjector");
     }
 

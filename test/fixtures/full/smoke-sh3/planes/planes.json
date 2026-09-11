@@ -1,0 +1,55 @@
+{
+ "count": 20004,
+ "bands": 3,
+ "planes": {
+  "means_l": {
+   "width": 144,
+   "height": 140,
+   "bytes": 80640,
+   "zipEntry": "means_l.webp",
+   "zipSize": 60224
+  },
+  "means_u": {
+   "width": 144,
+   "height": 140,
+   "bytes": 80640,
+   "zipEntry": "means_u.webp",
+   "zipSize": 30194
+  },
+  "quats": {
+   "width": 144,
+   "height": 140,
+   "bytes": 80640,
+   "zipEntry": "quats.webp",
+   "zipSize": 65304
+  },
+  "scales": {
+   "width": 144,
+   "height": 140,
+   "bytes": 80640,
+   "zipEntry": "scales.webp",
+   "zipSize": 59452
+  },
+  "sh0": {
+   "width": 144,
+   "height": 140,
+   "bytes": 80640,
+   "zipEntry": "sh0.webp",
+   "zipSize": 59082
+  },
+  "shN_centroids": {
+   "width": 960,
+   "height": 256,
+   "bytes": 983040,
+   "zipEntry": "shN_centroids.webp",
+   "zipSize": 707656
+  },
+  "shN_labels": {
+   "width": 144,
+   "height": 140,
+   "bytes": 80640,
+   "zipEntry": "shN_labels.webp",
+   "zipSize": 35122
+  }
+ }
+}
