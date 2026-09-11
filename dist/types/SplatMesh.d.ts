@@ -124,9 +124,17 @@ export declare class SplatMesh extends SplatGenerator {
     editable: boolean;
     raycastable: boolean;
     minRaycastOpacity: number;
+    /**
+     * Raycast over a SUBSET of the splats: `indices` into the mesh's own array
+     * (static) or the LOD tree / pool (lodSplats / paged). [full-2] `packed`:
+     * an optional CONTIGUOUS pre-gathered copy of those splats (numSplats x 4
+     * words) - the per-ray gather over a strided index set is cache-hostile
+     * (~6 ms per 65,536-splat chunk at 20M), a memcpy from the copy is not.
+     */
     raycastIndices?: {
         numSplats: number;
         indices: Uint32Array;
+        packed?: Uint32Array;
     };
     rgbaDisplaceEdits: SplatEdits | null;
     splatRgba: RgbaArray | null;

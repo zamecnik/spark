@@ -12147,7 +12147,7 @@ const _SplatMesh = class _SplatMesh extends SplatGenerator {
   // intersections using this method to populate the provided intersects[] array
   // with each intersection point.
   raycast(raycaster, intersects) {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y;
     if (!_SplatMesh.isStaticInitialized || !this.raycastable || !this.packedSplats && !this.extSplats && !this.paged) {
       return;
     }
@@ -12164,15 +12164,24 @@ const _SplatMesh = class _SplatMesh extends SplatGenerator {
     const numSplats = ((_c = this.raycastIndices) == null ? void 0 : _c.numSplats) ?? (paged ? (_d = this.paged) == null ? void 0 : _d.numSplats : this.context.numSplats.value) ?? 0;
     const indices = ((_e = this.raycastIndices) == null ? void 0 : _e.indices) ?? (paged ? (_f = this.paged) == null ? void 0 : _f.dynoIndices.value.image.data : this.context.enableLod.value ? this.context.lodIndices.value.image.data : null) ?? null;
     if (!ext) {
-      const packed = paged ? (_h = (_g = this.paged) == null ? void 0 : _g.pager) == null ? void 0 : _h.packedTexture.value.image.data : indices ? (_j = (_i = this.packedSplats) == null ? void 0 : _i.lodSplats) == null ? void 0 : _j.packedArray : (_k = this.packedSplats) == null ? void 0 : _k.packedArray;
+      const packed = paged ? (_h = (_g = this.paged) == null ? void 0 : _g.pager) == null ? void 0 : _h.packedTexture.value.image.data : indices ? (
+        // [full-1] `raycastIndices` on a STATIC mesh (no LOD tree) index
+        // the mesh's own packedArray - the full-detail loader hands a
+        // uniform-stride subsample so a 20M-splat click stays responsive;
+        // before this fallback the raycast returned nothing at all there.
+        ((_j = (_i = this.packedSplats) == null ? void 0 : _i.lodSplats) == null ? void 0 : _j.packedArray) ?? ((_k = this.packedSplats) == null ? void 0 : _k.packedArray)
+      ) : (_l = this.packedSplats) == null ? void 0 : _l.packedArray;
       if (!packed) {
         return;
       }
-      const splatEncoding = paged ? (_l = this.paged) == null ? void 0 : _l.splatEncoding : (_m = this.packedSplats) == null ? void 0 : _m.splatEncoding;
+      const splatEncoding = paged ? (_m = this.paged) == null ? void 0 : _m.splatEncoding : (_n = this.packedSplats) == null ? void 0 : _n.splatEncoding;
+      const prePacked = (_o = this.raycastIndices) == null ? void 0 : _o.packed;
       for (let base = 0; base < numSplats; base += bufferSize) {
         const count = Math.min(bufferSize, numSplats - base);
         if (!indices) {
           buffer.set(packed.subarray(base * 4, (base + count) * 4));
+        } else if (prePacked) {
+          buffer.set(prePacked.subarray(base * 4, (base + count) * 4));
         } else {
           for (let i = 0; i < count; ++i) {
             const index = indices[base + i];
@@ -12206,8 +12215,8 @@ const _SplatMesh = class _SplatMesh extends SplatGenerator {
       }
     } else {
       const buffer2 = get_raycast_buffer2();
-      const ext1 = paged ? (_o = (_n = this.paged) == null ? void 0 : _n.pager) == null ? void 0 : _o.packedTexture.value.image.data : indices ? (_q = (_p = this.extSplats) == null ? void 0 : _p.lodSplats) == null ? void 0 : _q.extArrays[0] : (_r = this.extSplats) == null ? void 0 : _r.extArrays[0];
-      const ext2 = paged ? (_t = (_s = this.paged) == null ? void 0 : _s.pager) == null ? void 0 : _t.extTexture.value.image.data : indices ? (_v = (_u = this.extSplats) == null ? void 0 : _u.lodSplats) == null ? void 0 : _v.extArrays[1] : (_w = this.extSplats) == null ? void 0 : _w.extArrays[1];
+      const ext1 = paged ? (_q = (_p = this.paged) == null ? void 0 : _p.pager) == null ? void 0 : _q.packedTexture.value.image.data : indices ? (_s = (_r = this.extSplats) == null ? void 0 : _r.lodSplats) == null ? void 0 : _s.extArrays[0] : (_t = this.extSplats) == null ? void 0 : _t.extArrays[0];
+      const ext2 = paged ? (_v = (_u = this.paged) == null ? void 0 : _u.pager) == null ? void 0 : _v.extTexture.value.image.data : indices ? (_x = (_w = this.extSplats) == null ? void 0 : _w.lodSplats) == null ? void 0 : _x.extArrays[1] : (_y = this.extSplats) == null ? void 0 : _y.extArrays[1];
       if (!ext1 || !ext2) {
         return;
       }
