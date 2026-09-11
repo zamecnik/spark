@@ -2,6 +2,7 @@
 Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 const THREE = require("three");
 const browser = require("./browser-MOWB998F.cjs");
+const packedEncode = require("./packedEncode-ClYvQIUY.cjs");
 const Pass_js = require("three/addons/postprocessing/Pass.js");
 const kcRegrowDebug = require("./kcRegrowDebug-C_gpgxNu.cjs");
 var _documentCurrentScript = typeof document !== "undefined" ? document.currentScript : null;
@@ -82,70 +83,6 @@ function WorkerWrapper$1(options) {
     objURL && (self.URL || self.webkitURL).revokeObjectURL(objURL);
   }
 }
-const LN_SCALE_MIN = -12;
-const LN_SCALE_MAX = 9;
-const SCALE_MIN = Math.exp(LN_SCALE_MIN);
-const SCALE_MAX = Math.exp(LN_SCALE_MAX);
-const LN_SCALE_ZERO = -30;
-const SCALE_ZERO = Math.exp(LN_SCALE_ZERO);
-const SPLAT_TEX_WIDTH_BITS = 11;
-const SPLAT_TEX_HEIGHT_BITS = 11;
-const SPLAT_TEX_DEPTH_BITS = 11;
-const SPLAT_TEX_LAYER_BITS = SPLAT_TEX_WIDTH_BITS + SPLAT_TEX_HEIGHT_BITS;
-const SPLAT_TEX_WIDTH = 1 << SPLAT_TEX_WIDTH_BITS;
-const SPLAT_TEX_HEIGHT = 1 << SPLAT_TEX_HEIGHT_BITS;
-const SPLAT_TEX_DEPTH = 1 << SPLAT_TEX_DEPTH_BITS;
-const SPLAT_TEX_MIN_HEIGHT = 1;
-const SPLAT_TEX_WIDTH_MASK = SPLAT_TEX_WIDTH - 1;
-const SPLAT_TEX_HEIGHT_MASK = SPLAT_TEX_HEIGHT - 1;
-const SPLAT_TEX_DEPTH_MASK = SPLAT_TEX_DEPTH - 1;
-const WASM_SPLAT_SORT = true;
-const USE_COMPILED_PARSER_FUNCTION = true;
-var SplatFileType = /* @__PURE__ */ ((SplatFileType2) => {
-  SplatFileType2["PLY"] = "ply";
-  SplatFileType2["SPZ"] = "spz";
-  SplatFileType2["SPLAT"] = "splat";
-  SplatFileType2["KSPLAT"] = "ksplat";
-  SplatFileType2["PCSOGS"] = "pcsogs";
-  SplatFileType2["PCSOGSZIP"] = "pcsogszip";
-  SplatFileType2["RAD"] = "rad";
-  SplatFileType2["SSOG"] = "ssog";
-  return SplatFileType2;
-})(SplatFileType || {});
-const DEFAULT_SPLAT_ENCODING = {
-  rgbMin: 0,
-  rgbMax: 1,
-  lnScaleMin: LN_SCALE_MIN,
-  lnScaleMax: LN_SCALE_MAX,
-  sh1Max: 1,
-  sh2Max: 1,
-  sh3Max: 1,
-  lodOpacity: false
-};
-const defines = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.defineProperty({
-  __proto__: null,
-  DEFAULT_SPLAT_ENCODING,
-  LN_SCALE_MAX,
-  LN_SCALE_MIN,
-  LN_SCALE_ZERO,
-  SCALE_MAX,
-  SCALE_MIN,
-  SCALE_ZERO,
-  SPLAT_TEX_DEPTH,
-  SPLAT_TEX_DEPTH_BITS,
-  SPLAT_TEX_DEPTH_MASK,
-  SPLAT_TEX_HEIGHT,
-  SPLAT_TEX_HEIGHT_BITS,
-  SPLAT_TEX_HEIGHT_MASK,
-  SPLAT_TEX_LAYER_BITS,
-  SPLAT_TEX_MIN_HEIGHT,
-  SPLAT_TEX_WIDTH,
-  SPLAT_TEX_WIDTH_BITS,
-  SPLAT_TEX_WIDTH_MASK,
-  SplatFileType,
-  USE_COMPILED_PARSER_FUNCTION,
-  WASM_SPLAT_SORT
-}, Symbol.toStringTag, { value: "Module" }));
 function isBoolType(type) {
   return type === "bool" || type === "bvec2" || type === "bvec3" || type === "bvec4";
 }
@@ -877,278 +814,6 @@ class TrinaryOp extends Dyno {
     return new DynoOutput(this, this.outKey);
   }
 }
-const f32buffer$1 = new Float32Array(1);
-const u32buffer$1 = new Uint32Array(f32buffer$1.buffer);
-const supportsFloat16Array = "Float16Array" in globalThis;
-const f16buffer = supportsFloat16Array ? new globalThis["Float16Array"](1) : null;
-const u16buffer = new Uint16Array(f16buffer == null ? void 0 : f16buffer.buffer);
-const toHalf = supportsFloat16Array ? toHalfNative : toHalfJS;
-const fromHalf = supportsFloat16Array ? fromHalfNative : fromHalfJS;
-function toHalfNative(f) {
-  f16buffer[0] = f;
-  return u16buffer[0];
-}
-function toHalfJS(f) {
-  f32buffer$1[0] = f;
-  const bits = u32buffer$1[0];
-  const sign2 = bits >> 31 & 1;
-  const exp3 = bits >> 23 & 255;
-  const frac = bits & 8388607;
-  const halfSign = sign2 << 15;
-  if (exp3 === 255) {
-    if (frac !== 0) {
-      return halfSign | 32767;
-    }
-    return halfSign | 31744;
-  }
-  const newExp = exp3 - 127 + 15;
-  if (newExp >= 31) {
-    return halfSign | 31744;
-  }
-  if (newExp <= 0) {
-    if (newExp < -10) {
-      return halfSign;
-    }
-    const subFrac = (frac | 8388608) >> 1 - newExp + 13;
-    return halfSign | subFrac;
-  }
-  const halfFrac = frac >> 13;
-  return halfSign | newExp << 10 | halfFrac;
-}
-function fromHalfNative(u) {
-  u16buffer[0] = u;
-  return f16buffer[0];
-}
-function fromHalfJS(h) {
-  const sign2 = h >> 15 & 1;
-  const exp3 = h >> 10 & 31;
-  const frac = h & 1023;
-  let f32bits;
-  if (exp3 === 0) {
-    if (frac === 0) {
-      f32bits = sign2 << 31;
-    } else {
-      let mant = frac;
-      let e = -14;
-      while ((mant & 1024) === 0) {
-        mant <<= 1;
-        e--;
-      }
-      mant &= 1023;
-      const newExp = e + 127;
-      const newFrac = mant << 13;
-      f32bits = sign2 << 31 | newExp << 23 | newFrac;
-    }
-  } else if (exp3 === 31) {
-    if (frac === 0) {
-      f32bits = sign2 << 31 | 2139095040;
-    } else {
-      f32bits = sign2 << 31 | 2143289344;
-    }
-  } else {
-    const newExp = exp3 - 15 + 127;
-    const newFrac = frac << 13;
-    f32bits = sign2 << 31 | newExp << 23 | newFrac;
-  }
-  u32buffer$1[0] = f32bits;
-  return f32buffer$1[0];
-}
-function floatToUint8(v) {
-  return Math.max(0, Math.min(255, Math.round(v * 255)));
-}
-function encodeQuatOctXy88R8(q) {
-  let { x, y, z, w } = q;
-  const len = Math.sqrt(x * x + y * y + z * z + w * w);
-  if (len === 0) {
-    x = 0;
-    y = 0;
-    z = 0;
-    w = 1;
-  } else {
-    const inv = 1 / len;
-    x *= inv;
-    y *= inv;
-    z *= inv;
-    w *= inv;
-  }
-  if (w < 0) {
-    x = -x;
-    y = -y;
-    z = -z;
-    w = -w;
-  }
-  const theta = 2 * Math.acos(w);
-  const xyz_norm = Math.sqrt(x * x + y * y + z * z);
-  let axisX;
-  let axisY;
-  let axisZ;
-  if (xyz_norm < 1e-6) {
-    axisX = 1;
-    axisY = 0;
-    axisZ = 0;
-  } else {
-    axisX = x / xyz_norm;
-    axisY = y / xyz_norm;
-    axisZ = z / xyz_norm;
-  }
-  const sum = Math.abs(axisX) + Math.abs(axisY) + Math.abs(axisZ);
-  let p_x = axisX / sum;
-  let p_y = axisY / sum;
-  if (axisZ < 0) {
-    const tmp = p_x;
-    p_x = (1 - Math.abs(p_y)) * (p_x >= 0 ? 1 : -1);
-    p_y = (1 - Math.abs(tmp)) * (p_y >= 0 ? 1 : -1);
-  }
-  const u_f = p_x * 0.5 + 0.5;
-  const v_f = p_y * 0.5 + 0.5;
-  const quantU = Math.round(u_f * 255);
-  const quantV = Math.round(v_f * 255);
-  const angleInt = Math.round(theta * (255 / Math.PI));
-  return angleInt << 16 | quantV << 8 | quantU;
-}
-function setPackedSplatCenter(packedSplats, index, x, y, z) {
-  const uCenterX = toHalf(x);
-  const uCenterY = toHalf(y);
-  const uCenterZ = toHalf(z);
-  const i4 = index * 4;
-  packedSplats[i4 + 1] = uCenterX | uCenterY << 16;
-  packedSplats[i4 + 2] = uCenterZ | packedSplats[i4 + 2] & 4294901760;
-}
-function setPackedSplatScales(packedSplats, index, scaleX, scaleY, scaleZ, encoding) {
-  const lnScaleMin = (encoding == null ? void 0 : encoding.lnScaleMin) ?? LN_SCALE_MIN;
-  const lnScaleMax = (encoding == null ? void 0 : encoding.lnScaleMax) ?? LN_SCALE_MAX;
-  const lnScaleScale = 254 / (lnScaleMax - lnScaleMin);
-  const uScaleX = scaleX < SCALE_ZERO ? 0 : Math.min(
-    255,
-    Math.max(
-      1,
-      Math.round((Math.log(scaleX) - lnScaleMin) * lnScaleScale) + 1
-    )
-  );
-  const uScaleY = scaleY < SCALE_ZERO ? 0 : Math.min(
-    255,
-    Math.max(
-      1,
-      Math.round((Math.log(scaleY) - lnScaleMin) * lnScaleScale) + 1
-    )
-  );
-  const uScaleZ = scaleZ < SCALE_ZERO ? 0 : Math.min(
-    255,
-    Math.max(
-      1,
-      Math.round((Math.log(scaleZ) - lnScaleMin) * lnScaleScale) + 1
-    )
-  );
-  const i4 = index * 4;
-  packedSplats[i4 + 3] = uScaleX | uScaleY << 8 | uScaleZ << 16 | packedSplats[i4 + 3] & 4278190080;
-}
-function setPackedSplatQuat(packedSplats, index, quatX, quatY, quatZ, quatW) {
-  const uQuat = encodeQuatOctXy88R8({
-    x: quatX,
-    y: quatY,
-    z: quatZ,
-    w: quatW
-  });
-  const uQuatX = uQuat & 255;
-  const uQuatY = uQuat >>> 8 & 255;
-  const uQuatZ = uQuat >>> 16 & 255;
-  const i4 = index * 4;
-  packedSplats[i4 + 2] = packedSplats[i4 + 2] & 65535 | uQuatX << 16 | uQuatY << 24;
-  packedSplats[i4 + 3] = packedSplats[i4 + 3] & 16777215 | uQuatZ << 24;
-}
-function setPackedSplatRgba(packedSplats, index, r, g, b, a, encoding) {
-  const rgbMin = (encoding == null ? void 0 : encoding.rgbMin) ?? 0;
-  const rgbMax = (encoding == null ? void 0 : encoding.rgbMax) ?? 1;
-  const rgbRange = rgbMax - rgbMin;
-  const uR = floatToUint8((r - rgbMin) / rgbRange);
-  const uG = floatToUint8((g - rgbMin) / rgbRange);
-  const uB = floatToUint8((b - rgbMin) / rgbRange);
-  const uA = floatToUint8((encoding == null ? void 0 : encoding.lodOpacity) ? 0.5 * a : a);
-  const i4 = index * 4;
-  packedSplats[i4] = uR | uG << 8 | uB << 16 | uA << 24;
-}
-function computeMaxSplats(numSplats) {
-  const width = SPLAT_TEX_WIDTH;
-  const height = Math.max(
-    SPLAT_TEX_MIN_HEIGHT,
-    Math.min(SPLAT_TEX_HEIGHT, Math.ceil(numSplats / width))
-  );
-  const depth = Math.ceil(numSplats / (width * height));
-  return width * height * depth;
-}
-function packSint8Bytes(b0, b1, b2, b3) {
-  const clampedB0 = Math.round(Math.max(-127, Math.min(127, b0 * 127)));
-  const clampedB1 = Math.round(Math.max(-127, Math.min(127, b1 * 127)));
-  const clampedB2 = Math.round(Math.max(-127, Math.min(127, b2 * 127)));
-  const clampedB3 = Math.round(Math.max(-127, Math.min(127, b3 * 127)));
-  return clampedB0 & 255 | (clampedB1 & 255) << 8 | (clampedB2 & 255) << 16 | (clampedB3 & 255) << 24;
-}
-function encodeSh1Rgb(sh1Array, index, sh1Rgb, encoding) {
-  const sh1Max = (encoding == null ? void 0 : encoding.sh1Max) ?? 1;
-  const sh1Scale = 63 / sh1Max;
-  const base = index * 2;
-  for (let i = 0; i < 9; ++i) {
-    const s = sh1Rgb[i] * sh1Scale;
-    const value = Math.round(Math.max(-63, Math.min(63, s))) & 127;
-    const bitStart = i * 7;
-    const bitEnd = bitStart + 7;
-    const wordStart = Math.floor(bitStart / 32);
-    const bitOffset = bitStart - wordStart * 32;
-    const firstWord = value << bitOffset & 4294967295;
-    sh1Array[base + wordStart] |= firstWord;
-    if (bitEnd > wordStart * 32 + 32) {
-      const secondWord = value >>> 32 - bitOffset & 4294967295;
-      sh1Array[base + wordStart + 1] |= secondWord;
-    }
-  }
-}
-function encodeSh2Rgb(sh2Array, index, sh2Rgb, encoding) {
-  const sh2Max = (encoding == null ? void 0 : encoding.sh2Max) ?? 1;
-  const sh2Scale = 1 / sh2Max;
-  sh2Array[index * 4 + 0] = packSint8Bytes(
-    sh2Rgb[0] * sh2Scale,
-    sh2Rgb[1] * sh2Scale,
-    sh2Rgb[2] * sh2Scale,
-    sh2Rgb[3] * sh2Scale
-  );
-  sh2Array[index * 4 + 1] = packSint8Bytes(
-    sh2Rgb[4] * sh2Scale,
-    sh2Rgb[5] * sh2Scale,
-    sh2Rgb[6] * sh2Scale,
-    sh2Rgb[7] * sh2Scale
-  );
-  sh2Array[index * 4 + 2] = packSint8Bytes(
-    sh2Rgb[8] * sh2Scale,
-    sh2Rgb[9] * sh2Scale,
-    sh2Rgb[10] * sh2Scale,
-    sh2Rgb[11] * sh2Scale
-  );
-  sh2Array[index * 4 + 3] = packSint8Bytes(
-    sh2Rgb[12] * sh2Scale,
-    sh2Rgb[13] * sh2Scale,
-    sh2Rgb[14] * sh2Scale,
-    0
-  );
-}
-function encodeSh3Rgb(sh3Array, index, sh3Rgb, encoding) {
-  const sh3Max = (encoding == null ? void 0 : encoding.sh3Max) ?? 1;
-  const sh3Scale = 31 / sh3Max;
-  const base = index * 4;
-  for (let i = 0; i < 21; ++i) {
-    const s = sh3Rgb[i] * sh3Scale;
-    const value = Math.round(Math.max(-31, Math.min(31, s))) & 63;
-    const bitStart = i * 6;
-    const bitEnd = bitStart + 6;
-    const wordStart = Math.floor(bitStart / 32);
-    const bitOffset = bitStart - wordStart * 32;
-    const firstWord = value << bitOffset & 4294967295;
-    sh3Array[base + wordStart] |= firstWord;
-    if (bitEnd > wordStart * 32 + 32) {
-      const secondWord = value >>> 32 - bitOffset & 4294967295;
-      sh3Array[base + wordStart + 1] |= secondWord;
-    }
-  }
-}
 const threeRevision = Number.parseInt(THREE__namespace.REVISION);
 const threeMrtArray = threeRevision >= 179;
 const f32buffer = new Float32Array(1);
@@ -1310,10 +975,10 @@ function encodeExtSplat(extArrays, index, x, y, z, scaleX, scaleY, scaleZ, quatX
   extA[i4] = floatBitsToUint$1(x);
   extA[i4 + 1] = floatBitsToUint$1(y);
   extA[i4 + 2] = floatBitsToUint$1(z);
-  extA[i4 + 3] = toHalf(opacity);
-  extB[i4] = toHalf(r) | toHalf(g) << 16;
-  extB[i4 + 1] = toHalf(b) | toHalf(Math.log(scaleX)) << 16;
-  extB[i4 + 2] = toHalf(Math.log(scaleY)) | toHalf(Math.log(scaleZ)) << 16;
+  extA[i4 + 3] = packedEncode.toHalf(opacity);
+  extB[i4] = packedEncode.toHalf(r) | packedEncode.toHalf(g) << 16;
+  extB[i4 + 1] = packedEncode.toHalf(b) | packedEncode.toHalf(Math.log(scaleX)) << 16;
+  extB[i4 + 2] = packedEncode.toHalf(Math.log(scaleY)) | packedEncode.toHalf(Math.log(scaleZ)) << 16;
   extB[i4 + 3] = encodeQuatOctXy1010R12(quatX, quatY, quatZ, quatW);
 }
 function decodeExtSplat(extArrays, index) {
@@ -1323,13 +988,13 @@ function decodeExtSplat(extArrays, index) {
   result.center.x = uintBitsToFloat$1(extA[i4]);
   result.center.y = uintBitsToFloat$1(extA[i4 + 1]);
   result.center.z = uintBitsToFloat$1(extA[i4 + 2]);
-  result.opacity = fromHalf(extA[i4 + 3] & 65535);
-  result.color.r = fromHalf(extB[i4] & 65535);
-  result.color.g = fromHalf(extB[i4] >>> 16);
-  result.color.b = fromHalf(extB[i4 + 1] & 65535);
-  result.scales.x = Math.exp(fromHalf(extB[i4 + 1] >>> 16));
-  result.scales.y = Math.exp(fromHalf(extB[i4 + 2] & 65535));
-  result.scales.z = Math.exp(fromHalf(extB[i4 + 2] >>> 16));
+  result.opacity = packedEncode.fromHalf(extA[i4 + 3] & 65535);
+  result.color.r = packedEncode.fromHalf(extB[i4] & 65535);
+  result.color.g = packedEncode.fromHalf(extB[i4] >>> 16);
+  result.color.b = packedEncode.fromHalf(extB[i4 + 1] & 65535);
+  result.scales.x = Math.exp(packedEncode.fromHalf(extB[i4 + 1] >>> 16));
+  result.scales.y = Math.exp(packedEncode.fromHalf(extB[i4 + 2] & 65535));
+  result.scales.z = Math.exp(packedEncode.fromHalf(extB[i4 + 2] >>> 16));
   decodeQuatOctXy1010R12(extB[i4 + 3], result.quaternion);
   return result;
 }
@@ -1337,43 +1002,43 @@ function setPackedSplat(packedSplats, index, x, y, z, scaleX, scaleY, scaleZ, qu
   const rgbMin = (encoding == null ? void 0 : encoding.rgbMin) ?? 0;
   const rgbMax = (encoding == null ? void 0 : encoding.rgbMax) ?? 1;
   const rgbRange = rgbMax - rgbMin;
-  const uR = floatToUint8((r - rgbMin) / rgbRange);
-  const uG = floatToUint8((g - rgbMin) / rgbRange);
-  const uB = floatToUint8((b - rgbMin) / rgbRange);
-  const uA = floatToUint8((encoding == null ? void 0 : encoding.lodOpacity) ? 0.5 * opacity : opacity);
-  const uQuat = encodeQuatOctXy88R8(
+  const uR = packedEncode.floatToUint8((r - rgbMin) / rgbRange);
+  const uG = packedEncode.floatToUint8((g - rgbMin) / rgbRange);
+  const uB = packedEncode.floatToUint8((b - rgbMin) / rgbRange);
+  const uA = packedEncode.floatToUint8((encoding == null ? void 0 : encoding.lodOpacity) ? 0.5 * opacity : opacity);
+  const uQuat = packedEncode.encodeQuatOctXy88R8(
     tempQuaternion.set(quatX, quatY, quatZ, quatW)
   );
   const uQuatX = uQuat & 255;
   const uQuatY = uQuat >>> 8 & 255;
   const uQuatZ = uQuat >>> 16 & 255;
-  const lnScaleMin = (encoding == null ? void 0 : encoding.lnScaleMin) ?? LN_SCALE_MIN;
-  const lnScaleMax = (encoding == null ? void 0 : encoding.lnScaleMax) ?? LN_SCALE_MAX;
+  const lnScaleMin = (encoding == null ? void 0 : encoding.lnScaleMin) ?? packedEncode.LN_SCALE_MIN;
+  const lnScaleMax = (encoding == null ? void 0 : encoding.lnScaleMax) ?? packedEncode.LN_SCALE_MAX;
   const lnScaleScale = 254 / (lnScaleMax - lnScaleMin);
-  const uScaleX = scaleX < SCALE_ZERO ? 0 : Math.min(
+  const uScaleX = scaleX < packedEncode.SCALE_ZERO ? 0 : Math.min(
     255,
     Math.max(
       1,
       Math.round((Math.log(scaleX) - lnScaleMin) * lnScaleScale) + 1
     )
   );
-  const uScaleY = scaleY < SCALE_ZERO ? 0 : Math.min(
+  const uScaleY = scaleY < packedEncode.SCALE_ZERO ? 0 : Math.min(
     255,
     Math.max(
       1,
       Math.round((Math.log(scaleY) - lnScaleMin) * lnScaleScale) + 1
     )
   );
-  const uScaleZ = scaleZ < SCALE_ZERO ? 0 : Math.min(
+  const uScaleZ = scaleZ < packedEncode.SCALE_ZERO ? 0 : Math.min(
     255,
     Math.max(
       1,
       Math.round((Math.log(scaleZ) - lnScaleMin) * lnScaleScale) + 1
     )
   );
-  const uCenterX = toHalf(x);
-  const uCenterY = toHalf(y);
-  const uCenterZ = toHalf(z);
+  const uCenterX = packedEncode.toHalf(x);
+  const uCenterY = packedEncode.toHalf(y);
+  const uCenterZ = packedEncode.toHalf(z);
   const i4 = index * 4;
   packedSplats[i4] = uR | uG << 8 | uB << 16 | uA << 24;
   packedSplats[i4 + 1] = uCenterX | uCenterY << 16;
@@ -1385,14 +1050,14 @@ function setPackedSplatRgb(packedSplats, index, r, g, b, encoding) {
   const rgbMin = (encoding == null ? void 0 : encoding.rgbMin) ?? 0;
   const rgbMax = (encoding == null ? void 0 : encoding.rgbMax) ?? 1;
   const rgbRange = rgbMax - rgbMin;
-  const uR = floatToUint8((r - rgbMin) / rgbRange);
-  const uG = floatToUint8((g - rgbMin) / rgbRange);
-  const uB = floatToUint8((b - rgbMin) / rgbRange);
+  const uR = packedEncode.floatToUint8((r - rgbMin) / rgbRange);
+  const uG = packedEncode.floatToUint8((g - rgbMin) / rgbRange);
+  const uB = packedEncode.floatToUint8((b - rgbMin) / rgbRange);
   const i4 = index * 4;
   packedSplats[i4] = uR | uG << 8 | uB << 16 | packedSplats[i4] & 4278190080;
 }
 function setPackedSplatOpacity(packedSplats, index, opacity) {
-  const uA = floatToUint8(opacity);
+  const uA = packedEncode.floatToUint8(opacity);
   const i4 = index * 4;
   packedSplats[i4] = packedSplats[i4] & 16777215 | uA << 24;
 }
@@ -1427,12 +1092,12 @@ function unpackSplat(packedSplats, index, encoding) {
     result.opacity = 2 * result.opacity;
   }
   result.center.set(
-    fromHalf(word1 & 65535),
-    fromHalf(word1 >>> 16 & 65535),
-    fromHalf(word2 & 65535)
+    packedEncode.fromHalf(word1 & 65535),
+    packedEncode.fromHalf(word1 >>> 16 & 65535),
+    packedEncode.fromHalf(word2 & 65535)
   );
-  const lnScaleMin = (encoding == null ? void 0 : encoding.lnScaleMin) ?? LN_SCALE_MIN;
-  const lnScaleMax = (encoding == null ? void 0 : encoding.lnScaleMax) ?? LN_SCALE_MAX;
+  const lnScaleMin = (encoding == null ? void 0 : encoding.lnScaleMin) ?? packedEncode.LN_SCALE_MIN;
+  const lnScaleMax = (encoding == null ? void 0 : encoding.lnScaleMax) ?? packedEncode.LN_SCALE_MAX;
   const lnScaleScale = (lnScaleMax - lnScaleMin) / 254;
   const uScalesX = word3 & 255;
   result.scales.x = uScalesX === 0 ? 0 : Math.exp(lnScaleMin + (uScalesX - 1) * lnScaleScale);
@@ -1445,10 +1110,10 @@ function unpackSplat(packedSplats, index, encoding) {
   return result;
 }
 function getTextureSize(numSplats) {
-  const width = SPLAT_TEX_WIDTH;
+  const width = packedEncode.SPLAT_TEX_WIDTH;
   const height = Math.max(
-    SPLAT_TEX_MIN_HEIGHT,
-    Math.min(SPLAT_TEX_HEIGHT, Math.ceil(numSplats / width))
+    packedEncode.SPLAT_TEX_MIN_HEIGHT,
+    Math.min(packedEncode.SPLAT_TEX_HEIGHT, Math.ceil(numSplats / width))
   );
   const depth = Math.ceil(numSplats / (width * height));
   const maxSplats = width * height * depth;
@@ -1888,7 +1553,7 @@ const utils = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.definePropert
   averageQuaternions,
   cloneClock,
   coinciDist,
-  computeMaxSplats,
+  computeMaxSplats: packedEncode.computeMaxSplats,
   coorientDist,
   decodeExtRgb,
   decodeExtSplat,
@@ -1904,17 +1569,17 @@ const utils = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.definePropert
   encodeExtSplat,
   encodeQuatEulerXyz888,
   encodeQuatOctXy1010R12,
-  encodeQuatOctXy88R8,
+  encodeQuatOctXy88R8: packedEncode.encodeQuatOctXy88R8,
   encodeQuatXyz888,
-  encodeSh1Rgb,
-  encodeSh2Rgb,
-  encodeSh3Rgb,
+  encodeSh1Rgb: packedEncode.encodeSh1Rgb,
+  encodeSh2Rgb: packedEncode.encodeSh2Rgb,
+  encodeSh3Rgb: packedEncode.encodeSh3Rgb,
   epsilonSign,
   flipPixels,
   floatBitsToUint: floatBitsToUint$1,
   floatToSint8,
-  floatToUint8,
-  fromHalf,
+  floatToUint8: packedEncode.floatToUint8,
+  fromHalf: packedEncode.fromHalf,
   getTextureSize,
   getTransferable,
   isAndroid,
@@ -1930,15 +1595,15 @@ const utils = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.definePropert
   omitUndefined,
   pixelsToPngUrl,
   setPackedSplat,
-  setPackedSplatCenter,
+  setPackedSplatCenter: packedEncode.setPackedSplatCenter,
   setPackedSplatOpacity,
-  setPackedSplatQuat,
+  setPackedSplatQuat: packedEncode.setPackedSplatQuat,
   setPackedSplatRgb,
-  setPackedSplatRgba,
-  setPackedSplatScales,
+  setPackedSplatRgba: packedEncode.setPackedSplatRgba,
+  setPackedSplatScales: packedEncode.setPackedSplatScales,
   threeMrtArray,
   threeRevision,
-  toHalf,
+  toHalf: packedEncode.toHalf,
   uintBitsToFloat: uintBitsToFloat$1,
   unpackSplat,
   withinCoinciDist,
@@ -6525,7 +6190,7 @@ const _ExtSplats = class _ExtSplats {
         Math.min(this.extArrays[0].length / 4, this.extArrays[1].length / 4)
       );
       this.numSplats = options.numSplats ?? this.maxSplats;
-      this.maxSplats = Math.floor(this.maxSplats / SPLAT_TEX_WIDTH) * SPLAT_TEX_WIDTH;
+      this.maxSplats = Math.floor(this.maxSplats / packedEncode.SPLAT_TEX_WIDTH) * packedEncode.SPLAT_TEX_WIDTH;
       this.numSplats = Math.min(
         this.maxSplats,
         options.numSplats ?? Number.POSITIVE_INFINITY
@@ -7528,7 +7193,7 @@ const _Readback = class _Readback {
   // Ensure we have a buffer large enough for the readback of count indices.
   // Pass in previous bufer of the desired type.
   static ensureBuffer(count, buffer) {
-    const roundedCount = Math.ceil(Math.max(1, count) / SPLAT_TEX_WIDTH) * SPLAT_TEX_WIDTH;
+    const roundedCount = Math.ceil(Math.max(1, count) / packedEncode.SPLAT_TEX_WIDTH) * packedEncode.SPLAT_TEX_WIDTH;
     const bytes = roundedCount * 4;
     if (buffer.byteLength >= bytes) {
       return buffer;
@@ -7621,7 +7286,7 @@ const _Readback = class _Readback {
     if (!this.target) {
       throw new Error("No target");
     }
-    const layerSize = SPLAT_TEX_WIDTH * SPLAT_TEX_HEIGHT;
+    const layerSize = packedEncode.SPLAT_TEX_WIDTH * packedEncode.SPLAT_TEX_HEIGHT;
     material.uniforms.targetBase.value = 0;
     material.uniforms.targetCount.value = count;
     let baseIndex = 0;
@@ -7629,16 +7294,16 @@ const _Readback = class _Readback {
       const layer = Math.floor(baseIndex / layerSize);
       const layerBase = layer * layerSize;
       const layerYEnd = Math.min(
-        SPLAT_TEX_HEIGHT,
-        Math.ceil((count - layerBase) / SPLAT_TEX_WIDTH)
+        packedEncode.SPLAT_TEX_HEIGHT,
+        Math.ceil((count - layerBase) / packedEncode.SPLAT_TEX_WIDTH)
       );
       material.uniforms.targetLayer.value = layer;
-      this.target.scissor.set(0, 0, SPLAT_TEX_WIDTH, layerYEnd);
+      this.target.scissor.set(0, 0, packedEncode.SPLAT_TEX_WIDTH, layerYEnd);
       renderer.setRenderTarget(this.target, layer);
       renderer.xr.enabled = false;
       renderer.autoClear = false;
       _Readback.fullScreenQuad.render(renderer);
-      baseIndex += SPLAT_TEX_WIDTH * layerYEnd;
+      baseIndex += packedEncode.SPLAT_TEX_WIDTH * layerYEnd;
     }
     this.count = count;
   }
@@ -7652,7 +7317,7 @@ const _Readback = class _Readback {
     if (!this.target) {
       throw new Error("No target");
     }
-    const roundedCount = Math.ceil(this.count / SPLAT_TEX_WIDTH) * SPLAT_TEX_WIDTH;
+    const roundedCount = Math.ceil(this.count / packedEncode.SPLAT_TEX_WIDTH) * packedEncode.SPLAT_TEX_WIDTH;
     if (readback.byteLength < roundedCount * 4) {
       throw new Error(
         `Readback buffer too small: ${readback.byteLength} < ${roundedCount * 4}`
@@ -7661,18 +7326,18 @@ const _Readback = class _Readback {
     const readbackUint8 = new Uint8Array(
       readback instanceof ArrayBuffer ? readback : readback.buffer
     );
-    const layerSize = SPLAT_TEX_WIDTH * SPLAT_TEX_HEIGHT;
+    const layerSize = packedEncode.SPLAT_TEX_WIDTH * packedEncode.SPLAT_TEX_HEIGHT;
     let baseIndex = 0;
     const promises = [];
     while (baseIndex < this.count) {
       const layer = Math.floor(baseIndex / layerSize);
       const layerBase = layer * layerSize;
       const layerYEnd = Math.min(
-        SPLAT_TEX_HEIGHT,
-        Math.ceil((this.count - layerBase) / SPLAT_TEX_WIDTH)
+        packedEncode.SPLAT_TEX_HEIGHT,
+        Math.ceil((this.count - layerBase) / packedEncode.SPLAT_TEX_WIDTH)
       );
       renderer.setRenderTarget(this.target, layer);
-      const readbackSize = SPLAT_TEX_WIDTH * layerYEnd * 4;
+      const readbackSize = packedEncode.SPLAT_TEX_WIDTH * layerYEnd * 4;
       const subReadback = readbackUint8.subarray(
         layerBase * 4,
         layerBase * 4 + readbackSize
@@ -7681,12 +7346,12 @@ const _Readback = class _Readback {
         this.target,
         0,
         0,
-        SPLAT_TEX_WIDTH,
+        packedEncode.SPLAT_TEX_WIDTH,
         layerYEnd,
         subReadback
       );
       promises.push(promise);
-      baseIndex += SPLAT_TEX_WIDTH * layerYEnd;
+      baseIndex += packedEncode.SPLAT_TEX_WIDTH * layerYEnd;
     }
     return Promise.all(promises).then(() => readback);
   }
@@ -7778,7 +7443,7 @@ const _RgbaArray = class _RgbaArray {
     if (options.array) {
       this.array = options.array;
       const splatCount = Math.floor(this.array.length / 4);
-      this.capacity = Math.ceil(splatCount / SPLAT_TEX_WIDTH) * SPLAT_TEX_WIDTH;
+      this.capacity = Math.ceil(splatCount / packedEncode.SPLAT_TEX_WIDTH) * packedEncode.SPLAT_TEX_WIDTH;
       if (this.capacity > splatCount) {
         this.array = new Uint8Array(this.capacity * 4);
         this.array.set(options.array);
@@ -8819,7 +8484,7 @@ const _SplatAccumulator = class _SplatAccumulator {
     let maxSplats = 0;
     const mapping = splatCounts.map((numSplats) => {
       const base = maxSplats;
-      const rounded = Math.ceil(numSplats / SPLAT_TEX_WIDTH) * SPLAT_TEX_WIDTH;
+      const rounded = Math.ceil(numSplats / packedEncode.SPLAT_TEX_WIDTH) * packedEncode.SPLAT_TEX_WIDTH;
       maxSplats += rounded;
       return { base, count: numSplats };
     });
@@ -8930,7 +8595,7 @@ const _SplatAccumulator = class _SplatAccumulator {
                 });
                 const output = outputPackedSplat(
                   gsplat,
-                  dynoConst("vec4", [0, 1, LN_SCALE_MIN, LN_SCALE_MAX])
+                  dynoConst("vec4", [0, 1, packedEncode.LN_SCALE_MIN, packedEncode.LN_SCALE_MAX])
                 );
                 roots.push(output);
               } else {
@@ -8960,7 +8625,7 @@ const _SplatAccumulator = class _SplatAccumulator {
               });
               const output = outputCovSplat(
                 covsplat,
-                dynoConst("vec4", [0, 1, LN_SCALE_MIN, LN_SCALE_MAX])
+                dynoConst("vec4", [0, 1, packedEncode.LN_SCALE_MIN, packedEncode.LN_SCALE_MAX])
               );
               roots.push(output);
             }
@@ -9026,30 +8691,30 @@ const _SplatAccumulator = class _SplatAccumulator {
     );
     program.update();
     const renderState = this.saveRenderState(renderer);
-    const nextBase = Math.ceil((base + count) / SPLAT_TEX_WIDTH) * SPLAT_TEX_WIDTH;
-    const layerSize = SPLAT_TEX_WIDTH * SPLAT_TEX_HEIGHT;
+    const nextBase = Math.ceil((base + count) / packedEncode.SPLAT_TEX_WIDTH) * packedEncode.SPLAT_TEX_WIDTH;
+    const layerSize = packedEncode.SPLAT_TEX_WIDTH * packedEncode.SPLAT_TEX_HEIGHT;
     material.uniforms.targetBase.value = base;
     material.uniforms.targetCount.value = count;
     while (base < nextBase) {
       const layer = Math.floor(base / layerSize);
       material.uniforms.targetLayer.value = layer;
       const layerBase = layer * layerSize;
-      const layerYStart = Math.floor((base - layerBase) / SPLAT_TEX_WIDTH);
+      const layerYStart = Math.floor((base - layerBase) / packedEncode.SPLAT_TEX_WIDTH);
       const layerYEnd = Math.min(
-        SPLAT_TEX_HEIGHT,
-        Math.ceil((nextBase - layerBase) / SPLAT_TEX_WIDTH)
+        packedEncode.SPLAT_TEX_HEIGHT,
+        Math.ceil((nextBase - layerBase) / packedEncode.SPLAT_TEX_WIDTH)
       );
       this.target.scissor.set(
         0,
         layerYStart,
-        SPLAT_TEX_WIDTH,
+        packedEncode.SPLAT_TEX_WIDTH,
         layerYEnd - layerYStart
       );
       renderer.setRenderTarget(this.target, layer);
       renderer.xr.enabled = false;
       renderer.autoClear = false;
       _SplatAccumulator.fullScreenQuad.render(renderer);
-      base += SPLAT_TEX_WIDTH * (layerYEnd - layerYStart);
+      base += packedEncode.SPLAT_TEX_WIDTH * (layerYEnd - layerYStart);
     }
     this.resetRenderState(renderer, renderState);
     return { nextBase };
@@ -10365,7 +10030,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     if (!current.target) {
       throw new Error("No target");
     }
-    const roundedCount = Math.ceil(numSplats / SPLAT_TEX_WIDTH) * SPLAT_TEX_WIDTH;
+    const roundedCount = Math.ceil(numSplats / packedEncode.SPLAT_TEX_WIDTH) * packedEncode.SPLAT_TEX_WIDTH;
     if (readback.byteLength < roundedCount * 4) {
       throw new Error(
         `Readback buffer too small: ${readback.byteLength} < ${roundedCount * 4}`
@@ -10373,17 +10038,17 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
     }
     const readbackUint8 = new Uint8Array(readback.buffer);
     const renderState = this.saveRenderState(renderer);
-    const layerSize = SPLAT_TEX_WIDTH * SPLAT_TEX_HEIGHT;
+    const layerSize = packedEncode.SPLAT_TEX_WIDTH * packedEncode.SPLAT_TEX_HEIGHT;
     let baseIndex = 0;
     const promises = [];
     while (baseIndex < numSplats) {
       const layer = Math.floor(baseIndex / layerSize);
       const layerBase = layer * layerSize;
       const layerYEnd = Math.min(
-        SPLAT_TEX_HEIGHT,
-        Math.ceil((numSplats - layerBase) / SPLAT_TEX_WIDTH)
+        packedEncode.SPLAT_TEX_HEIGHT,
+        Math.ceil((numSplats - layerBase) / packedEncode.SPLAT_TEX_WIDTH)
       );
-      const readbackSize = SPLAT_TEX_WIDTH * layerYEnd * 4;
+      const readbackSize = packedEncode.SPLAT_TEX_WIDTH * layerYEnd * 4;
       const subReadback = readbackUint8.subarray(
         layerBase * 4,
         layerBase * 4 + readbackSize
@@ -10393,7 +10058,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
         current.target,
         0,
         0,
-        SPLAT_TEX_WIDTH,
+        packedEncode.SPLAT_TEX_WIDTH,
         layerYEnd,
         subReadback,
         void 0,
@@ -10404,7 +10069,7 @@ const _SparkRenderer = class _SparkRenderer extends THREE__namespace.Mesh {
         const gl = renderer.getContext();
         gl.flush();
       }
-      baseIndex += SPLAT_TEX_WIDTH * layerYEnd;
+      baseIndex += packedEncode.SPLAT_TEX_WIDTH * layerYEnd;
     }
     this.resetRenderState(renderer, renderState);
     return Promise.all(promises).then(() => readback);
@@ -10717,7 +10382,7 @@ class PagedSplats {
       value: SplatPager.emptyIndicesTexture
     });
     this.rgbMinMaxLnScaleMinMax = new DynoVec4({
-      value: new THREE__namespace.Vector4(0, 1, LN_SCALE_MIN, LN_SCALE_MAX)
+      value: new THREE__namespace.Vector4(0, 1, packedEncode.LN_SCALE_MIN, packedEncode.LN_SCALE_MAX)
     });
     this.lodOpacity = new DynoBool({
       value: false
@@ -10735,7 +10400,7 @@ class PagedSplats {
     if (!this.fileType) {
       throw new Error("Unable to determine file type");
     }
-    if (this.fileType === SplatFileType.RAD) {
+    if (this.fileType === packedEncode.SplatFileType.RAD) {
       this.radMetaPromise = this.getRadMeta();
     }
   }
@@ -10792,7 +10457,7 @@ class PagedSplats {
   }
   async fetchDecodeChunk(chunk) {
     let decodeBytes = void 0;
-    if (this.fileType === SplatFileType.RAD) {
+    if (this.fileType === packedEncode.SplatFileType.RAD) {
       const { meta, chunksStart } = await this.getRadMeta();
       if (chunk < 0 || chunk >= meta.chunks.length) {
         throw new Error(
@@ -10872,8 +10537,8 @@ class PagedSplats {
           this.rgbMinMaxLnScaleMinMax.value.set(
             this.splatEncoding.rgbMin ?? 0,
             this.splatEncoding.rgbMax ?? 1,
-            this.splatEncoding.lnScaleMin ?? LN_SCALE_MIN,
-            this.splatEncoding.lnScaleMax ?? LN_SCALE_MAX
+            this.splatEncoding.lnScaleMin ?? packedEncode.LN_SCALE_MIN,
+            this.splatEncoding.lnScaleMax ?? packedEncode.LN_SCALE_MAX
           );
           this.lodOpacity.value = this.splatEncoding.lodOpacity ?? false;
           this.shMax.value.set(
@@ -10897,7 +10562,7 @@ class PagedSplats {
       });
       const lodSplats = result.lodSplats;
       if (!this.splatEncoding) {
-        this.splatEncoding = DEFAULT_SPLAT_ENCODING;
+        this.splatEncoding = packedEncode.DEFAULT_SPLAT_ENCODING;
         this.numSh = lodSplats.extra.sh3a && lodSplats.extra.sh3b ? 3 : lodSplats.extra.sh2 ? 2 : lodSplats.extra.sh1 ? 1 : 0;
       }
       this.sh1Codes = lodSplats.extra.sh1Codes ?? this.sh1Codes;
@@ -11994,7 +11659,7 @@ const _SplatMesh = class _SplatMesh extends SplatGenerator {
     } else if (options.packedSplats) {
       this.packedSplats = options.packedSplats;
       this.packedSplats.splatEncoding = options.splatEncoding ?? {
-        ...DEFAULT_SPLAT_ENCODING
+        ...packedEncode.DEFAULT_SPLAT_ENCODING
       };
       this.splats = this.packedSplats;
     } else {
@@ -12548,8 +12213,8 @@ const _SplatMesh = class _SplatMesh extends SplatGenerator {
           near,
           far,
           count,
-          (splatEncoding == null ? void 0 : splatEncoding.lnScaleMin) ?? LN_SCALE_MIN,
-          (splatEncoding == null ? void 0 : splatEncoding.lnScaleMax) ?? LN_SCALE_MAX,
+          (splatEncoding == null ? void 0 : splatEncoding.lnScaleMin) ?? packedEncode.LN_SCALE_MIN,
+          (splatEncoding == null ? void 0 : splatEncoding.lnScaleMax) ?? packedEncode.LN_SCALE_MAX,
           (splatEncoding == null ? void 0 : splatEncoding.lodOpacity) ?? false
         );
         intersections = this.appendRaycastBuffer(
@@ -13653,24 +13318,24 @@ function getSplatFileType(fileBytes) {
   const view = new DataView(fileBytes.buffer);
   const magic = view.getUint32(0, true);
   if ((magic & 16777215) === 7957616) {
-    return SplatFileType.PLY;
+    return packedEncode.SplatFileType.PLY;
   }
   if ((magic & 16777215) === 559903) {
     const header = decompressPartialGzip(fileBytes, 4);
     const gView = new DataView(header.buffer);
     if (gView.getUint32(0, true) === 1347635022) {
-      return SplatFileType.SPZ;
+      return packedEncode.SplatFileType.SPZ;
     }
     return void 0;
   }
   if (magic === 67324752) {
     if (tryPcSogsZip(fileBytes)) {
-      return SplatFileType.PCSOGSZIP;
+      return packedEncode.SplatFileType.PCSOGSZIP;
     }
     return void 0;
   }
   if (magic === 809779538) {
-    return SplatFileType.RAD;
+    return packedEncode.SplatFileType.RAD;
   }
   return void 0;
 }
@@ -13690,22 +13355,22 @@ function getFileExtension(pathOrUrl) {
 function getSplatFileTypeFromPath(pathOrUrl) {
   const extension = getFileExtension(pathOrUrl);
   if (extension === "ply") {
-    return SplatFileType.PLY;
+    return packedEncode.SplatFileType.PLY;
   }
   if (extension === "spz") {
-    return SplatFileType.SPZ;
+    return packedEncode.SplatFileType.SPZ;
   }
   if (extension === "splat") {
-    return SplatFileType.SPLAT;
+    return packedEncode.SplatFileType.SPLAT;
   }
   if (extension === "ksplat") {
-    return SplatFileType.KSPLAT;
+    return packedEncode.SplatFileType.KSPLAT;
   }
   if (extension === "sog") {
-    return SplatFileType.PCSOGSZIP;
+    return packedEncode.SplatFileType.PCSOGSZIP;
   }
   if (extension === "rad") {
-    return SplatFileType.RAD;
+    return packedEncode.SplatFileType.RAD;
   }
   return void 0;
 }
@@ -13799,7 +13464,7 @@ async function unpackSplats({
     }
   }
   switch (splatFileType) {
-    case SplatFileType.PLY: {
+    case packedEncode.SplatFileType.PLY: {
       const ply = new PlyReader({ fileBytes });
       await ply.parseHeader();
       const numSplats = ply.numSplats;
@@ -13817,7 +13482,7 @@ async function unpackSplats({
         return { packedArray, numSplats: numSplats2, extra };
       });
     }
-    case SplatFileType.SPZ: {
+    case packedEncode.SplatFileType.SPZ: {
       return await withWorker(async (worker) => {
         const { packedArray, numSplats, extra } = await worker.call(
           "decodeSpz",
@@ -13829,7 +13494,7 @@ async function unpackSplats({
         return { packedArray, numSplats, extra };
       });
     }
-    case SplatFileType.SPLAT: {
+    case packedEncode.SplatFileType.SPLAT: {
       return await withWorker(async (worker) => {
         const { packedArray, numSplats } = await worker.call(
           "decodeAntiSplat",
@@ -13841,7 +13506,7 @@ async function unpackSplats({
         return { packedArray, numSplats };
       });
     }
-    case SplatFileType.KSPLAT: {
+    case packedEncode.SplatFileType.KSPLAT: {
       return await withWorker(async (worker) => {
         const { packedArray, numSplats, extra } = await worker.call(
           "decodeKsplat",
@@ -13850,7 +13515,7 @@ async function unpackSplats({
         return { packedArray, numSplats, extra };
       });
     }
-    case SplatFileType.PCSOGS: {
+    case packedEncode.SplatFileType.PCSOGS: {
       return await withWorker(async (worker) => {
         const { packedArray, numSplats, extra } = await worker.call(
           "decodePcSogs",
@@ -13859,7 +13524,7 @@ async function unpackSplats({
         return { packedArray, numSplats, extra };
       });
     }
-    case SplatFileType.PCSOGSZIP: {
+    case packedEncode.SplatFileType.PCSOGSZIP: {
       return await withWorker(async (worker) => {
         const { packedArray, numSplats, extra } = await worker.call(
           "decodePcSogsZip",
@@ -13998,14 +13663,14 @@ const _PackedSplats = class _PackedSplats {
     this.dyno = new DynoPackedSplats({ packedSplats: this });
     this.dynoRgbMinMaxLnScaleMinMax = new DynoVec4({
       key: "rgbMinMaxLnScaleMinMax",
-      value: new THREE__namespace.Vector4(0, 1, LN_SCALE_MIN, LN_SCALE_MAX),
+      value: new THREE__namespace.Vector4(0, 1, packedEncode.LN_SCALE_MIN, packedEncode.LN_SCALE_MAX),
       update: (value) => {
         var _a, _b, _c, _d;
         value.set(
           ((_a = this.splatEncoding) == null ? void 0 : _a.rgbMin) ?? 0,
           ((_b = this.splatEncoding) == null ? void 0 : _b.rgbMax) ?? 1,
-          ((_c = this.splatEncoding) == null ? void 0 : _c.lnScaleMin) ?? LN_SCALE_MIN,
-          ((_d = this.splatEncoding) == null ? void 0 : _d.lnScaleMax) ?? LN_SCALE_MAX
+          ((_c = this.splatEncoding) == null ? void 0 : _c.lnScaleMin) ?? packedEncode.LN_SCALE_MIN,
+          ((_d = this.splatEncoding) == null ? void 0 : _d.lnScaleMax) ?? packedEncode.LN_SCALE_MAX
         );
         return value;
       }
@@ -14059,7 +13724,7 @@ const _PackedSplats = class _PackedSplats {
       this.packedArray = options.packedArray;
       this.numSplats = options.numSplats ?? this.packedArray.length / 4;
       this.maxSplats = Math.floor(this.packedArray.length / 4);
-      this.maxSplats = Math.floor(this.maxSplats / SPLAT_TEX_WIDTH) * SPLAT_TEX_WIDTH;
+      this.maxSplats = Math.floor(this.maxSplats / packedEncode.SPLAT_TEX_WIDTH) * packedEncode.SPLAT_TEX_WIDTH;
       this.numSplats = Math.min(
         this.maxSplats,
         options.numSplats ?? Number.POSITIVE_INFINITY
@@ -14411,7 +14076,7 @@ const _PackedSplats = class _PackedSplats {
     let maxSplats = 0;
     const mapping = splatCounts.map((numSplats) => {
       const base = maxSplats;
-      const rounded = Math.ceil(numSplats / SPLAT_TEX_WIDTH) * SPLAT_TEX_WIDTH;
+      const rounded = Math.ceil(numSplats / packedEncode.SPLAT_TEX_WIDTH) * packedEncode.SPLAT_TEX_WIDTH;
       maxSplats += rounded;
       return { base, count: numSplats };
     });
@@ -14535,30 +14200,30 @@ const _PackedSplats = class _PackedSplats {
     const { program, material } = this.prepareProgramMaterial(generator);
     program.update();
     const renderState = this.saveRenderState(renderer);
-    const nextBase = Math.ceil((base + count) / SPLAT_TEX_WIDTH) * SPLAT_TEX_WIDTH;
-    const layerSize = SPLAT_TEX_WIDTH * SPLAT_TEX_HEIGHT;
+    const nextBase = Math.ceil((base + count) / packedEncode.SPLAT_TEX_WIDTH) * packedEncode.SPLAT_TEX_WIDTH;
+    const layerSize = packedEncode.SPLAT_TEX_WIDTH * packedEncode.SPLAT_TEX_HEIGHT;
     material.uniforms.targetBase.value = base;
     material.uniforms.targetCount.value = count;
     while (base < nextBase) {
       const layer = Math.floor(base / layerSize);
       material.uniforms.targetLayer.value = layer;
       const layerBase = layer * layerSize;
-      const layerYStart = Math.floor((base - layerBase) / SPLAT_TEX_WIDTH);
+      const layerYStart = Math.floor((base - layerBase) / packedEncode.SPLAT_TEX_WIDTH);
       const layerYEnd = Math.min(
-        SPLAT_TEX_HEIGHT,
-        Math.ceil((nextBase - layerBase) / SPLAT_TEX_WIDTH)
+        packedEncode.SPLAT_TEX_HEIGHT,
+        Math.ceil((nextBase - layerBase) / packedEncode.SPLAT_TEX_WIDTH)
       );
       this.target.scissor.set(
         0,
         layerYStart,
-        SPLAT_TEX_WIDTH,
+        packedEncode.SPLAT_TEX_WIDTH,
         layerYEnd - layerYStart
       );
       renderer.setRenderTarget(this.target, layer);
       renderer.xr.enabled = false;
       renderer.autoClear = false;
       _PackedSplats.fullScreenQuad.render(renderer);
-      base += SPLAT_TEX_WIDTH * (layerYEnd - layerYStart);
+      base += packedEncode.SPLAT_TEX_WIDTH * (layerYEnd - layerYStart);
     }
     this.resetRenderState(renderer, renderState);
     return { nextBase };
@@ -14590,7 +14255,7 @@ const _PackedSplats = class _PackedSplats {
           extra,
           lodBase,
           rgba,
-          encoding: this.splatEncoding ?? DEFAULT_SPLAT_ENCODING
+          encoding: this.splatEncoding ?? packedEncode.DEFAULT_SPLAT_ENCODING
         }
       );
     });
@@ -14691,8 +14356,8 @@ class DynoPackedSplats extends DynoUniform {
         rgbMinMaxLnScaleMinMax: new THREE__namespace.Vector4(
           0,
           1,
-          LN_SCALE_MIN,
-          LN_SCALE_MAX
+          packedEncode.LN_SCALE_MIN,
+          packedEncode.LN_SCALE_MAX
         ),
         lodOpacity: false
       },
@@ -14703,8 +14368,8 @@ class DynoPackedSplats extends DynoUniform {
         value.rgbMinMaxLnScaleMinMax.set(
           ((_d = (_c = this.packedSplats) == null ? void 0 : _c.splatEncoding) == null ? void 0 : _d.rgbMin) ?? 0,
           ((_f = (_e = this.packedSplats) == null ? void 0 : _e.splatEncoding) == null ? void 0 : _f.rgbMax) ?? 1,
-          ((_h = (_g = this.packedSplats) == null ? void 0 : _g.splatEncoding) == null ? void 0 : _h.lnScaleMin) ?? LN_SCALE_MIN,
-          ((_j = (_i = this.packedSplats) == null ? void 0 : _i.splatEncoding) == null ? void 0 : _j.lnScaleMax) ?? LN_SCALE_MAX
+          ((_h = (_g = this.packedSplats) == null ? void 0 : _g.splatEncoding) == null ? void 0 : _h.lnScaleMin) ?? packedEncode.LN_SCALE_MIN,
+          ((_j = (_i = this.packedSplats) == null ? void 0 : _i.splatEncoding) == null ? void 0 : _j.lnScaleMax) ?? packedEncode.LN_SCALE_MAX
         );
         value.lodOpacity = ((_l = (_k = this.packedSplats) == null ? void 0 : _k.splatEncoding) == null ? void 0 : _l.lodOpacity) ?? false;
         return value;
@@ -15618,7 +15283,7 @@ const _OldSparkRenderer = class _OldSparkRenderer extends THREE__namespace.Mesh 
     this.falloff = options.falloff ?? 1;
     this.clipXY = options.clipXY ?? 1.4;
     this.focalAdjustment = options.focalAdjustment ?? 1;
-    this.splatEncoding = options.splatEncoding ?? { ...DEFAULT_SPLAT_ENCODING };
+    this.splatEncoding = options.splatEncoding ?? { ...packedEncode.DEFAULT_SPLAT_ENCODING };
     this.active = new OldSplatAccumulator();
     this.active.refCount = 1;
     this.accumulatorCount = 1;
@@ -15855,8 +15520,8 @@ const _OldSparkRenderer = class _OldSparkRenderer extends THREE__namespace.Mesh 
       this.uniforms.rgbMinMaxLnScaleMinMax.value.set(
         ((_a = accumulator.splats.splatEncoding) == null ? void 0 : _a.rgbMin) ?? 0,
         ((_b = accumulator.splats.splatEncoding) == null ? void 0 : _b.rgbMax) ?? 1,
-        ((_c = accumulator.splats.splatEncoding) == null ? void 0 : _c.lnScaleMin) ?? LN_SCALE_MIN,
-        ((_d = accumulator.splats.splatEncoding) == null ? void 0 : _d.lnScaleMax) ?? LN_SCALE_MAX
+        ((_c = accumulator.splats.splatEncoding) == null ? void 0 : _c.lnScaleMin) ?? packedEncode.LN_SCALE_MIN,
+        ((_d = accumulator.splats.splatEncoding) == null ? void 0 : _d.lnScaleMax) ?? packedEncode.LN_SCALE_MAX
       );
       this.geometry = geometry;
       this.material.transparent = !this.viewpoint.stochastic;
@@ -16309,7 +15974,7 @@ function decodeKsplat(fileBytes, initNumSplats, splatCallback, shCallback) {
         );
       }
       if (compressionLevel === 1) {
-        return fromHalf(
+        return packedEncode.fromHalf(
           data.getUint16(
             splatOffset + sphericalHarmonicsOffsetBytes + component * 2,
             true
@@ -16429,19 +16094,19 @@ function decodeKsplat(fileBytes, initNumSplats, splatCallback, shCallback) {
       const x = compressionLevel === 0 ? data.getFloat32(splatOffset + 0, true) : (data.getUint16(splatOffset + 0, true) - compressionScaleRange) * compressionScaleFactor + bucketArray[3 * bucketIndex + 0];
       const y = compressionLevel === 0 ? data.getFloat32(splatOffset + 4, true) : (data.getUint16(splatOffset + 2, true) - compressionScaleRange) * compressionScaleFactor + bucketArray[3 * bucketIndex + 1];
       const z = compressionLevel === 0 ? data.getFloat32(splatOffset + 8, true) : (data.getUint16(splatOffset + 4, true) - compressionScaleRange) * compressionScaleFactor + bucketArray[3 * bucketIndex + 2];
-      const scaleX = compressionLevel === 0 ? data.getFloat32(splatOffset + scaleOffsetBytes + 0, true) : fromHalf(data.getUint16(splatOffset + scaleOffsetBytes + 0, true));
-      const scaleY = compressionLevel === 0 ? data.getFloat32(splatOffset + scaleOffsetBytes + 4, true) : fromHalf(data.getUint16(splatOffset + scaleOffsetBytes + 2, true));
-      const scaleZ = compressionLevel === 0 ? data.getFloat32(splatOffset + scaleOffsetBytes + 8, true) : fromHalf(data.getUint16(splatOffset + scaleOffsetBytes + 4, true));
-      const quatW = compressionLevel === 0 ? data.getFloat32(splatOffset + rotationOffsetBytes + 0, true) : fromHalf(
+      const scaleX = compressionLevel === 0 ? data.getFloat32(splatOffset + scaleOffsetBytes + 0, true) : packedEncode.fromHalf(data.getUint16(splatOffset + scaleOffsetBytes + 0, true));
+      const scaleY = compressionLevel === 0 ? data.getFloat32(splatOffset + scaleOffsetBytes + 4, true) : packedEncode.fromHalf(data.getUint16(splatOffset + scaleOffsetBytes + 2, true));
+      const scaleZ = compressionLevel === 0 ? data.getFloat32(splatOffset + scaleOffsetBytes + 8, true) : packedEncode.fromHalf(data.getUint16(splatOffset + scaleOffsetBytes + 4, true));
+      const quatW = compressionLevel === 0 ? data.getFloat32(splatOffset + rotationOffsetBytes + 0, true) : packedEncode.fromHalf(
         data.getUint16(splatOffset + rotationOffsetBytes + 0, true)
       );
-      const quatX = compressionLevel === 0 ? data.getFloat32(splatOffset + rotationOffsetBytes + 4, true) : fromHalf(
+      const quatX = compressionLevel === 0 ? data.getFloat32(splatOffset + rotationOffsetBytes + 4, true) : packedEncode.fromHalf(
         data.getUint16(splatOffset + rotationOffsetBytes + 2, true)
       );
-      const quatY = compressionLevel === 0 ? data.getFloat32(splatOffset + rotationOffsetBytes + 8, true) : fromHalf(
+      const quatY = compressionLevel === 0 ? data.getFloat32(splatOffset + rotationOffsetBytes + 8, true) : packedEncode.fromHalf(
         data.getUint16(splatOffset + rotationOffsetBytes + 4, true)
       );
-      const quatZ = compressionLevel === 0 ? data.getFloat32(splatOffset + rotationOffsetBytes + 12, true) : fromHalf(
+      const quatZ = compressionLevel === 0 ? data.getFloat32(splatOffset + rotationOffsetBytes + 12, true) : packedEncode.fromHalf(
         data.getUint16(splatOffset + rotationOffsetBytes + 6, true)
       );
       const r = data.getUint8(splatOffset + colorOffsetBytes + 0) / 255;
@@ -16540,9 +16205,9 @@ class SpzReader {
       const centerUint16 = new Uint16Array(centerBytes.buffer);
       for (let i = 0; i < this.numSplats; i++) {
         const i3 = i * 3;
-        const x = fromHalf(centerUint16[i3]);
-        const y = fromHalf(centerUint16[i3 + 1]);
-        const z = fromHalf(centerUint16[i3 + 2]);
+        const x = packedEncode.fromHalf(centerUint16[i3]);
+        const y = packedEncode.fromHalf(centerUint16[i3 + 1]);
+        const z = packedEncode.fromHalf(centerUint16[i3 + 2]);
         centerCallback == null ? void 0 : centerCallback(i, x, y, z);
       }
     } else if (this.version === 2 || this.version === 3) {
@@ -16886,7 +16551,7 @@ async function transcodeSpz(input) {
       }
     }
     switch (fileType) {
-      case SplatFileType.PLY: {
+      case packedEncode.SplatFileType.PLY: {
         const ply = new PlyReader({ fileBytes: input2.fileBytes });
         await ply.parseHeader();
         let lastIndex = null;
@@ -16930,7 +16595,7 @@ async function transcodeSpz(input) {
         );
         break;
       }
-      case SplatFileType.SPZ: {
+      case packedEncode.SplatFileType.SPZ: {
         const spz2 = new SpzReader({ fileBytes: input2.fileBytes });
         await spz2.parseHeader();
         const mapping = new Int32Array(spz2.numSplats);
@@ -16993,7 +16658,7 @@ async function transcodeSpz(input) {
         );
         break;
       }
-      case SplatFileType.SPLAT:
+      case packedEncode.SplatFileType.SPLAT:
         decodeAntiSplat(
           input2.fileBytes,
           (numSplats) => {
@@ -17023,7 +16688,7 @@ async function transcodeSpz(input) {
           }
         );
         break;
-      case SplatFileType.KSPLAT: {
+      case packedEncode.SplatFileType.KSPLAT: {
         let lastIndex = null;
         decodeKsplat(
           input2.fileBytes,
@@ -20375,6 +20040,13 @@ class SparkPortals {
     this.behindRenderer.dispose();
   }
 }
+exports.LN_SCALE_MAX = packedEncode.LN_SCALE_MAX;
+exports.LN_SCALE_MIN = packedEncode.LN_SCALE_MIN;
+exports.SplatFileType = packedEncode.SplatFileType;
+exports.defines = packedEncode.defines;
+exports.floatToUint8 = packedEncode.floatToUint8;
+exports.fromHalf = packedEncode.fromHalf;
+exports.toHalf = packedEncode.toHalf;
 exports.DEFAULT_CONTROLLER_FAST_MULTIPLIER = DEFAULT_CONTROLLER_FAST_MULTIPLIER;
 exports.DEFAULT_CONTROLLER_GETFAST = DEFAULT_CONTROLLER_GETFAST;
 exports.DEFAULT_CONTROLLER_GETMOVE = DEFAULT_CONTROLLER_GETMOVE;
@@ -20400,8 +20072,6 @@ exports.JOINT_SEGMENT_STEPS = JOINT_SEGMENT_STEPS;
 exports.JOINT_TIPS = JOINT_TIPS;
 exports.JointEnum = JointEnum;
 exports.JointSplats = JointSplats;
-exports.LN_SCALE_MAX = LN_SCALE_MAX;
-exports.LN_SCALE_MIN = LN_SCALE_MIN;
 exports.NUM_JOINTS = NUM_JOINTS;
 exports.NewSplatWorkerPool = NewSplatWorkerPool;
 exports.OldSparkRenderer = OldSparkRenderer;
@@ -20424,7 +20094,6 @@ exports.SplatEditRgbaBlendMode = SplatEditRgbaBlendMode;
 exports.SplatEditSdf = SplatEditSdf;
 exports.SplatEditSdfType = SplatEditSdfType;
 exports.SplatEdits = SplatEdits;
-exports.SplatFileType = SplatFileType;
 exports.SplatGenerator = SplatGenerator;
 exports.SplatLoader = SplatLoader;
 exports.SplatMesh = SplatMesh;
@@ -20442,12 +20111,9 @@ exports.XrHands = XrHands;
 exports.constructAxes = constructAxes;
 exports.constructGrid = constructGrid;
 exports.constructSpherePoints = constructSpherePoints;
-exports.defines = defines;
 exports.dyno = dyno;
 exports.flipPixels = flipPixels;
 exports.floatToSint8 = floatToSint8;
-exports.floatToUint8 = floatToUint8;
-exports.fromHalf = fromHalf;
 exports.generators = generators;
 exports.getSplatFileType = getSplatFileType;
 exports.imageSplats = imageSplats;
@@ -20464,7 +20130,6 @@ exports.pixelsToPngUrl = pixelsToPngUrl;
 exports.readRgbaArray = readRgbaArray;
 exports.setPackedSplat = setPackedSplat;
 exports.textSplats = textSplats;
-exports.toHalf = toHalf;
 exports.transcodeSpz = transcodeSpz;
 exports.unpackSplat = unpackSplat;
 exports.unpackSplats = unpackSplats;

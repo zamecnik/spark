@@ -1240,6 +1240,12 @@ function scanBounds(words, offsets, count) {
     max: new webgpu.Vector3(maxX + mx, maxY + my, maxZ + mz)
   };
 }
+function dispatch2d(groups) {
+  const MAX_PER_DIM = 65535;
+  if (groups <= MAX_PER_DIM) return [groups];
+  const y = Math.ceil(groups / MAX_PER_DIM);
+  return [Math.ceil(groups / y), y];
+}
 class WebGpuSplatBackend {
   constructor() {
     this.sortRadial = true;
@@ -1628,7 +1634,7 @@ class WebGpuSplatBackend {
       const norm = sortKeyLog ? TSL.log(TSL.max(metric, uDistRange.z)).sub(uDistRange.x).div(uDistRange.y) : metric.sub(uDistRange.x).div(uDistRange.y.sub(uDistRange.x));
       const q = TSL.uint(TSL.float(1).sub(TSL.clamp(norm, 0, 1)).mul(quantMax));
       keysNode.element(i).assign(q);
-    })().compute([Math.ceil(Math.max(1, capacity) / 256)], [256]).setName("splatKeygen");
+    })().compute(dispatch2d(Math.ceil(Math.max(1, capacity) / 256)), [256]).setName("splatKeygen");
     const packLevel = projOn && (this.cachePack === 1 || this.cachePack === 2) ? this.cachePack : 0;
     const projC = projOn && packLevel < 2 ? {
       c0: TSL.instancedArray(Math.max(1, capacity), "vec4"),
@@ -1952,7 +1958,7 @@ class WebGpuSplatBackend {
             projP.p1.element(i).assign(uvec4(TSL.uint(0), TSL.uint(0), TSL.uint(0), TSL.uint(0)));
           });
         }
-      })().compute([Math.ceil(Math.max(1, capacity) / 256)], [256]).setName("splatProjector");
+      })().compute(dispatch2d(Math.ceil(Math.max(1, capacity) / 256)), [256]).setName("splatProjector");
     }
     if (this.state) {
       kcRegrowDebug.kcDisposeOldMaterial(spark.renderer, this.state.material);
