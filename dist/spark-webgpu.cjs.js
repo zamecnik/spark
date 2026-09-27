@@ -1228,6 +1228,53 @@ function scanBounds(words, offsets, count) {
     if (z < minZ) minZ = z;
     if (z > maxZ) maxZ = z;
   }
+  return finishBounds(minX, minY, minZ, maxX, maxY, maxZ);
+}
+let halfTable = null;
+function halfToFloatTable() {
+  if (!halfTable) {
+    halfTable = new Float32Array(65536);
+    for (let h = 0; h < 65536; h++) halfTable[h] = fromHalf(h);
+  }
+  return halfTable;
+}
+function accumulateStaticBounds(words, start, end, acc) {
+  const half = halfToFloatTable();
+  let minX = acc[0];
+  let minY = acc[1];
+  let minZ = acc[2];
+  let maxX = acc[3];
+  let maxY = acc[4];
+  let maxZ = acc[5];
+  for (let k = start; k < end; k++) {
+    const o = 4 * k;
+    const w1 = words[o + 1];
+    const w2 = words[o + 2];
+    const x = half[w1 & 65535];
+    const y = half[w1 >>> 16];
+    const z = half[w2 & 65535];
+    if (!Number.isFinite(x + y + z)) continue;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    if (z < minZ) minZ = z;
+    if (z > maxZ) maxZ = z;
+  }
+  acc[0] = minX;
+  acc[1] = minY;
+  acc[2] = minZ;
+  acc[3] = maxX;
+  acc[4] = maxY;
+  acc[5] = maxZ;
+}
+function finishBounds(minXIn, minYIn, minZIn, maxXIn, maxYIn, maxZIn) {
+  let minX = minXIn;
+  let minY = minYIn;
+  let minZ = minZIn;
+  let maxX = maxXIn;
+  let maxY = maxYIn;
+  let maxZ = maxZIn;
   if (minX > maxX) {
     minX = minY = minZ = 0;
     maxX = maxY = maxZ = 1;
@@ -1245,6 +1292,48 @@ function dispatch2d(groups) {
   if (groups <= MAX_PER_DIM) return [groups];
   const y = Math.ceil(groups / MAX_PER_DIM);
   return [Math.ceil(groups / y), y];
+}
+const PREPARE_PIPELINE_TIMEOUT_MS = 3e4;
+const PREPARE_BOUNDS_CHUNK = 1 << 20;
+function yieldToPage() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+function createSyncInto(device, slot, descriptor) {
+  try {
+    slot.pipeline = device.createComputePipeline(descriptor);
+  } catch (e) {
+    console.warn("[splat] synchronous compute pipeline create threw", e);
+  }
+}
+function settleWithin(promise, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    promise.then(
+      () => {
+        clearTimeout(timer);
+        resolve(true);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(false);
+      }
+    );
+  });
+}
+function nowMs() {
+  return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+function withSwapped(target, key, replacement, fn) {
+  const rec = target;
+  const hadOwn = Object.prototype.hasOwnProperty.call(target, key);
+  const previous = rec[key];
+  rec[key] = replacement;
+  try {
+    return fn();
+  } finally {
+    if (hadOwn) rec[key] = previous;
+    else delete rec[key];
+  }
 }
 class WebGpuSplatBackend {
   constructor() {
@@ -1267,6 +1356,8 @@ class WebGpuSplatBackend {
     this.state = null;
     this.sortedOnce = false;
     this.warnedMultiMesh = false;
+    this.preparing = false;
+    this.needsRebuild = false;
     this.placeholderMaterial = new webgpu.MeshBasicNodeMaterial();
   }
   // Called from SparkRenderer.updateInternal (WebGPU branch). Returns true
@@ -1280,7 +1371,7 @@ class WebGpuSplatBackend {
     this.frames++;
     const mesh = this.findSplatMesh(scene);
     const src = mesh ? this.resolveSource(spark, mesh) : null;
-    if (!mesh || !src || src.numSplats === 0) {
+    if (!mesh || !src || src.numSplats === 0 || this.preparing) {
       spark.activeSplats = 0;
       spark.geometry.instanceCount = 0;
       if (this.state) this.state.drawInstances = 0;
@@ -1288,8 +1379,7 @@ class WebGpuSplatBackend {
     }
     this.sortRadial = spark.sortRadial ?? true;
     let rebuilt = false;
-    const st = this.state;
-    if (!st || st.mesh !== mesh || st.kind !== src.kind || st.packedTexture !== src.packedTexture || st.cutTexture !== src.cutTexture || st.sh1 !== src.sh1 || st.sh2 !== src.sh2 || st.sh3 !== src.sh3 || st.capacity !== src.capacity) {
+    if (this.needsRebuild || !this.stateMatches(mesh, src)) {
       this.buildState(spark, mesh, src);
       rebuilt = true;
       this.rebuilds++;
@@ -1316,24 +1406,15 @@ class WebGpuSplatBackend {
     state.drawInstances = drawInstances;
     state.material.batchNumSplats.value = src.numSplats;
     spark.geometry.instanceCount = drawInstances;
-    if (state.projector && src.numSplats > 0) {
+    if (state.projector) {
       this.syncUniforms(spark, camera);
       if (state.uWriteKeys) state.uWriteKeys.value = wantSort ? 1 : 0;
-      if (wantSort && state.uWriteKeys && state.visGroups) {
-        spark.renderer.compute([state.visPrePass, state.projector]);
-        for (const g of state.visGroups) {
-          spark.renderer.compute(
-            g.nodes,
-            g.indirect ? state.visDispatchAttr : null
-          );
-        }
-      } else {
-        spark.renderer.compute(
-          wantSort && state.uWriteKeys ? [state.projector, ...state.radix.steps] : [state.projector]
-        );
-      }
-    } else if (wantSort) {
-      spark.renderer.compute([state.keygen, ...state.radix.steps]);
+    }
+    for (const call of this.sortDispatchPlan(state, wantSort)) {
+      spark.renderer.compute(
+        call.nodes,
+        call.indirect ? state.visDispatchAttr : null
+      );
     }
     const ctx = mesh.context;
     if (ctx) {
@@ -1348,6 +1429,323 @@ class WebGpuSplatBackend {
       }
     }
     return didSort;
+  }
+  /**
+   * [full-3] Get `mesh` ready for its first frame WITHOUT freezing the
+   * browser. Optional: a host that never calls it renders exactly as before.
+   *
+   * The first frame of a new state creates ~12 compute pipelines (keygen or
+   * projector + the radix passes) and the draw pipeline through three's
+   * SYNCHRONOUS entry points. Chrome compiles those (DXC on D3D12) on the GPU
+   * process MAIN thread - the thread that also draws the browser's own UI.
+   * Measured 2026-09-27 on a 4.6M-splat static scene: ~1.1 s of compiles in
+   * 621 + 659 ms blocks, during which the whole browser froze (tabs could
+   * not be switched), plus a 684 ms main-thread first render. The ASYNC
+   * entry points compile on GPU-process worker threads, in parallel
+   * (measured: 8 heavy shaders 7.5 s serial on the main thread vs 1.4 s with
+   * the GPU main thread busy for 1 ms).
+   *
+   * So, before the mesh is shown, prepare():
+   *   1. builds the state for `mesh` (as the first update() would),
+   *   2. runs the static bounds scan in chunks (update() then skips it),
+   *   3. dry-runs every compute node the first frame dispatches through
+   *      three's own renderer.compute() - bindings, uploads, node building,
+   *      dispose bookkeeping all exactly as a real first dispatch - with the
+   *      dispatch disabled and each new pipeline's descriptor handed to
+   *      createComputePipelineAsync instead of the synchronous create,
+   *   4. compiles the draw pipeline through renderer.compileAsync,
+   * yielding to the page between steps. While it runs, update() dispatches
+   * and draws nothing; the SparkRenderer draws its placeholder material so
+   * the host's render loop cannot create the draw pipeline synchronously.
+   *
+   * Never rejects, never strands a loading screen, and its worst case is the
+   * old behaviour: a compute pipeline whose async creation rejects or does
+   * not settle within PREPARE_PIPELINE_TIMEOUT_MS is created the synchronous
+   * way (errors surface as before); a compute step that fails or leaves a
+   * pipeline slot empty makes the next update() rebuild the state the old
+   * way; a texture whose layered upload broke off gets one full upload on
+   * its next bind; the draw pipeline's compile is awaited for at most the
+   * same timeout (a pipeline already being created is waited for by three's
+   * isReady check; a compile that hung before that point is created
+   * synchronously by the first frame). report.ok is false on any of it.
+   */
+  async prepare({
+    spark,
+    mesh,
+    scene,
+    camera,
+    onProgress
+  }) {
+    var _a;
+    const t0 = nowMs();
+    const report = {
+      ok: false,
+      asyncComputePipelines: 0,
+      syncFallbacks: 0,
+      renderCompiled: false,
+      uploadedLayers: 0,
+      ms: { state: 0, bounds: 0, upload: 0, compute: 0, render: 0, total: 0 }
+    };
+    const finish = () => {
+      report.ms.total = Math.round(nowMs() - t0);
+      return report;
+    };
+    if (this.preparing) {
+      report.reason = "busy";
+      return finish();
+    }
+    this.preparing = true;
+    const jobs = [];
+    const uploading = /* @__PURE__ */ new Set();
+    let device;
+    let phase = "setup";
+    let placeholderOn = false;
+    try {
+      const renderer = spark.renderer;
+      const backend = renderer == null ? void 0 : renderer.backend;
+      device = backend == null ? void 0 : backend.device;
+      if (!backend || !device || typeof backend.compute !== "function" || typeof device.createComputePipelineAsync !== "function") {
+        report.reason = "no-renderer";
+        return finish();
+      }
+      const src = this.resolveSource(spark, mesh);
+      if (!src || src.numSplats === 0) {
+        report.reason = "empty";
+        return finish();
+      }
+      let t = nowMs();
+      this.sortRadial = spark.sortRadial ?? true;
+      if (this.needsRebuild || !this.stateMatches(mesh, src)) {
+        this.buildState(spark, mesh, src);
+        this.rebuilds++;
+      }
+      const state = this.state;
+      spark.material = this.placeholderMaterial;
+      placeholderOn = true;
+      report.ms.state = Math.round(nowMs() - t);
+      const nodes = this.firstFrameComputeNodes(state);
+      const layers = typeof renderer.initTexture === "function" ? this.staticUploadLayers(state) : [];
+      const steps = 1 + layers.length + nodes.length + 2;
+      let done = 0;
+      const progress = () => onProgress == null ? void 0 : onProgress(++done, steps);
+      await yieldToPage();
+      t = nowMs();
+      await this.prepareBounds(state, src);
+      state.lastNumSplats = src.numSplats;
+      state.lastMappingVersion = src.mappingVersion;
+      report.ms.bounds = Math.round(nowMs() - t);
+      progress();
+      t = nowMs();
+      for (const { texture, layer } of layers) {
+        await yieldToPage();
+        uploading.add(texture);
+        texture.addLayerUpdate(layer);
+        if (layer > 0) texture.needsUpdate = true;
+        renderer.initTexture(texture);
+        if (layer === Math.max(1, ((_a = texture.image) == null ? void 0 : _a.depth) ?? 1) - 1) uploading.delete(texture);
+        report.uploadedLayers++;
+        progress();
+      }
+      report.ms.upload = Math.round(nowMs() - t);
+      phase = "compute";
+      t = nowMs();
+      for (const node of nodes) {
+        await yieldToPage();
+        this.dryRunCompute(renderer, node, jobs);
+        progress();
+      }
+      await this.settleJobs(device, jobs);
+      report.asyncComputePipelines = jobs.length;
+      report.syncFallbacks = jobs.filter((j) => j.fellBack).length;
+      if (jobs.some((j) => !j.slot.pipeline)) {
+        throw new Error("a compute pipeline slot stayed empty");
+      }
+      phase = "later";
+      report.ms.compute = Math.round(nowMs() - t);
+      progress();
+      t = nowMs();
+      const compileAsync = renderer.compileAsync;
+      if (typeof compileAsync === "function") {
+        spark.material = state.material;
+        let compiling;
+        try {
+          compiling = compileAsync.call(renderer, spark, camera, scene);
+        } finally {
+          spark.material = this.placeholderMaterial;
+        }
+        report.renderCompiled = await settleWithin(compiling, PREPARE_PIPELINE_TIMEOUT_MS);
+        if (!report.renderCompiled) {
+          report.reason = "failed";
+          report.error = "the draw pipeline compile failed or did not settle in time";
+        }
+      }
+      report.ms.render = Math.round(nowMs() - t);
+      progress();
+      report.ok = report.reason === void 0;
+    } catch (e) {
+      report.reason = "failed";
+      report.error = String((e == null ? void 0 : e.message) ?? e).slice(0, 300);
+      if (phase === "compute") this.needsRebuild = true;
+      for (const texture of uploading) {
+        texture.layerUpdates.clear();
+        texture.needsUpdate = true;
+      }
+    } finally {
+      if (device && jobs.some((j) => !j.done)) {
+        await this.settleJobs(device, jobs).catch(() => {
+        });
+      }
+      if (placeholderOn && this.state) spark.material = this.state.material;
+      this.preparing = false;
+    }
+    return finish();
+  }
+  // The renderer.compute() calls one update() submits, in order - the ONE
+  // place the dispatch branches live (update() runs it every frame; prepare()
+  // dry-runs its sort-frame plan, so the two can never drift apart).
+  // `indirect` calls take state.visDispatchAttr as their dispatch size.
+  sortDispatchPlan(state, wantSort) {
+    if (state.projector) {
+      if (wantSort && state.uWriteKeys && state.visGroups) {
+        return [
+          { nodes: [state.visPrePass, state.projector], indirect: false },
+          ...state.visGroups.map((g) => ({ nodes: g.nodes, indirect: g.indirect }))
+        ];
+      }
+      return [
+        {
+          nodes: wantSort && state.uWriteKeys ? [state.projector, ...state.radix.steps] : [state.projector],
+          indirect: false
+        }
+      ];
+    }
+    return wantSort ? [{ nodes: [state.keygen, ...state.radix.steps], indirect: false }] : [];
+  }
+  // The compute nodes the first update() dispatches (its sort-frame plan),
+  // each once - creation only, order irrelevant.
+  firstFrameComputeNodes(state) {
+    const list = [];
+    for (const call of this.sortDispatchPlan(state, true)) list.push(...call.nodes);
+    return [...new Set(list.filter(Boolean))];
+  }
+  // The (texture, layer) pairs prepare() uploads one per step: the static
+  // source's packed + SH array textures, which are fresh (never uploaded) on
+  // a new load. Cut kinds are skipped: their pool/cut textures are uploaded
+  // incrementally by their own producers. Stripped of the WebGL internal
+  // format already (buildState / the SplatNodeMaterial constructor) - an
+  // unstripped texture would upload zeros.
+  staticUploadLayers(state) {
+    var _a;
+    if (state.kind !== "static") return [];
+    const out = [];
+    for (const texture of [state.packedTexture, state.sh1, state.sh2, state.sh3]) {
+      if (!texture || typeof texture.addLayerUpdate !== "function") continue;
+      const depth = Math.max(1, ((_a = texture.image) == null ? void 0 : _a.depth) ?? 1);
+      for (let layer = 0; layer < depth; layer++) out.push({ texture, layer });
+    }
+    return out;
+  }
+  // update()'s bounds step, done ahead: the static kind scans every splat
+  // (chunked, yielding between chunks - identical result to scanBounds), the
+  // cut kinds sample through updateBounds (<= 65,536 samples, sub-ms).
+  async prepareBounds(state, src) {
+    var _a;
+    const arr = (_a = state.mesh.packedSplats) == null ? void 0 : _a.packedArray;
+    if (src.kind !== "static" || !arr) {
+      this.updateBounds(state, src);
+      return;
+    }
+    const acc = new Float64Array([
+      Number.POSITIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+      Number.NEGATIVE_INFINITY
+    ]);
+    for (let s = 0; s < src.numSplats; s += PREPARE_BOUNDS_CHUNK) {
+      if (s > 0) await yieldToPage();
+      accumulateStaticBounds(
+        arr,
+        s,
+        Math.min(src.numSplats, s + PREPARE_BOUNDS_CHUNK),
+        acc
+      );
+    }
+    const b = finishBounds(acc[0], acc[1], acc[2], acc[3], acc[4], acc[5]);
+    state.boundsMin.copy(b.min);
+    state.boundsMax.copy(b.max);
+  }
+  // One compute node through three's real first-dispatch path, with the
+  // dispatch disabled and a new pipeline's compile made async. three creates
+  // a pipeline inside getForCompute (device.createComputePipeline, which the
+  // hook captures) and then hands that pipeline to backend.compute (which the
+  // hook turns into "create it async into the pipeline's slot").
+  dryRunCompute(renderer, node, jobs) {
+    const backend = renderer.backend;
+    const device = backend.device;
+    let captured = null;
+    const captureCreate = (desc) => {
+      captured = { label: desc.label, layout: desc.layout, compute: desc.compute };
+      return void 0;
+    };
+    const noDispatch = (...args) => {
+      const descriptor = captured;
+      if (!descriptor) return;
+      captured = null;
+      const pipeline = args[3];
+      if (!pipeline || pipeline.isComputePipeline !== true) {
+        throw new Error("three's compute hook no longer passes the pipeline 4th");
+      }
+      const slot = backend.get(pipeline);
+      const job = { slot, descriptor, done: false, fellBack: false };
+      job.settled = device.createComputePipelineAsync(descriptor).then(
+        (gpuPipeline) => {
+          if (job.done) return;
+          job.done = true;
+          slot.pipeline = gpuPipeline;
+        },
+        (err) => {
+          if (job.done) return;
+          job.done = true;
+          job.fellBack = true;
+          console.warn(
+            `[splat] async ${descriptor.label ?? "compute pipeline"} failed (${String((err == null ? void 0 : err.message) ?? err).slice(0, 200)}) - created synchronously`
+          );
+          createSyncInto(device, slot, descriptor);
+        }
+      );
+      jobs.push(job);
+    };
+    withSwapped(
+      device,
+      "createComputePipeline",
+      captureCreate,
+      () => withSwapped(backend, "compute", noDispatch, () => renderer.compute(node))
+    );
+    if (captured) {
+      throw new Error("a compute pipeline was created but never reached the dispatch hook");
+    }
+  }
+  // Wait for every async pipeline; whatever has not settled in time is
+  // created synchronously (the pre-[full-3] behaviour), so no slot is ever
+  // left empty when the guard lifts.
+  async settleJobs(device, jobs) {
+    let timer;
+    await Promise.race([
+      Promise.all(jobs.map((j) => j.settled.catch(() => {
+      }))),
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, PREPARE_PIPELINE_TIMEOUT_MS);
+      })
+    ]);
+    clearTimeout(timer);
+    for (const j of jobs) {
+      if (j.done) continue;
+      j.done = true;
+      j.fellBack = true;
+      createSyncInto(device, j.slot, j.descriptor);
+    }
   }
   // Called from SparkRenderer.onBeforeRender: per-frame material uniforms.
   applyPerFrame(spark, camera) {
@@ -1537,6 +1935,11 @@ class WebGpuSplatBackend {
       sh3: numSh >= 3 ? (_g = sh.sh3Texture) == null ? void 0 : _g.value : void 0,
       mappingVersion: mesh.mappingVersion ?? 0
     };
+  }
+  // The baked state serves this mesh + source as-is (identities + capacity).
+  stateMatches(mesh, src) {
+    const st = this.state;
+    return !!st && st.mesh === mesh && st.kind === src.kind && st.packedTexture === src.packedTexture && st.cutTexture === src.cutTexture && st.sh1 === src.sh1 && st.sh2 === src.sh2 && st.sh3 === src.sh3 && st.capacity === src.capacity;
   }
   buildState(spark, mesh, src) {
     const { capacity, cutTexture, packedTexture, pagedTiling } = src;
@@ -1996,6 +2399,7 @@ class WebGpuSplatBackend {
       visCountAttr
     };
     this.sortedOnce = false;
+    this.needsRebuild = false;
     spark.material = material;
     if (this.batchSize > 1 && !(spark.geometry instanceof BatchedSplatGeometry)) {
       spark.geometry = new BatchedSplatGeometry(this.batchSize);

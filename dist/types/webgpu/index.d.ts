@@ -3,4 +3,4 @@ export { evaluatePackedSH1Tsl, evaluatePackedSH2Tsl, evaluatePackedSH3Tsl, evalu
 export { SplatNodeMaterial, type SplatNodeMaterialOptions, } from './SplatNodeMaterial';
 export { type AlphaChainResult, referenceAlphaChain, roundEven, stockNetAlpha, } from './alphaReference';
 export { type RadixSort, type RadixSortGroup, createRadixSort, createVisibleClear, } from './radixSort';
-export { WebGpuSplatBackend } from './WebGpuSplatBackend';
+export { WebGpuSplatBackend, type WebGpuSplatPrepareReport, } from './WebGpuSplatBackend';
