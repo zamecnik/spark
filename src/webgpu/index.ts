@@ -42,4 +42,7 @@ export {
   createRadixSort,
   createVisibleClear,
 } from "./radixSort";
-export { WebGpuSplatBackend } from "./WebGpuSplatBackend";
+export {
+  WebGpuSplatBackend,
+  type WebGpuSplatPrepareReport,
+} from "./WebGpuSplatBackend";
