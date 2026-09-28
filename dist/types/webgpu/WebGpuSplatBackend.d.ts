@@ -98,6 +98,7 @@ type SparkRendererLike = THREE.Mesh & {
     clipXY: number;
     focalAdjustment: number;
     renderSize: THREE.Vector2;
+    setDirty?: () => void;
     lodInstances?: Map<unknown, LodInstanceLike>;
 };
 type SourceKind = "static" | "lodPacked" | "paged";
@@ -142,7 +143,12 @@ export declare class WebGpuSplatBackend {
     sorts: number;
     lastSortFrame: number;
     rebuilds: number;
+    prepareNewStates: boolean;
+    onPrepared: ((report: WebGpuSplatPrepareReport) => void) | null;
+    lastPrepareReport: WebGpuSplatPrepareReport | null;
     private state;
+    private autoPrepareBroken;
+    private prepareScheduled;
     private sortedOnce;
     private warnedMultiMesh;
     private preparing;
@@ -193,13 +199,20 @@ export declare class WebGpuSplatBackend {
      * isReady check; a compile that hung before that point is created
      * synchronously by the first frame). report.ok is false on any of it.
      */
-    prepare({ spark, mesh, scene, camera, onProgress, }: {
+    prepare(options: {
         spark: SparkRendererLike;
         mesh: SplatMeshLike;
         scene: THREE.Scene;
         camera: THREE.Camera;
         onProgress?: (done: number, total: number) => void;
+        /** per pipeline step (compute settle, draw compile); default 30 s */
+        timeoutMs?: number;
     }): Promise<WebGpuSplatPrepareReport>;
+    /** [full-3b] a prepare() is scheduled or running: nothing is drawn yet. */
+    get isPreparing(): boolean;
+    private drawNothing;
+    private schedulePrepare;
+    private prepareOnce;
     private sortDispatchPlan;
     private firstFrameComputeNodes;
     private staticUploadLayers;

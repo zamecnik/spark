@@ -1294,6 +1294,7 @@ function dispatch2d(groups) {
   return [Math.ceil(groups / y), y];
 }
 const PREPARE_PIPELINE_TIMEOUT_MS = 3e4;
+const PREPARE_SCHEDULED_TIMEOUT_MS = 8e3;
 const PREPARE_BOUNDS_CHUNK = 1 << 20;
 function yieldToPage() {
   return new Promise((resolve) => setTimeout(resolve, 0));
@@ -1353,7 +1354,12 @@ class WebGpuSplatBackend {
     this.sorts = 0;
     this.lastSortFrame = -1;
     this.rebuilds = 0;
+    this.prepareNewStates = false;
+    this.onPrepared = null;
+    this.lastPrepareReport = null;
     this.state = null;
+    this.autoPrepareBroken = false;
+    this.prepareScheduled = false;
     this.sortedOnce = false;
     this.warnedMultiMesh = false;
     this.preparing = false;
@@ -1371,15 +1377,16 @@ class WebGpuSplatBackend {
     this.frames++;
     const mesh = this.findSplatMesh(scene);
     const src = mesh ? this.resolveSource(spark, mesh) : null;
-    if (!mesh || !src || src.numSplats === 0 || this.preparing) {
-      spark.activeSplats = 0;
-      spark.geometry.instanceCount = 0;
-      if (this.state) this.state.drawInstances = 0;
-      return false;
+    if (!mesh || !src || src.numSplats === 0 || this.preparing || this.prepareScheduled) {
+      return this.drawNothing(spark);
     }
     this.sortRadial = spark.sortRadial ?? true;
     let rebuilt = false;
     if (this.needsRebuild || !this.stateMatches(mesh, src)) {
+      if (this.prepareNewStates && !this.autoPrepareBroken && !this.needsRebuild && (!this.state || this.state.mesh !== mesh || !this.sortedOnce)) {
+        this.schedulePrepare(spark, mesh, scene, camera);
+        return this.drawNothing(spark);
+      }
       this.buildState(spark, mesh, src);
       rebuilt = true;
       this.rebuilds++;
@@ -1469,12 +1476,64 @@ class WebGpuSplatBackend {
    * isReady check; a compile that hung before that point is created
    * synchronously by the first frame). report.ok is false on any of it.
    */
-  async prepare({
+  async prepare(options) {
+    var _a;
+    const report = await this.prepareOnce(options);
+    if (report.reason !== "busy" && report.reason !== "empty") {
+      this.lastPrepareReport = report;
+      try {
+        (_a = this.onPrepared) == null ? void 0 : _a.call(this, report);
+      } catch (e) {
+        console.warn("[splat] onPrepared threw", e);
+      }
+    }
+    return report;
+  }
+  /** [full-3b] a prepare() is scheduled or running: nothing is drawn yet. */
+  get isPreparing() {
+    return this.preparing || this.prepareScheduled;
+  }
+  // update()'s draw-nothing path (no mesh / empty cut / prepare pending)
+  drawNothing(spark) {
+    spark.activeSplats = 0;
+    spark.geometry.instanceCount = 0;
+    if (this.state) this.state.drawInstances = 0;
+    return false;
+  }
+  // [full-3b] update() met a mesh it has no state for (prepareNewStates):
+  // prepare it right AFTER this frame - never inside it: update() runs within
+  // renderer.render(), and compileAsync resets the render list of the very
+  // scene + camera being drawn. Until prepare() starts, prepareScheduled keeps
+  // update() drawing nothing; prepare() itself then sets `preparing`.
+  schedulePrepare(spark, mesh, scene, camera) {
+    this.prepareScheduled = true;
+    setTimeout(() => {
+      this.prepareScheduled = false;
+      this.prepare({
+        spark,
+        mesh,
+        scene,
+        camera,
+        // shorter than an explicit prepare's: a host's loading overlay waits
+        // for the first drawn splats, and past this the old in-frame compile
+        // (a freeze, but a drawn scene) is the better outcome
+        timeoutMs: PREPARE_SCHEDULED_TIMEOUT_MS
+      }).then((report) => {
+        var _a;
+        if (!report.ok && report.reason !== "empty" && report.reason !== "busy") {
+          this.autoPrepareBroken = true;
+        }
+        (_a = spark.setDirty) == null ? void 0 : _a.call(spark);
+      });
+    }, 0);
+  }
+  async prepareOnce({
     spark,
     mesh,
     scene,
     camera,
-    onProgress
+    onProgress,
+    timeoutMs = PREPARE_PIPELINE_TIMEOUT_MS
   }) {
     var _a;
     const t0 = nowMs();
@@ -1554,7 +1613,7 @@ class WebGpuSplatBackend {
         this.dryRunCompute(renderer, node, jobs);
         progress();
       }
-      await this.settleJobs(device, jobs);
+      await this.settleJobs(device, jobs, timeoutMs);
       report.asyncComputePipelines = jobs.length;
       report.syncFallbacks = jobs.filter((j) => j.fellBack).length;
       if (jobs.some((j) => !j.slot.pipeline)) {
@@ -1573,7 +1632,7 @@ class WebGpuSplatBackend {
         } finally {
           spark.material = this.placeholderMaterial;
         }
-        report.renderCompiled = await settleWithin(compiling, PREPARE_PIPELINE_TIMEOUT_MS);
+        report.renderCompiled = await settleWithin(compiling, timeoutMs);
         if (!report.renderCompiled) {
           report.reason = "failed";
           report.error = "the draw pipeline compile failed or did not settle in time";
@@ -1592,7 +1651,7 @@ class WebGpuSplatBackend {
       }
     } finally {
       if (device && jobs.some((j) => !j.done)) {
-        await this.settleJobs(device, jobs).catch(() => {
+        await this.settleJobs(device, jobs, timeoutMs).catch(() => {
         });
       }
       if (placeholderOn && this.state) spark.material = this.state.material;
@@ -1730,13 +1789,13 @@ class WebGpuSplatBackend {
   // Wait for every async pipeline; whatever has not settled in time is
   // created synchronously (the pre-[full-3] behaviour), so no slot is ever
   // left empty when the guard lifts.
-  async settleJobs(device, jobs) {
+  async settleJobs(device, jobs, timeoutMs) {
     let timer;
     await Promise.race([
       Promise.all(jobs.map((j) => j.settled.catch(() => {
       }))),
       new Promise((resolve) => {
-        timer = setTimeout(resolve, PREPARE_PIPELINE_TIMEOUT_MS);
+        timer = setTimeout(resolve, timeoutMs);
       })
     ]);
     clearTimeout(timer);
