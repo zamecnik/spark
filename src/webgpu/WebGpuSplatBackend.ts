@@ -198,6 +198,8 @@ type SparkRendererLike = THREE.Mesh & {
   clipXY: number;
   focalAdjustment: number;
   renderSize: THREE.Vector2;
+  // [full-3b] the render-on-demand wake-up after a scheduled prepare
+  setDirty?: () => void;
   lodInstances?: Map<unknown, LodInstanceLike>;
 };
 
@@ -466,6 +468,9 @@ type AsyncPipelineJob = {
 // A pipeline promise that has not settled after this long is created the old
 // (synchronous) way instead: prepare() must never strand a loading screen.
 const PREPARE_PIPELINE_TIMEOUT_MS = 30000;
+// [full-3b] the same for a prepare the backend scheduled itself (the host's
+// overlay is waiting for the first drawn splats - 15 s on the streamed path)
+const PREPARE_SCHEDULED_TIMEOUT_MS = 8000;
 // Splats per bounds-scan chunk between two yields.
 const PREPARE_BOUNDS_CHUNK = 1 << 20;
 
@@ -658,7 +663,31 @@ export class WebGpuSplatBackend {
   // per scene — watch it via ?splatdebug state().webgpu.rebuilds.
   rebuilds = 0;
 
+  //   prepareNewStates - [full-3b] when update() meets a mesh it has NO state
+  //                    for (the first build of a scene - on the streamed path
+  //                    the first cut, which only exists inside the render
+  //                    loop), it does not build + compile synchronously: it
+  //                    schedules prepare() for right after this frame and draws
+  //                    nothing until it settles (the host's loading screen is
+  //                    up then: activeSplats stays 0). Measured on the streamed
+  //                    4.6M scene: the synchronous first build blocked Chrome's
+  //                    UI thread for 1,054 ms. A rebuild of the SAME mesh
+  //                    (capacity growth - designed out, the gates assert one
+  //                    build per scene - or the SH pools arriving) stays
+  //                    synchronous: it would otherwise blank a visible scene.
+  //                    Off by default (hosts opt in); after one failed prepare
+  //                    it stays off for this backend (the old path).
+  prepareNewStates = false;
+  // Called after every prepare() (explicit or scheduled) with its report.
+  onPrepared: ((report: WebGpuSplatPrepareReport) => void) | null = null;
+  // The last prepare()'s report (telemetry / HUD / harness).
+  lastPrepareReport: WebGpuSplatPrepareReport | null = null;
+
   private state: MeshState | null = null;
+  // [full-3b] a scheduled prepare failed: new states build synchronously
+  private autoPrepareBroken = false;
+  // [full-3b] update() scheduled a prepare() that has not started yet
+  private prepareScheduled = false;
   private sortedOnce = false;
   private warnedMultiMesh = false;
   // [full-3] prepare() in flight: update() dispatches and draws nothing (an
@@ -690,11 +719,14 @@ export class WebGpuSplatBackend {
 
     const mesh = this.findSplatMesh(scene);
     const src = mesh ? this.resolveSource(spark, mesh) : null;
-    if (!mesh || !src || src.numSplats === 0 || this.preparing) {
-      spark.activeSplats = 0;
-      (spark.geometry as THREE.InstancedBufferGeometry).instanceCount = 0;
-      if (this.state) this.state.drawInstances = 0;
-      return false;
+    if (
+      !mesh ||
+      !src ||
+      src.numSplats === 0 ||
+      this.preparing ||
+      this.prepareScheduled
+    ) {
+      return this.drawNothing(spark);
     }
 
     // sync BEFORE buildState — the keygen kernel bakes the metric choice
@@ -702,6 +734,18 @@ export class WebGpuSplatBackend {
 
     let rebuilt = false;
     if (this.needsRebuild || !this.stateMatches(mesh, src)) {
+      // [full-3b] a mesh with no state yet - or a state never drawn (its
+      // source changed identity while it was being prepared): prepare it off
+      // this frame. A drawn state of the same mesh rebuilds in-frame below.
+      if (
+        this.prepareNewStates &&
+        !this.autoPrepareBroken &&
+        !this.needsRebuild &&
+        (!this.state || this.state.mesh !== mesh || !this.sortedOnce)
+      ) {
+        this.schedulePrepare(spark, mesh, scene, camera);
+        return this.drawNothing(spark);
+      }
       this.buildState(spark, mesh, src);
       rebuilt = true;
       this.rebuilds++;
@@ -829,18 +873,91 @@ export class WebGpuSplatBackend {
    * isReady check; a compile that hung before that point is created
    * synchronously by the first frame). report.ok is false on any of it.
    */
-  async prepare({
+  async prepare(options: {
+    spark: SparkRendererLike;
+    mesh: SplatMeshLike;
+    scene: THREE.Scene;
+    camera: THREE.Camera;
+    onProgress?: (done: number, total: number) => void;
+    /** per pipeline step (compute settle, draw compile); default 30 s */
+    timeoutMs?: number;
+  }): Promise<WebGpuSplatPrepareReport> {
+    const report = await this.prepareOnce(options);
+    // "another prepare runs" / "nothing to prepare" are not results
+    if (report.reason !== "busy" && report.reason !== "empty") {
+      this.lastPrepareReport = report;
+      try {
+        this.onPrepared?.(report);
+      } catch (e) {
+        console.warn("[splat] onPrepared threw", e);
+      }
+    }
+    return report;
+  }
+
+  /** [full-3b] a prepare() is scheduled or running: nothing is drawn yet. */
+  get isPreparing(): boolean {
+    return this.preparing || this.prepareScheduled;
+  }
+
+  // update()'s draw-nothing path (no mesh / empty cut / prepare pending)
+  private drawNothing(spark: SparkRendererLike): boolean {
+    spark.activeSplats = 0;
+    (spark.geometry as THREE.InstancedBufferGeometry).instanceCount = 0;
+    if (this.state) this.state.drawInstances = 0;
+    return false;
+  }
+
+  // [full-3b] update() met a mesh it has no state for (prepareNewStates):
+  // prepare it right AFTER this frame - never inside it: update() runs within
+  // renderer.render(), and compileAsync resets the render list of the very
+  // scene + camera being drawn. Until prepare() starts, prepareScheduled keeps
+  // update() drawing nothing; prepare() itself then sets `preparing`.
+  private schedulePrepare(
+    spark: SparkRendererLike,
+    mesh: SplatMeshLike,
+    scene: THREE.Scene,
+    camera: THREE.Camera,
+  ): void {
+    this.prepareScheduled = true;
+    setTimeout(() => {
+      this.prepareScheduled = false;
+      this.prepare({
+        spark,
+        mesh,
+        scene,
+        camera,
+        // shorter than an explicit prepare's: a host's loading overlay waits
+        // for the first drawn splats, and past this the old in-frame compile
+        // (a freeze, but a drawn scene) is the better outcome
+        timeoutMs: PREPARE_SCHEDULED_TIMEOUT_MS,
+      }).then((report) => {
+        // anything but "the cut emptied meanwhile" / "another prepare runs":
+        // the old synchronous build from now on (never a re-schedule loop)
+        if (!report.ok && report.reason !== "empty" && report.reason !== "busy") {
+          this.autoPrepareBroken = true;
+        }
+        // wake a render-on-demand host: nothing else asks for the frame that
+        // draws the prepared state (its loop may have gone idle meanwhile)
+        spark.setDirty?.();
+      });
+    }, 0);
+  }
+
+  private async prepareOnce({
     spark,
     mesh,
     scene,
     camera,
     onProgress,
+    timeoutMs = PREPARE_PIPELINE_TIMEOUT_MS,
   }: {
     spark: SparkRendererLike;
     mesh: SplatMeshLike;
     scene: THREE.Scene;
     camera: THREE.Camera;
     onProgress?: (done: number, total: number) => void;
+    timeoutMs?: number;
   }): Promise<WebGpuSplatPrepareReport> {
     const t0 = nowMs();
     const report: WebGpuSplatPrepareReport = {
@@ -941,7 +1058,7 @@ export class WebGpuSplatBackend {
         this.dryRunCompute(renderer, node, jobs);
         progress();
       }
-      await this.settleJobs(device, jobs);
+      await this.settleJobs(device, jobs, timeoutMs);
       report.asyncComputePipelines = jobs.length;
       report.syncFallbacks = jobs.filter((j) => j.fellBack).length;
       if (jobs.some((j) => !j.slot.pipeline)) {
@@ -973,7 +1090,7 @@ export class WebGpuSplatBackend {
         } finally {
           spark.material = this.placeholderMaterial;
         }
-        report.renderCompiled = await settleWithin(compiling, PREPARE_PIPELINE_TIMEOUT_MS);
+        report.renderCompiled = await settleWithin(compiling, timeoutMs);
         if (!report.renderCompiled) {
           report.reason = "failed";
           report.error = "the draw pipeline compile failed or did not settle in time";
@@ -997,7 +1114,7 @@ export class WebGpuSplatBackend {
     } finally {
       // never leave a pipeline slot pending behind the guard
       if (device && jobs.some((j) => !j.done)) {
-        await this.settleJobs(device, jobs).catch(() => {});
+        await this.settleJobs(device, jobs, timeoutMs).catch(() => {});
       }
       if (placeholderOn && this.state) spark.material = this.state.material;
       this.preparing = false;
@@ -1173,12 +1290,16 @@ export class WebGpuSplatBackend {
   // Wait for every async pipeline; whatever has not settled in time is
   // created synchronously (the pre-[full-3] behaviour), so no slot is ever
   // left empty when the guard lifts.
-  private async settleJobs(device: GPUDevice, jobs: AsyncPipelineJob[]): Promise<void> {
+  private async settleJobs(
+    device: GPUDevice,
+    jobs: AsyncPipelineJob[],
+    timeoutMs: number,
+  ): Promise<void> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([
       Promise.all(jobs.map((j) => j.settled.catch(() => {}))),
       new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, PREPARE_PIPELINE_TIMEOUT_MS);
+        timer = setTimeout(resolve, timeoutMs);
       }),
     ]);
     clearTimeout(timer);
