@@ -85,6 +85,34 @@ export interface SsogLodControllerOptions {
     sseDwellMs?: number;
     /** [ssog-23] sse: viewport height in CSS pixels (default 1080; see setViewportHeight) */
     viewportHeightPx?: number;
+    /**
+     * [ssog-32] sse: per-UNIT error blend α ∈ [0, 1]. 0 (default) = the
+     * [ssog-23] rule, byte-identical: one error per LEVEL, err1·sqrt(2)^(l−1)
+     * from the scene-median L0 spacing. α > 0 = each (leaf, level) error is
+     * uniform_l^(1−α) · unit_l^α, where unit_l = 0.5·sqrt(Σext² / Σrows) over
+     * the leaves whose level-l rows share that leaf's level-l unit (every leaf
+     * of a unit gets the same value, so a unit's leaves still decide on
+     * distance alone). A sparse unit (a far, thin area) then has a larger
+     * error and goes coarse sooner; a dense one stays fine longer. Viewme
+     * LOD-quality plan 2026-09-28, C3: α = 0.5 measured best whole-frame.
+     */
+    sseErrorBlend?: number;
+    /**
+     * [ssog-33] target focus g (sse + graded budget, and only while an
+     * interest point is set - the orbit target, see setInterest): when the
+     * e-px cut does not fit the budget/pool, the tolerance search relaxes a
+     * leaf whose closest point lies t > R from the interest point FASTER than
+     * the subject: shift·(1 + g·log2(t/R)) levels instead of shift, R =
+     * focusRadius × the camera-to-interest distance. The budget then comes
+     * from the periphery (far field, and the foreground away from the
+     * target) before the subject; when the 2 px cut fits (shift 0) nothing
+     * changes. 0 (default) = off, byte-identical. Viewme owner report
+     * 2026-09-29 after [ssog-32]: far regions too good, the subject at the
+     * orbit target rough and re-levelling as the camera moves.
+     */
+    focusStrength?: number;
+    /** [ssog-33] focus radius R as a fraction of the camera-to-interest distance (default 0.25) */
+    focusRadius?: number;
 }
 export declare class SsogLodController {
     readonly mesh: SplatMesh;
@@ -238,6 +266,26 @@ export declare class SsogLodController {
      * re-levels every leaf per step with one add + floor instead of a log.
      */
     private readonly levelPos;
+    /** [ssog-32] per-unit error blend α in force (0 = the uniform [ssog-23] rule) */
+    private sseErrorBlend;
+    /** [ssog-32] scene-median L0 spacing (mesh-local), the uniform half of the blend */
+    private readonly sseS0;
+    /**
+     * [ssog-32] per-(leaf, level) error as a LEVEL POSITION, NL·L:
+     * log(err[li,l]) / log(sqrt2). Level l is acceptable for a leaf whose
+     * levelPos (log(db/c)/log(sqrt2), c = uniformScale·f_px/e) plus the
+     * tolerance shift is >= this value, i.e. err·c/db <= e·sqrt2^shift. null
+     * while sseErrorBlend is 0 — the legacy level math runs untouched then.
+     * The [ssog-23] rule is the special case errPos[l] = l − 1 relative to d0.
+     */
+    private errPos;
+    /** [ssog-33] target focus strength g (0 = off) and radius (fraction of the camera-to-interest distance) */
+    private focusStrength;
+    private focusRadius;
+    /** [ssog-33] per-tick scratch: each leaf's relaxation multiplier (allocated on first use) */
+    private focusMul;
+    /** [ssog-34] subject radius (mesh-local) of the last selection: focusRadius × |camera − interest|; −1 = none */
+    private subjectR;
     /**
      * [ssog-31] EFFECTIVE tolerance (e·m, CSS px) the previous tick settled
      * at, the anchor of the next search — stored in px, not as the grid
@@ -336,6 +384,13 @@ export declare class SsogLodController {
         subjectDeferrals: number;
         /** [ssog-23] L1 geometric error (mesh-local units) the sse mode calibrated */
         sseErr1: number;
+        /** [ssog-32] per-unit error blend α in force (0 = uniform per-level error) */
+        sseErrorBlend: number;
+        /** [ssog-33] target focus strength / radius in force */
+        focusStrength: number;
+        focusRadius: number;
+        /** [ssog-33] true when the last selection applied the focus (interest set, sse + graded, g > 0) */
+        focusActive: boolean;
         /** [ssog-23] error tolerance (CSS px) the last selection ran at */
         sseErrorPx: number;
         /** [ssog-23] "base" while moving / before dwell, "fine" at rest */
@@ -429,6 +484,21 @@ export declare class SsogLodController {
      * flip retry is queued behind the WebGL2 sort backpressure.
      */
     get isConverged(): boolean;
+    /**
+     * [ssog-34] Share of the SUBJECT's target detail on screen, for a host's
+     * reveal ("show the scene once the place at the camera target is mostly
+     * sharp"): Σ min(shown rows, target rows) / Σ target rows over the leaves
+     * whose closest point lies within focusRadius × |camera − interest| of
+     * the interest point (the same subject the [ssog-33] focus protects;
+     * tBucket and the radius come from the last selection, the target is the
+     * current balanced cut, shown = the displayed level, a reveal hole = 0).
+     * Rows halve per level, so 0.75 ≈ half the subject final and the rest one
+     * level short. −1 when it cannot be judged: no interest point, before the
+     * first selection or during the reveal phase, while a fetch hold is armed
+     * (the target is for a pose the camera is still flying to), or no leaf
+     * within the radius. O(leaves) per call.
+     */
+    subjectProgress(): number;
     /** Detach-only stop (pano roundtrip): state stays warm for reattach. */
     detach(): void;
     attach(): void;
@@ -461,6 +531,30 @@ export declare class SsogLodController {
     private static clampBehindPenalty;
     /** [ssog-31] graded budget on/off (see the option); takes effect next tick. */
     setGradedBudget(on: boolean): void;
+    /** [ssog-33] target focus strength g and radius (see the options); takes effect next tick. */
+    setFocus(strength: number, radius?: number): void;
+    private applyFocus;
+    /** [ssog-32] per-unit error blend α (see the option); takes effect next tick. */
+    setSseErrorBlend(alpha: number): void;
+    private applySseErrorBlend;
+    /**
+     * [ssog-32] the blended per-(leaf, level) error table as level positions
+     * (see errPos). Per-unit error: unit_l = 0.5·sqrt(Σext² / Σrows) over the
+     * PRE-resolution refs sharing the unit (ext = the leaf's max box extent).
+     * A GAP level (no rows, at or below the leaf's coarsest real level) shows
+     * the rows SsogModel resolves it to (nearest real level, tie → coarser),
+     * so it carries that level's error — a missing entry must never read as
+     * 0 error (Viewme sim: that bug scattered 15–17% of the 20M's levels).
+     * The empty suffix past the coarsest real level draws nothing of this
+     * leaf; it gets max(extrapolated ·sqrt2 per level, 0.5·ext) so it is
+     * chosen only where the leaf is sub-pixel anyway. Then each level blends
+     * with the uniform rule: err = uniform_l^(1−α) · unit_l^α (uniform_l =
+     * 0.5·s0·sqrt2^l). Matches the Viewme sim `SIM_ERR=blend` and the table
+     * `tools/ssog-quality/geotable.mjs` rendered (α = 0.5).
+     */
+    private buildErrPos;
+    /** [ssog-32] coarsest level l >= 1 with errPos[li,l] <= x, else 0 */
+    private levelAtPos;
     /**
      * [ssog-25] Orbit-centric ordering. `point` is the camera's ORBIT TARGET in
      * WORLD space (converted into the mesh frame with the same matrix the

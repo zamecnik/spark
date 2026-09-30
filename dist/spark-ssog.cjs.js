@@ -1345,6 +1345,12 @@ class SsogLodController {
     this.chunkLastNeeded = /* @__PURE__ */ new Map();
     this.chunkRefs = /* @__PURE__ */ new Map();
     this.everDisplayed = /* @__PURE__ */ new Set();
+    this.sseErrorBlend = 0;
+    this.errPos = null;
+    this.focusStrength = 0;
+    this.focusRadius = 0.25;
+    this.focusMul = null;
+    this.subjectR = -1;
     this.tolPxAnchor = 0;
     this.priorityChunks = /* @__PURE__ */ new Set();
     this.lastPose = {
@@ -1416,6 +1422,13 @@ class SsogLodController {
       subjectDeferrals: 0,
       /** [ssog-23] L1 geometric error (mesh-local units) the sse mode calibrated */
       sseErr1: 0,
+      /** [ssog-32] per-unit error blend α in force (0 = uniform per-level error) */
+      sseErrorBlend: 0,
+      /** [ssog-33] target focus strength / radius in force */
+      focusStrength: 0,
+      focusRadius: 0.25,
+      /** [ssog-33] true when the last selection applied the focus (interest set, sse + graded, g > 0) */
+      focusActive: false,
       /** [ssog-23] error tolerance (CSS px) the last selection ran at */
       sseErrorPx: 0,
       /** [ssog-23] "base" while moving / before dwell, "fine" at rest */
@@ -1536,10 +1549,13 @@ class SsogLodController {
       }
       spacings.sort((a, b) => a - b);
       const s0 = spacings.length > 0 ? spacings[spacings.length >> 1] : 1;
+      this.sseS0 = s0;
       this.sseErr1 = 0.5 * s0 * Math.SQRT2;
       this.stats.sseErr1 = this.sseErr1;
       this.stats.lodMode = this.lodMode;
     }
+    this.applySseErrorBlend(options.sseErrorBlend);
+    this.applyFocus(options.focusStrength, options.focusRadius);
     this.cut = new Uint32Array(this.splats.capacitySplats);
     const pinned = [];
     for (let u = 0; u < model.numUnits; u++) {
@@ -1688,6 +1704,39 @@ class SsogLodController {
   get isConverged() {
     return this.phase === "run" && this.converged && !this.flipRetryPending;
   }
+  /**
+   * [ssog-34] Share of the SUBJECT's target detail on screen, for a host's
+   * reveal ("show the scene once the place at the camera target is mostly
+   * sharp"): Σ min(shown rows, target rows) / Σ target rows over the leaves
+   * whose closest point lies within focusRadius × |camera − interest| of
+   * the interest point (the same subject the [ssog-33] focus protects;
+   * tBucket and the radius come from the last selection, the target is the
+   * current balanced cut, shown = the displayed level, a reveal hole = 0).
+   * Rows halve per level, so 0.75 ≈ half the subject final and the rest one
+   * level short. −1 when it cannot be judged: no interest point, before the
+   * first selection or during the reveal phase, while a fetch hold is armed
+   * (the target is for a pose the camera is still flying to), or no leaf
+   * within the radius. O(leaves) per call.
+   */
+  subjectProgress() {
+    if (!this.interest || this.phase !== "run" || this.fetchHold || !(this.subjectR > 0)) {
+      return -1;
+    }
+    const lods = this.splats.model.leafLods;
+    const L = this.L;
+    const R = this.subjectR;
+    let target = 0;
+    let shown = 0;
+    for (let li = 0; li < this.NL; li++) {
+      if (this.tBucket[li] > R) {
+        continue;
+      }
+      const t = lods[(li * L + this.balancedLevel[li]) * 3 + 2];
+      target += t;
+      shown += Math.min(t, this.displayedCount(li));
+    }
+    return target > 0 ? shown / target : -1;
+  }
   /** Detach-only stop (pano roundtrip): state stays warm for reattach. */
   detach() {
     this.detached = true;
@@ -1747,6 +1796,137 @@ class SsogLodController {
     this.gradedBudget = next;
     this.stats.gradedBudget = next;
     this.paramsDirty = true;
+  }
+  /** [ssog-33] target focus strength g and radius (see the options); takes effect next tick. */
+  setFocus(strength, radius) {
+    const s0 = this.focusStrength;
+    const r0 = this.focusRadius;
+    this.applyFocus(strength, radius ?? this.focusRadius);
+    if (this.focusStrength !== s0 || this.focusRadius !== r0) {
+      this.paramsDirty = true;
+    }
+  }
+  applyFocus(strength, radius) {
+    this.focusStrength = typeof strength === "number" && Number.isFinite(strength) ? Math.min(8, Math.max(0, strength)) : 0;
+    this.focusRadius = typeof radius === "number" && Number.isFinite(radius) && radius > 0 ? Math.min(100, radius) : 0.25;
+    this.stats.focusStrength = this.focusStrength;
+    this.stats.focusRadius = this.focusRadius;
+  }
+  /** [ssog-32] per-unit error blend α (see the option); takes effect next tick. */
+  setSseErrorBlend(alpha) {
+    const before = this.sseErrorBlend;
+    this.applySseErrorBlend(alpha);
+    if (this.sseErrorBlend !== before) {
+      this.paramsDirty = true;
+    }
+  }
+  applySseErrorBlend(alpha) {
+    const a = typeof alpha === "number" && Number.isFinite(alpha) ? Math.min(1, Math.max(0, alpha)) : 0;
+    this.sseErrorBlend = a;
+    this.stats.sseErrorBlend = a;
+    this.errPos = a > 0 ? this.buildErrPos(a) : null;
+  }
+  /**
+   * [ssog-32] the blended per-(leaf, level) error table as level positions
+   * (see errPos). Per-unit error: unit_l = 0.5·sqrt(Σext² / Σrows) over the
+   * PRE-resolution refs sharing the unit (ext = the leaf's max box extent).
+   * A GAP level (no rows, at or below the leaf's coarsest real level) shows
+   * the rows SsogModel resolves it to (nearest real level, tie → coarser),
+   * so it carries that level's error — a missing entry must never read as
+   * 0 error (Viewme sim: that bug scattered 15–17% of the 20M's levels).
+   * The empty suffix past the coarsest real level draws nothing of this
+   * leaf; it gets max(extrapolated ·sqrt2 per level, 0.5·ext) so it is
+   * chosen only where the leaf is sub-pixel anyway. Then each level blends
+   * with the uniform rule: err = uniform_l^(1−α) · unit_l^α (uniform_l =
+   * 0.5·s0·sqrt2^l). Matches the Viewme sim `SIM_ERR=blend` and the table
+   * `tools/ssog-quality/geotable.mjs` rendered (α = 0.5).
+   */
+  buildErrPos(alpha) {
+    const model = this.splats.model;
+    const L = this.L;
+    const NL = this.NL;
+    const pre = model.leafLodsPre;
+    const b = model.boundsFlat;
+    const ext = new Float64Array(NL);
+    for (let li = 0; li < NL; li++) {
+      const o = li * 6;
+      ext[li] = Math.max(b[o + 3] - b[o], b[o + 4] - b[o + 1], b[o + 5] - b[o + 2]);
+    }
+    const sumExt2 = new Float64Array(model.numUnits);
+    const sumRows = new Float64Array(model.numUnits);
+    const real = (li, l) => pre[(li * L + l) * 3] >= 0 && pre[(li * L + l) * 3 + 2] > 0;
+    for (let li = 0; li < NL; li++) {
+      for (let l = 0; l < L; l++) {
+        if (!real(li, l)) {
+          continue;
+        }
+        const u = pre[(li * L + l) * 3];
+        sumExt2[u] += ext[li] * ext[li];
+        sumRows[u] += pre[(li * L + l) * 3 + 2];
+      }
+    }
+    const unitErr = new Float64Array(L);
+    const out = new Float64Array(NL * L);
+    const s0 = this.sseS0;
+    const logM = Math.log(Math.SQRT2);
+    const floorErr = 1e-9 * Math.max(s0, 1e-9);
+    for (let li = 0; li < NL; li++) {
+      let coarsest = 0;
+      for (let l = 0; l < L; l++) {
+        if (real(li, l)) {
+          coarsest = l;
+        }
+      }
+      unitErr.fill(0);
+      for (let l = 1; l <= coarsest; l++) {
+        if (real(li, l)) {
+          const u = pre[(li * L + l) * 3];
+          unitErr[l] = 0.5 * Math.sqrt(sumExt2[u] / sumRows[u]);
+        }
+      }
+      for (let l = 1; l <= coarsest; l++) {
+        if (real(li, l)) {
+          continue;
+        }
+        let best = -1;
+        for (let a = 0; a <= coarsest; a++) {
+          if (!real(li, a)) {
+            continue;
+          }
+          const da = Math.abs(a - l);
+          const db = Math.abs(best - l);
+          if (best < 0 || da < db || da === db && a > best) {
+            best = a;
+          }
+        }
+        unitErr[l] = best >= 0 ? unitErr[best] : 0.5 * ext[li];
+      }
+      for (let l = coarsest + 1; l < L; l++) {
+        unitErr[l] = Math.max(
+          unitErr[coarsest] * Math.SQRT2 ** (l - coarsest),
+          0.5 * ext[li]
+        );
+      }
+      const o = li * L;
+      out[o] = Number.NEGATIVE_INFINITY;
+      for (let l = 1; l < L; l++) {
+        const uniform = 0.5 * s0 * Math.SQRT2 ** l;
+        const err = uniform ** (1 - alpha) * unitErr[l] ** alpha;
+        out[o + l] = Math.log(Math.max(floorErr, err)) / logM;
+      }
+    }
+    return out;
+  }
+  /** [ssog-32] coarsest level l >= 1 with errPos[li,l] <= x, else 0 */
+  levelAtPos(li, x) {
+    const t = this.errPos;
+    const o = li * this.L;
+    for (let l = this.L - 1; l >= 1; l--) {
+      if (t[o + l] <= x) {
+        return l;
+      }
+    }
+    return 0;
   }
   /**
    * [ssog-25] Orbit-centric ordering. `point` is the camera's ORBIT TARGET in
@@ -2330,6 +2510,8 @@ class SsogLodController {
     const d0 = sse ? sseD0 : this.lodBaseDistance * this.budgetScale;
     const mPrime = sse ? Math.SQRT2 : Math.max(1.2, 3 * this.budgetScale ** -0.2);
     const logM = Math.log(mPrime);
+    const errPos = sse ? this.errPos : null;
+    const dRef = errPos ? sseD0 / this.sseErr1 : d0;
     const rb = model.rootBound;
     const cx = (rb.min[0] + rb.max[0]) / 2;
     const cy = (rb.min[1] + rb.max[1]) / 2;
@@ -2375,9 +2557,9 @@ class SsogLodController {
         63,
         Math.floor(64 * Math.sqrt(db) / sqrtDMax)
       );
-      const pos = db > 0 ? Math.log(db / d0) / logM : Number.NEGATIVE_INFINITY;
+      const pos = db > 0 ? Math.log(db / dRef) / logM : Number.NEGATIVE_INFINITY;
       this.levelPos[li] = pos;
-      let lvl = db <= d0 ? 0 : 1 + Math.floor(pos);
+      let lvl = errPos ? this.levelAtPos(li, pos) : db <= d0 ? 0 : 1 + Math.floor(pos);
       if (lvl < 0) {
         lvl = 0;
       }
@@ -2413,6 +2595,24 @@ class SsogLodController {
     }
     let tolShift = 0;
     let tolSteps = 0;
+    this.subjectR = interest ? Math.max(
+      1e-6,
+      this.focusRadius * Math.hypot(cam.x - interest.x, cam.y - interest.y, cam.z - interest.z)
+    ) : -1;
+    let focusMul = null;
+    if (sse && this.gradedBudget && interest && this.focusStrength > 0) {
+      const R = this.subjectR;
+      const g = this.focusStrength;
+      if (!this.focusMul) {
+        this.focusMul = new Float64Array(NL);
+      }
+      focusMul = this.focusMul;
+      for (let li = 0; li < NL; li++) {
+        const t = this.tBucket[li];
+        focusMul[li] = t > R ? 1 + g * Math.log2(t / R) : 1;
+      }
+    }
+    this.stats.focusActive = focusMul !== null;
     if (sse && this.gradedBudget) {
       const K = 256;
       const pageSlack = wholeResident ? 0 : Math.max(1, Math.round(0.04 * pageLimit));
@@ -2421,8 +2621,8 @@ class SsogLodController {
         const shift = k2 / 4;
         let total = 0;
         for (let li = 0; li < NL; li++) {
-          const x = this.levelPos[li] + shift;
-          let lvl = x <= 0 ? 0 : 1 + Math.floor(x);
+          const x = this.levelPos[li] + (focusMul ? shift * focusMul[li] : shift);
+          let lvl = errPos ? this.levelAtPos(li, x) : x <= 0 ? 0 : 1 + Math.floor(x);
           if (lvl >= L) {
             lvl = L - 1;
           }
