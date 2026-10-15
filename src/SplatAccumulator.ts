@@ -1,3 +1,4 @@
+// Modified by Kroscloud, 2026 — see FORK-CHANGES.md [fov-2]
 import * as THREE from "three";
 import { FullScreenQuad } from "three/addons/postprocessing/Pass.js";
 import { Readback } from "./Readback";
@@ -61,7 +62,18 @@ export class SplatAccumulator {
   viewToWorld = new THREE.Matrix4();
   viewOrigin = new THREE.Vector3();
   viewDirection = new THREE.Vector3();
+  // Kroscloud fork [fov-2]: the point the PACKED accumulator's centres are
+  // stored relative to (fp16(center - accumOrigin)); SparkRenderer draws them
+  // through T(accumOrigin), composed in float64. Upstream stores them relative
+  // to the camera (viewOrigin), whose fp16 step is ~2^-11 of the distance -
+  // about 2^-11 * focal px on screen whatever the distance: 0.6 px at a 50 deg
+  // FOV, 30 px at 1 deg, where every splat snapped to a coarse lattice. Equals
+  // viewOrigin unless prepareGenerate is handed another origin (the focus
+  // rule in SparkRenderer.accumulatorOrigin). Unused by ExtSplats, which store
+  // world-space float32 centres.
+  accumOrigin = new THREE.Vector3();
   static viewCenterUniform = new DynoVec3({ value: new THREE.Vector3() });
+  static accumOriginUniform = new DynoVec3({ value: new THREE.Vector3() });
   static viewDirUniform = new DynoVec3({ value: new THREE.Vector3() });
   static sortRadialUniform = new DynoBool({ value: true });
   maxSplats = 0;
@@ -251,9 +263,11 @@ export class SplatAccumulator {
           } else {
             if (!this.covSplats) {
               if (generator) {
+                // [fov-2] stored relative to accumOrigin (the depth key
+                // below stays relative to the camera)
                 const centerSubView = sub(
                   splitGsplat(generator.outputs.gsplat).outputs.center,
-                  SplatAccumulator.viewCenterUniform,
+                  SplatAccumulator.accumOriginUniform,
                 );
                 // Use expanded LoD opacity encoding
                 const halfAlpha = mul(
@@ -284,7 +298,7 @@ export class SplatAccumulator {
               }
               const centerSubView = sub(
                 splitCovSplat(covsplat).outputs.center,
-                SplatAccumulator.viewCenterUniform,
+                SplatAccumulator.accumOriginUniform,
               );
               const halfAlpha = mul(
                 splitCovSplat(covsplat).outputs.opacity,
@@ -439,6 +453,7 @@ export class SplatAccumulator {
     renderSize,
     previous,
     lodInstances,
+    accumOrigin,
   }: {
     renderer: THREE.WebGLRenderer;
     scene: THREE.Scene;
@@ -451,11 +466,16 @@ export class SplatAccumulator {
       SplatMesh,
       { numSplats: number; texture: THREE.DataTexture }
     >;
+    // [fov-2] where the packed centres are stored relative to (default: the
+    // camera position, the upstream behaviour)
+    accumOrigin?: THREE.Vector3;
   }) {
     this.viewToWorld.copy(camera.matrixWorld);
     camera.getWorldPosition(this.viewOrigin);
     camera.getWorldDirection(this.viewDirection);
     SplatAccumulator.viewCenterUniform.value.copy(this.viewOrigin);
+    this.accumOrigin.copy(accumOrigin ?? this.viewOrigin);
+    SplatAccumulator.accumOriginUniform.value.copy(this.accumOrigin);
     SplatAccumulator.viewDirUniform.value.copy(this.viewDirection);
     SplatAccumulator.sortRadialUniform.value = sortRadial;
 

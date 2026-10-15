@@ -461,7 +461,21 @@ export class SparkRenderer extends THREE.Mesh {
   sortTimeoutId = -1;
   sortedCenter = new THREE.Vector3().setScalar(Number.NEGATIVE_INFINITY);
   sortedDir = new THREE.Vector3().setScalar(0);
+  // Kroscloud fork [fov-3]: the camera up vector at the last WebGPU sort
+  sortedUp = new THREE.Vector3().setScalar(0);
+  private cameraUp = new THREE.Vector3();
+  private cameraQuat = new THREE.Quaternion();
   readback32 = new Uint32Array(0);
+
+  // Kroscloud fork [fov-2]: the world point the camera is looking at - the
+  // app's orbit target - or a function returning it, evaluated at every
+  // accumulation (null = unknown). The WebGL2 packed accumulator then stores
+  // centres relative to a point on the view axis just short of it
+  // (accumulatorOrigin) instead of relative to the camera, so a telephoto
+  // view (1-2 deg FOV, the nadir camera) keeps sub-pixel centres. A focus at
+  // the eye (first-person) keeps the camera origin. No effect on the WebGPU
+  // backend or ExtSplats.
+  accumFocus: THREE.Vector3 | (() => THREE.Vector3 | null) | null = null;
 
   enableLod: boolean;
   enableDriveLod: boolean;
@@ -875,7 +889,8 @@ export class SparkRenderer extends THREE.Mesh {
 
     const accumToWorld = new THREE.Matrix4();
     if (!this.display.extSplats) {
-      accumToWorld.makeTranslation(spark.display.viewOrigin);
+      // [fov-2] the displayed accumulator's own storage origin
+      accumToWorld.makeTranslation(spark.display.accumOrigin);
     }
     const cameraToWorld = camera.matrixWorld.clone();
     const worldToCamera = cameraToWorld.invert();
@@ -1002,6 +1017,59 @@ export class SparkRenderer extends THREE.Mesh {
   //   this.prefetchMeshesCacheScene = undefined;
   // }
 
+  /**
+   * Kroscloud fork [fov-3]: the cosine of the view-direction change that counts
+   * as viewChanged (re-sort; WebGL2: re-accumulate). Upstream 0.999 (2.56 deg)
+   * is ~5 % of a normal FOV but 2.5 screen widths of a 1 deg one, and two things
+   * follow the view direction: the WebGPU visible-count compact sort (phones)
+   * culls against the frustum at sort time - a look-around under 2.56 deg left
+   * splats missing at the screen edges - and the [fov-2] accumulator origin.
+   * Now min(2.56 deg, 10 % of the narrower half-FOV) for a perspective camera
+   * (the cull keeps a 40 % margin, clipXY 1.4): 2.5 deg at 50 deg, 0.05 deg at
+   * 1 deg. Other projections keep 0.999.
+   */
+  static coorientThreshold(camera: THREE.Camera): number {
+    const e = camera.projectionMatrix.elements;
+    // three's makePerspective: e[11] = -1, e[0] = 1/(aspect tan(fovY/2)),
+    // e[5] = 1/tan(fovY/2) - the larger one belongs to the narrower half-angle
+    if (e[11] !== -1 || !(e[0] > 0) || !(e[5] > 0)) return 0.999;
+    const narrowHalf = Math.atan(1 / Math.max(e[0], e[5]));
+    return Math.cos(Math.min(Math.acos(0.999), 0.1 * narrowHalf));
+  }
+
+  /**
+   * Kroscloud fork [fov-2]: the origin the WebGL2 packed accumulator stores
+   * centres relative to (SplatAccumulator.accumOrigin). Upstream: the camera.
+   * With accumFocus set and a perspective camera: the point on the view axis
+   * k*h short of the focus depth D, h = D tan(fovY/2) the half-height of the
+   * view there and k = 2048 / render height (0.5..4), so on-screen content at
+   * the focus depth lies within ~3h of the origin and its fp16 step stays
+   * ~0.5 px whatever the FOV (stored relative to the camera it is ~2^-11 of
+   * the focal length in px: 0.6 at 50 deg, 30 at 1 deg). At a normal FOV the
+   * point stays near the camera (50 deg at 1080 px: 0.07 D), the upstream
+   * behaviour for near content; it moves out only as the FOV narrows.
+   */
+  private accumulatorOrigin(
+    camera: THREE.Camera,
+    camPos: THREE.Vector3,
+    camDir: THREE.Vector3,
+  ): THREE.Vector3 {
+    const origin = camPos.clone();
+    const focus =
+      typeof this.accumFocus === "function"
+        ? this.accumFocus()
+        : this.accumFocus;
+    const e = camera.projectionMatrix.elements;
+    if (!focus || e[11] !== -1 || !(e[5] > 0)) return origin;
+    const depth = new THREE.Vector3().subVectors(focus, camPos).dot(camDir);
+    if (!(depth > 0) || !Number.isFinite(depth)) return origin;
+    const halfHeight = depth / e[5];
+    const k = Math.min(4, Math.max(0.5, 2048 / Math.max(1, this.renderSize.y)));
+    const along = depth - k * halfHeight;
+    if (along > 0) origin.addScaledVector(camDir, along);
+    return origin;
+  }
+
   private async updateInternal({
     scene,
     camera,
@@ -1019,7 +1087,7 @@ export class SparkRenderer extends THREE.Mesh {
 
     const viewChanged =
       center.distanceTo(this.sortedCenter) > 0.001 ||
-      dir.dot(this.sortedDir) < 0.999;
+      dir.dot(this.sortedDir) < SparkRenderer.coorientThreshold(camera);
 
     // Kroscloud fork: the WebGPU branch replaces generate()+driveSort() with
     // the backend's keygen→GPU-radix-sort→ordered-draw (fork plan §4.2).
@@ -1029,15 +1097,24 @@ export class SparkRenderer extends THREE.Mesh {
     // machinery (mappingVersion pipeline gates) has no equivalent on this
     // branch by design — a new cut draws correctly next frame.
     if (this.webgpuBackend) {
+      // [fov-3] a ROLL (the camera turning about its own view axis) changes
+      // neither the position nor the view direction, but it turns the frustum
+      // the visible-count sort culled against - the nadir camera's autorotate
+      // is exactly that. Compare the up vector too (2.56 deg; roll moves the
+      // frustum corners independently of the FOV).
+      const up = this.cameraUp.set(0, 1, 0).applyQuaternion(
+        camera.getWorldQuaternion(this.cameraQuat),
+      );
       const didSort = this.webgpuBackend.update({
         spark: this,
         scene,
         camera,
-        viewChanged,
+        viewChanged: viewChanged || up.dot(this.sortedUp) < 0.999,
       });
       if (didSort) {
         this.sortedCenter.copy(center);
         this.sortedDir.copy(dir);
+        this.sortedUp.copy(up);
         this.setDirty();
       }
       if (this.enableDriveLod) {
@@ -1074,6 +1151,7 @@ export class SparkRenderer extends THREE.Mesh {
         renderSize: this.renderSize,
         previous: this.current,
         lodInstances: this.enableLod ? this.lodInstances : undefined,
+        accumOrigin: this.accumulatorOrigin(camera, center, dir),
       });
 
     let doUpdate = true;

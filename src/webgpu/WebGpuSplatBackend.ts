@@ -48,6 +48,7 @@ import {
   MeshBasicNodeMaterial,
   Quaternion,
   Vector3,
+  Vector4,
 } from "three/webgpu";
 import {
   Fn,
@@ -105,6 +106,12 @@ import {
   createVisibleClear,
 } from "./radixSort";
 import { SplatNodeMaterial } from "./SplatNodeMaterial";
+import {
+  ROBUST_SAMPLES,
+  type RobustKeyMap,
+  paddedQuantileRange,
+  robustKeyMap,
+} from "./sortKeyRange";
 
 // biome-ignore lint/suspicious/noExplicitAny: r180 type decls lack this export
 const unpackHalf2x16: (node: unknown) => any = (TSL as any).unpackHalf2x16;
@@ -250,8 +257,17 @@ type MeshState = {
   uCameraPos: ReturnType<typeof uniform>;
   uCameraDir: ReturnType<typeof uniform>;
   uDistRange: ReturnType<typeof uniform>;
+  // [fov-1] robustKeyMap's A / G / Cap (read only when the state was built
+  // with sortKeyRobust; robustKeys records that choice)
+  uKeyA: ReturnType<typeof uniform>;
+  uKeyG: ReturnType<typeof uniform>;
+  uKeyCap: ReturnType<typeof uniform>;
+  robustKeys: boolean;
   boundsMin: THREE.Vector3;
   boundsMax: THREE.Vector3;
+  // [fov-1] the robust box (robustBounds), packed frame like boundsMin/Max
+  robustMin: THREE.Vector3;
+  robustMax: THREE.Vector3;
   lastNumSplats: number;
   lastMappingVersion: number;
   // instances actually submitted = ceil(numSplats / batchSize); re-asserted
@@ -460,6 +476,98 @@ function finishBounds(
   };
 }
 
+// [fov-1] The robust box the sort keys concentrate on (sortKeyRange.ts has
+// the why): the per-axis [ROBUST_Q, 1 - ROBUST_Q] quantiles of <=
+// ROBUST_SAMPLES evenly spaced centres of the source - the build's dense-box
+// rule (tools/gpu-build-worker voxel-size.mjs) - padded by ROBUST_PAD of the
+// span and clipped to the raw bounds; the raw box for tiny sources.
+// Deterministic for a given source / cut, like the scans above. Entry k of
+// the source, k in [0, count), is at u32 word offset offsetOf(k).
+function robustBounds(
+  words: Uint32Array,
+  offsetOf: (k: number) => number,
+  count: number,
+  raw: Bounds,
+): Bounds {
+  const n = Math.min(count, ROBUST_SAMPLES);
+  const fallback = { min: raw.min.clone(), max: raw.max.clone() };
+  if (n < 256) return fallback;
+  const half = halfToFloatTable();
+  const xs = new Float32Array(n);
+  const ys = new Float32Array(n);
+  const zs = new Float32Array(n);
+  let m = 0;
+  for (let s = 0; s < n; s++) {
+    const o = offsetOf(Math.floor((s * count) / n));
+    const w1 = words[o + 1];
+    const w2 = words[o + 2];
+    const x = half[w1 & 0xffff];
+    const y = half[w1 >>> 16];
+    const z = half[w2 & 0xffff];
+    if (!Number.isFinite(x + y + z)) continue;
+    xs[m] = x;
+    ys[m] = y;
+    zs[m] = z;
+    m++;
+  }
+  if (m < 256) return fallback;
+  const out = fallback;
+  const axes: [Float32Array, "x" | "y" | "z"][] = [
+    [xs, "x"],
+    [ys, "y"],
+    [zs, "z"],
+  ];
+  for (const [a, c] of axes) {
+    const [lo, hi] = paddedQuantileRange(a, m);
+    out.min[c] = Math.min(Math.max(lo, raw.min[c]), raw.max[c]);
+    out.max[c] = Math.max(Math.min(hi, raw.max[c]), out.min[c]);
+  }
+  return out;
+}
+
+// Distance range [minD, maxD] from the camera to a packed-frame box, the
+// keygen's metric (radial or view-z + 100.0 bias). Max distance to a box is
+// attained at a corner; the z-mode plane metric attains BOTH extrema at
+// corners; the radial MIN is the true point-to-box distance (a face can be
+// closer than every corner; overestimating it would flatten all nearer splats
+// into one bucket): the packed-frame camera clamped into the box.
+function boxDistanceRange(
+  mn: THREE.Vector3,
+  mx: THREE.Vector3,
+  packedToWorld: Matrix4,
+  worldToPacked: Matrix4,
+  camPos: THREE.Vector3,
+  camDir: THREE.Vector3,
+  radial: boolean,
+): [number, number] {
+  let minD = Number.POSITIVE_INFINITY;
+  let maxD = Number.NEGATIVE_INFINITY;
+  const corner = new Vector3();
+  for (let c = 0; c < 8; c++) {
+    corner.set(
+      c & 1 ? mx.x : mn.x,
+      c & 2 ? mx.y : mn.y,
+      c & 4 ? mx.z : mn.z,
+    );
+    corner.applyMatrix4(packedToWorld);
+    const d = radial
+      ? corner.distanceTo(camPos)
+      : corner.sub(camPos).dot(camDir) + 100.0;
+    if (d < minD) minD = d;
+    if (d > maxD) maxD = d;
+  }
+  if (radial) {
+    const camObj = camPos.clone().applyMatrix4(worldToPacked);
+    const closest = new Vector3(
+      Math.min(Math.max(camObj.x, mn.x), mx.x),
+      Math.min(Math.max(camObj.y, mn.y), mx.y),
+      Math.min(Math.max(camObj.z, mn.z), mx.z),
+    ).applyMatrix4(packedToWorld);
+    minD = Math.max(0, closest.distanceTo(camPos));
+  }
+  return [minD, maxD];
+}
+
 // [full-1] Workgroup-count shaping for the per-splat kernels (keygen and the
 // fused projector). Both are dispatched with an explicit ARRAY size, which
 // three r185 passes verbatim to dispatchWorkgroups (only NUMBER sizes are
@@ -629,6 +737,18 @@ export class WebGpuSplatBackend {
   // where splats are tiny. Monotonic in distance, so non-tied order is
   // unchanged. `?sortkey=linear` (app) restores the old mapping for A/B.
   sortKeyLog = true;
+
+  // [fov-1] Concentrate the log keys on the ROBUST range of the centres
+  // (per-axis 0.5 % quantile box, see robustBounds) instead of spreading them
+  // over the raw bounds, whose floaters reach kilometres: with the camera
+  // pulled far back (a 1-2 deg FOV dolly zoom, the viewer's 1 deg nadir
+  // camera) the subject otherwise gets metre-sized buckets and its splats
+  // blink. Outliers keep being sorted, in two thin tail ranges. Read at
+  // buildState like sortKeyLog (log keys only); `?sortrange=raw` (app)
+  // restores the [ssog-30] mapping exactly.
+  sortKeyRobust = true;
+  // [fov-1] the key map of the last sort (diagnostics / harness only)
+  lastKeyMap: RobustKeyMap | null = null;
 
   // Testing hook (harness stale-order regression): freeze the order producer.
   freezeOrder = false;
@@ -1292,6 +1412,8 @@ export class WebGpuSplatBackend {
     const b = finishBounds(acc[0], acc[1], acc[2], acc[3], acc[4], acc[5]);
     state.boundsMin.copy(b.min);
     state.boundsMax.copy(b.max);
+    // [fov-1] the robust box: one sampled pass (<= 32,768 centres, ~ms)
+    this.updateRobustBounds(state, b, arr, (k) => 4 * k, src.numSplats);
   }
 
   // One compute node through three's real first-dispatch path, with the
@@ -1745,9 +1867,36 @@ export class WebGpuSplatBackend {
     const uCameraPos = uniform(new Vector3());
     const uCameraDir = uniform(new Vector3(0, 0, -1));
     const uDistRange = uniform(new Vector3(0, 1, 0)); // (min, max, unused)
+    // [fov-1] robustKeyMap (A = c0, 1/c1, L0, L2; G = gains; Cap = shares)
+    const uKeyA = uniform(new Vector4(0.02, 50, 0, 1));
+    const uKeyG = uniform(new Vector3(0, 1, 0));
+    const uKeyCap = uniform(new Vector3(0, 1, 0));
 
     const sortRadial = this.sortRadial;
     const sortKeyLog = this.sortKeyLog;
+    const robustKeys = sortKeyLog && this.sortKeyRobust;
+    // The key position of a distance, 0 = nearest .. 1 = farthest (clamped
+    // by the caller). Shared by keygen and the projector's fused keys.
+    const keyNorm = (metric: TslNode): TslNode => {
+      if (robustKeys) {
+        const A = uKeyA as TslNode;
+        const G = uKeyG as TslNode;
+        const C = uKeyCap as TslNode;
+        const l = log(max(metric, A.x).mul(A.y));
+        return clamp(l.sub(A.z).mul(G.x), 0.0, C.x)
+          .add(clamp(l.mul(G.y), 0.0, C.y))
+          .add(clamp(l.sub(A.w).mul(G.z), 0.0, C.z));
+      }
+      // [ssog-30] log keys: uDistRange = (log minClamp, log span, minClamp);
+      // linear keys: uDistRange = (minD, maxD, 0) as before.
+      return sortKeyLog
+        ? log(max(metric, (uDistRange as TslNode).z))
+            .sub((uDistRange as TslNode).x)
+            .div((uDistRange as TslNode).y)
+        : metric
+            .sub((uDistRange as TslNode).x)
+            .div((uDistRange as TslNode).y.sub((uDistRange as TslNode).x));
+    };
     const keygen = (Fn(() => {
       const i = instanceIndex;
       If(i.greaterThanEqual(uint(Math.max(1, capacity))), () => {
@@ -1796,15 +1945,7 @@ export class WebGpuSplatBackend {
         : world.sub(uCameraPos).dot(uCameraDir).add(100.0);
       // INVERTED: the radix sort is ascending, compositing draws
       // back-to-front, so far splats need the smallest keys.
-      // [ssog-30] log keys: uDistRange = (log minClamp, log span, minClamp);
-      // linear keys: uDistRange = (minD, maxD, 0) as before.
-      const norm = sortKeyLog
-        ? log(max(metric, (uDistRange as TslNode).z))
-            .sub((uDistRange as TslNode).x)
-            .div((uDistRange as TslNode).y)
-        : metric
-            .sub((uDistRange as TslNode).x)
-            .div((uDistRange as TslNode).y.sub((uDistRange as TslNode).x));
+      const norm = keyNorm(metric);
       const q = uint(float(1.0).sub(clamp(norm, 0.0, 1.0)).mul(quantMax));
       keysNode.element(i).assign(q);
     })() as TslNode)
@@ -2168,16 +2309,8 @@ export class WebGpuSplatBackend {
           const metric = sortRadial
             ? viewCenter.length()
             : viewCenter.z.negate().add(100.0);
-          // [ssog-30] same mapping as keygen (log or linear, baked)
-          const normK = sortKeyLog
-            ? log(max(metric, (uDistRange as TslNode).z))
-                .sub((uDistRange as TslNode).x)
-                .div((uDistRange as TslNode).y)
-            : metric
-                .sub((uDistRange as TslNode).x)
-                .div(
-                  (uDistRange as TslNode).y.sub((uDistRange as TslNode).x),
-                );
+          // the same mapping as keygen (robust / log / linear, baked)
+          const normK = keyNorm(metric);
           const qk = uint(float(1.0).sub(clamp(normK, 0.0, 1.0)).mul(quantMax));
           if (visOn && visCountAtomic && compactVals) {
             // [vc] compact append: only NON-rejected splats enter the sort
@@ -2282,8 +2415,14 @@ export class WebGpuSplatBackend {
       uCameraPos,
       uCameraDir,
       uDistRange,
+      uKeyA,
+      uKeyG,
+      uKeyCap,
+      robustKeys,
       boundsMin: new Vector3(0, 0, 0),
       boundsMax: new Vector3(1, 1, 1),
+      robustMin: new Vector3(0, 0, 0),
+      robustMax: new Vector3(1, 1, 1),
       lastNumSplats: -1,
       lastMappingVersion: -1,
       drawInstances: 0,
@@ -2321,12 +2460,18 @@ export class WebGpuSplatBackend {
   private updateBounds(state: MeshState, src: ResolvedSource): void {
     const mesh = state.mesh;
     let bounds: Bounds | null = null;
+    // [fov-1] the centres the robust box samples: words + the u32 offset of
+    // entry k of the source (the same entries the raw scan reads)
+    let words: Uint32Array | null = null;
+    let offsetOf: ((k: number) => number) | null = null;
 
     if (src.kind === "static") {
       const arr = mesh.packedSplats?.packedArray;
       if (arr) {
         let i = 0;
         bounds = scanBounds(arr, () => 4 * i++, src.numSplats);
+        words = arr;
+        offsetOf = (k) => 4 * k;
       }
     } else if (src.kind === "lodPacked") {
       const arr = mesh.packedSplats?.lodSplats?.packedArray;
@@ -2343,6 +2488,8 @@ export class WebGpuSplatBackend {
           },
           Math.floor(src.numSplats / step),
         );
+        words = arr;
+        offsetOf = (k) => 4 * cut[k];
       }
     } else {
       // paged: cut entries are (page<<16)|slot into the 65536-splat pages of
@@ -2363,13 +2510,36 @@ export class WebGpuSplatBackend {
           },
           Math.floor(src.numSplats / step),
         );
+        words = pool;
+        offsetOf = (k) => {
+          const idx = cut[k];
+          return 4 * ((idx >>> 16) * 65536 + (idx & 0xffff));
+        };
       }
     }
 
     if (bounds) {
       state.boundsMin.copy(bounds.min);
       state.boundsMax.copy(bounds.max);
+      this.updateRobustBounds(state, bounds, words, offsetOf, src.numSplats);
     }
+  }
+
+  // [fov-1] state.robustMin/Max from the source's centres (the raw box when
+  // the robust keys are off or nothing can be sampled).
+  private updateRobustBounds(
+    state: MeshState,
+    raw: Bounds,
+    words: Uint32Array | null,
+    offsetOf: ((k: number) => number) | null,
+    count: number,
+  ): void {
+    const r =
+      state.robustKeys && words && offsetOf
+        ? robustBounds(words, offsetOf, count, raw)
+        : raw;
+    state.robustMin.copy(r.min);
+    state.robustMax.copy(r.max);
   }
 
   private updateKeygenUniforms(state: MeshState, camera: THREE.Camera): void {
@@ -2389,40 +2559,18 @@ export class WebGpuSplatBackend {
     (state.uCameraDir.value as THREE.Vector3).copy(camDir);
 
     // CPU [minDist, maxDist] for the 16-bit quantization (fork plan §4.2
-    // item 4). Max distance to a box is attained at a corner; the z-mode
-    // plane metric attains BOTH extrema at corners.
-    const { boundsMin: mn, boundsMax: mx } = state;
-    let minD = Number.POSITIVE_INFINITY;
-    let maxD = Number.NEGATIVE_INFINITY;
-    const corner = new Vector3();
-    for (let c = 0; c < 8; c++) {
-      corner.set(
-        c & 1 ? mx.x : mn.x,
-        c & 2 ? mx.y : mn.y,
-        c & 4 ? mx.z : mn.z,
-      );
-      corner.applyMatrix4(packedToWorld);
-      const d = this.sortRadial
-        ? corner.distanceTo(camPos)
-        : corner.sub(camPos).dot(camDir) + 100.0;
-      if (d < minD) minD = d;
-      if (d > maxD) maxD = d;
-    }
-    if (this.sortRadial) {
-      // radial MIN needs the true point-to-box distance (a face can be
-      // closer than every corner; overestimating minD would flatten all
-      // nearer splats into bucket 0): clamp the OBJECT-space camera into
-      // the object AABB, take the world-space distance to that point.
-      const camObj = camPos
-        .clone()
-        .applyMatrix4(new Matrix4().copy(packedToWorld).invert());
-      const closest = new Vector3(
-        Math.min(Math.max(camObj.x, mn.x), mx.x),
-        Math.min(Math.max(camObj.y, mn.y), mx.y),
-        Math.min(Math.max(camObj.z, mn.z), mx.z),
-      ).applyMatrix4(packedToWorld);
-      minD = Math.max(0, closest.distanceTo(camPos));
-    }
+    // item 4), over the raw bounds (boxDistanceRange: corners, and the
+    // radial minimum as the true point-to-box distance).
+    const worldToPacked = new Matrix4().copy(packedToWorld).invert();
+    let [minD, maxD] = boxDistanceRange(
+      state.boundsMin,
+      state.boundsMax,
+      packedToWorld,
+      worldToPacked,
+      camPos,
+      camDir,
+      this.sortRadial,
+    );
     if (this.sortKeyLog) {
       // [ssog-30] log-distance keys: everything nearer than minClamp shares
       // the nearest bucket (2 cm — inside any camera near plane); the span
@@ -2436,6 +2584,24 @@ export class WebGpuSplatBackend {
         Math.log(maxD) - logMin,
         minClamp,
       );
+      if (state.robustKeys) {
+        // [fov-1] the same rule over the robust box -> the main key range
+        // inside [minClamp, maxD]; the two outlier shells become thin tails
+        const [rMin, rMax] = boxDistanceRange(
+          state.robustMin,
+          state.robustMax,
+          packedToWorld,
+          worldToPacked,
+          camPos,
+          camDir,
+          this.sortRadial,
+        );
+        const map = robustKeyMap(minClamp, maxD, rMin, rMax);
+        (state.uKeyA.value as THREE.Vector4).set(...map.a);
+        (state.uKeyG.value as THREE.Vector3).set(...map.g);
+        (state.uKeyCap.value as THREE.Vector3).set(...map.cap);
+        this.lastKeyMap = map;
+      }
       return;
     }
     if (maxD <= minD) maxD = minD + 1;
