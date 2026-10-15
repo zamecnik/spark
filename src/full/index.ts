@@ -37,6 +37,12 @@ export {
   packRange,
 } from "./sogPack";
 export {
+  SogMeanCodeHistogram,
+  composeCenterOrigin,
+  decodeMeanCode,
+  sogPackOrigin,
+} from "./sogOrigin";
+export {
   type SogWalkedEntry,
   SogStreamWalker,
   type SogZipEntry,

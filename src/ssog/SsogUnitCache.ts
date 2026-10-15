@@ -833,12 +833,17 @@ export class SsogUnitCache {
     }
 
     this.stats.decodes += 1;
+    // [prec-1] the model's pack origin (fixed for its lifetime): centres are
+    // packed as fp16(c - origin) and SsogSplats.centerOrigin folds it back
+    // into the mesh transform. A null origin sends exactly the old args.
+    const origin = this.model.packOrigin;
     const decoded = (await workerPool.withWorker(async (worker) =>
       worker.call("unpackSsogUnit", {
         json,
         files,
         encoding: this.splatEncoding,
         palette,
+        ...(origin ? { origin: [origin[0], origin[1], origin[2]] } : {}),
       }),
     )) as SsogDecodedUnit;
 

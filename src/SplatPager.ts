@@ -72,6 +72,12 @@ export class PagedSplats implements SplatSource {
   // Kroscloud fork: RadMeta.count captured at meta resolution — upper bound
   // on any cut size, used to clamp the cut-texture pre-size (0 = unknown).
   totalFileSplats = 0;
+  // Kroscloud fork [prec-1]: the pool's centre words hold fp16(c - o) for
+  // this origin o (file frame; null = none). SplatMesh / the WebGPU backend
+  // fold it into the mesh transform and forEachSplat re-adds it, so
+  // mesh.matrixWorld keeps mapping the FILE frame to world. Set before the
+  // mesh first renders (SsogSplats: the model's packOrigin).
+  centerOrigin: THREE.Vector3 | null = null;
 
   dynoNumSplats: dyno.DynoInt<"numSplats">;
   dynoIndices: dyno.DynoUsampler2D<"indices", THREE.DataTexture>;
@@ -562,12 +568,17 @@ export class PagedSplats implements SplatSource {
       packedSplatArray,
       extPackedSplatArray,
     ];
+    // Kroscloud fork [prec-1]: centres are reported in the FILE frame
+    const origin = this.centerOrigin;
 
     for (let i = 0; i < this.numSplats; ++i) {
       const splatIndex = indices[i];
       const unpacked = extSplats
         ? decodeExtSplat(extArrays, splatIndex)
         : unpackSplat(packedSplatArray, splatIndex, this.splatEncoding);
+      if (origin) {
+        unpacked.center.add(origin);
+      }
       callback(
         i,
         unpacked.center,

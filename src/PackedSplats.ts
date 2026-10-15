@@ -1,3 +1,4 @@
+// Modified by Kroscloud, 2026 — see FORK-CHANGES.md [prec-1]
 import * as THREE from "three";
 import { FullScreenQuad } from "three/addons/postprocessing/Pass.js";
 
@@ -98,7 +99,33 @@ export type PackedSplatsOptions = {
   lodAbove?: number;
   // The LoD version of the PackedSplats
   lodSplats?: PackedSplats;
+  // Kroscloud fork [prec-1]: the packed centre words hold fp16(c - o) for
+  // this origin o (file frame) — see PackedSplats.centerOrigin. Copied;
+  // [0,0,0] / null / undefined = none. (default: undefined)
+  centerOrigin?: THREE.Vector3 | readonly [number, number, number] | null;
 };
+
+// Kroscloud fork [prec-1]: PackedSplatsOptions.centerOrigin -> a fresh
+// Vector3, or null for none / all zero (-0 becomes 0). Non-finite throws: a
+// NaN origin would silently move every splat off screen.
+function toCenterOrigin(
+  o: PackedSplatsOptions["centerOrigin"],
+): THREE.Vector3 | null {
+  if (!o) {
+    return null;
+  }
+  const [x, y, z] = Array.isArray(o)
+    ? [o[0], o[1], o[2]]
+    : [(o as THREE.Vector3).x, (o as THREE.Vector3).y, (o as THREE.Vector3).z];
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+    throw new Error(
+      `PackedSplats: centerOrigin must be finite (got ${x}, ${y}, ${z})`,
+    );
+  }
+  return x === 0 && y === 0 && z === 0
+    ? null
+    : new THREE.Vector3(x || 0, y || 0, z || 0);
+}
 
 // A PackedSplats is a collection of Gaussian splats, packed into a format that
 // takes exactly 16 bytes per Gsplat to maximize memory and cache efficiency.
@@ -117,6 +144,18 @@ export class PackedSplats implements SplatSource {
   lod?: boolean | "quality";
   nonLod?: boolean;
   lodSplats?: PackedSplats;
+
+  // Kroscloud fork [prec-1]: pack origin o (file frame), null = none. Every
+  // fp16 centre word holds c - o, so content far from the file origin keeps
+  // fp16 precision (at |v| in [256, 512) the fp16 step is 0.25). The CPU
+  // readers below (getSplat, forEachSplat) return c = packed + o and the
+  // writers (setSplat, pushSplat) store c - o; SplatMesh and the WebGPU
+  // backend fold o into the mesh transform (matrixWorld · T(o)), so
+  // mesh.matrixWorld keeps mapping the FILE frame to world for every caller.
+  // fetchSplat (the dyno read) stays in the packed frame on purpose. May be
+  // set after construction until the mesh first renders (the app does that
+  // for a legacy-loaded recentred scene.sog).
+  centerOrigin: THREE.Vector3 | null = null;
 
   initialized: Promise<PackedSplats>;
   isInitialized = false;
@@ -184,6 +223,9 @@ export class PackedSplats implements SplatSource {
     this.splatEncoding = options.splatEncoding;
     this.lod = options.lod;
     this.nonLod = options.nonLod;
+    // Kroscloud fork [prec-1]: new content, new frame (file loads decode in
+    // the file frame, so no option = none)
+    this.centerOrigin = toCenterOrigin(options.centerOrigin);
 
     if (
       options.url ||
@@ -537,7 +579,12 @@ export class PackedSplats implements SplatSource {
     if (!this.packedArray || index >= this.numSplats) {
       throw new Error("Invalid index");
     }
-    return unpackSplat(this.packedArray, index, this.splatEncoding);
+    const splat = unpackSplat(this.packedArray, index, this.splatEncoding);
+    // Kroscloud fork [prec-1]: the centre in the FILE frame
+    if (this.centerOrigin) {
+      splat.center.add(this.centerOrigin);
+    }
+    return splat;
   }
 
   // Set all PackedSplat components at index with the provided Gsplat attributes
@@ -552,12 +599,14 @@ export class PackedSplats implements SplatSource {
     color: THREE.Color,
   ) {
     const packedSplats = this.ensureSplats(index + 1);
+    // Kroscloud fork [prec-1]: `center` is in the FILE frame; store c - o
+    const o = this.centerOrigin;
     setPackedSplat(
       packedSplats,
       index,
-      center.x,
-      center.y,
-      center.z,
+      o ? center.x - o.x : center.x,
+      o ? center.y - o.y : center.y,
+      o ? center.z - o.z : center.z,
       scales.x,
       scales.y,
       scales.z,
@@ -583,12 +632,14 @@ export class PackedSplats implements SplatSource {
     color: THREE.Color,
   ) {
     const packedSplats = this.ensureSplats(this.numSplats + 1);
+    // Kroscloud fork [prec-1]: `center` is in the FILE frame; store c - o
+    const o = this.centerOrigin;
     setPackedSplat(
       packedSplats,
       this.numSplats,
-      center.x,
-      center.y,
-      center.z,
+      o ? center.x - o.x : center.x,
+      o ? center.y - o.y : center.y,
+      o ? center.z - o.z : center.z,
       scales.x,
       scales.y,
       scales.z,
@@ -619,8 +670,13 @@ export class PackedSplats implements SplatSource {
     if (!this.packedArray || !this.numSplats) {
       return;
     }
+    // Kroscloud fork [prec-1]: centres are reported in the FILE frame
+    const origin = this.centerOrigin;
     for (let i = 0; i < this.numSplats; ++i) {
       const unpacked = unpackSplat(this.packedArray, i, this.splatEncoding);
+      if (origin) {
+        unpacked.center.add(origin);
+      }
       callback(
         i,
         unpacked.center,
@@ -932,7 +988,12 @@ export class PackedSplats implements SplatSource {
       };
     });
 
-    const lodSplats = new PackedSplats(decoded);
+    // Kroscloud fork [prec-1]: the tree is built from our packed words, so it
+    // lives in the same packed frame
+    const lodSplats = new PackedSplats({
+      ...decoded,
+      centerOrigin: this.centerOrigin,
+    });
     if (this.lodSplats) {
       this.lodSplats.dispose();
     }
@@ -944,7 +1005,12 @@ export class PackedSplats implements SplatSource {
 
   extractSplats(indices: Uint32Array, pageColoring: boolean) {
     const maxSplats = getTextureSize(indices.length).maxSplats;
-    const newSplats = new PackedSplats({ maxSplats });
+    // Kroscloud fork [prec-1]: same packed frame (getSplat returns file-frame
+    // centres, pushSplat stores them minus the same origin)
+    const newSplats = new PackedSplats({
+      maxSplats,
+      centerOrigin: this.centerOrigin,
+    });
     for (let i = 0; i < indices.length; i++) {
       const splat = this.getSplat(indices[i]);
       if (pageColoring) {

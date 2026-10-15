@@ -6,6 +6,13 @@
 // contract of the mode is "the words the stream writes", so a file that
 // would need a patch (a null codebook slot, a v1 layout, a missing plane) is
 // refused with a typed error instead of being repaired.
+//
+// [prec-2] (kroscloud.48) client support for the build-side recentred
+// scene.sog: an optional `kcOrigin: [x, y, z]` (raw/file frame) is the vector
+// the pipeline SUBTRACTED from every mean before encoding (stored = original -
+// kcOrigin). It is parsed into `SogMeta.origin`; `boundsFromMeta` adds it
+// back (file-frame bounds) and the loader puts it into the PackedSplats'
+// centerOrigin. A malformed kcOrigin is refused like every other field.
 
 import type { PcSogsV2Json } from "../SplatLoader";
 
@@ -31,6 +38,12 @@ export type SogMeta = {
   shNCodebook: Float64Array | null;
   /** File names by role, as written in the manifest (no directory prefix). */
   files: Record<SogPlaneName, string | null>;
+  /**
+   * [prec-2] `kcOrigin`: the vector the build subtracted from every mean
+   * (stored means = original - origin, raw/file frame). null when absent or
+   * [0, 0, 0].
+   */
+  origin: [number, number, number] | null;
   /** The manifest, verbatim (the reference decoder's input shape). */
   json: PcSogsV2Json;
 };
@@ -43,7 +56,8 @@ export class SogMetaError extends Error {
     | "codebook"
     | "codebook-null"
     | "files"
-    | "bands";
+    | "bands"
+    | "origin";
   constructor(code: SogMetaError["code"], message: string) {
     super(message);
     this.name = "SogMetaError";
@@ -157,6 +171,24 @@ export function parseSogMeta(json: unknown): SogMeta {
     files.shN_labels = j.shN.files[1];
   }
 
+  // [prec-2] optional build-side recentring stamp; anything but three finite
+  // numbers is refused (absent is fine, null is NOT absent)
+  let origin: SogMeta["origin"] = null;
+  const raw = (j as { kcOrigin?: unknown }).kcOrigin;
+  if (raw !== undefined) {
+    if (!isNumArray(raw, 3)) {
+      throw new SogMetaError(
+        "origin",
+        `kcOrigin must be [x, y, z] of finite numbers (got ${String(
+          JSON.stringify(raw),
+        ).slice(0, 80)})`,
+      );
+    }
+    if (raw[0] !== 0 || raw[1] !== 0 || raw[2] !== 0) {
+      origin = [raw[0] || 0, raw[1] || 0, raw[2] || 0]; // -0 -> 0
+    }
+  }
+
   return {
     count: j.count,
     bands,
@@ -169,6 +201,7 @@ export function parseSogMeta(json: unknown): SogMeta {
     sh0Codebook,
     shNCodebook,
     files,
+    origin,
     json: j,
   };
 }
@@ -192,19 +225,29 @@ export function planeSize(count: number): { width: number; height: number } {
  * sign(v)·(exp|v|−1) of the stored corners. Exact, and available before a
  * single texel is decoded — the loader hands these to the app so it never
  * has to walk 20M packed centers on the main thread.
+ *
+ * [prec-2] In the FILE frame: a recentred file's `kcOrigin` (meta.origin) is
+ * added back, so the bounds are the original scene's whatever the build did.
  */
-export function boundsFromMeta(meta: SogMeta): {
+export function boundsFromMeta(
+  meta: Pick<SogMeta, "means"> & Partial<Pick<SogMeta, "origin">>,
+): {
   min: [number, number, number];
   max: [number, number, number];
 } {
   const un = (v: number) => Math.sign(v) * (Math.exp(Math.abs(v)) - 1);
   const min: [number, number, number] = [0, 0, 0];
   const max: [number, number, number] = [0, 0, 0];
+  const origin = meta.origin ?? null;
   for (let c = 0; c < 3; ++c) {
     const a = un(meta.means.mins[c]);
     const b = un(meta.means.maxs[c]);
     min[c] = Math.min(a, b);
     max[c] = Math.max(a, b);
+    if (origin) {
+      min[c] += origin[c];
+      max[c] += origin[c];
+    }
   }
   return { min, max };
 }

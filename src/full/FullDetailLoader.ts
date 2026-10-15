@@ -9,8 +9,20 @@
 // Isolation: this module imports the CORE by package name (class identity
 // with the consumer's PackedSplats / SplatMesh, exactly like the ssog entry)
 // and the pure helpers by relative path. It never touches src/ssog/*, the
-// core worker (src/worker.ts), the unit decoder or the pager; the streamed
-// LOD path is byte-for-byte what it was.
+// core worker (src/worker.ts), the unit decoder or the pager. (Those files
+// changed once since, for [prec-1] - a cross-path precision fix with
+// defaults that keep every existing caller's words - never for this loader.)
+//
+// [prec-1] / [prec-2] (kroscloud.48) centre precision: Spark packs centres as
+// fp16, so content far from the file origin is quantised coarsely (18ss: real
+// altitude z ~ 465, fp16 step 0.25 -> horizontal stripes). After the plane
+// decodes the loader takes o_rel = the rounded per-axis median of the mean
+// codes (sogOrigin.ts; `packOrigin: false` = no o_rel), the workers' centre
+// tables subtract it, and the PackedSplats gets centerOrigin = kcOrigin +
+// o_rel (kcOrigin = what a recentring build already subtracted, meta.json;
+// always applied - it is correctness, not a lever). The mesh transform
+// re-adds it, so mesh.matrixWorld still maps the FILE frame to world and
+// `bounds` stay file-frame.
 //
 // This loader performs NO capability check (owner decision 2026-09-11): a
 // machine that cannot hold ~1.6 GB of GPU textures plus their CPU mirrors
@@ -30,6 +42,11 @@ import {
   parseSogMeta,
   planeSize,
 } from "./sogMeta";
+import {
+  SogMeanCodeHistogram,
+  composeCenterOrigin,
+  sogPackOrigin,
+} from "./sogOrigin";
 import {
   type SogWalkedEntry,
   SogStreamWalker,
@@ -91,6 +108,13 @@ export type FullDetailOptions = {
   requestHeader?: Record<string, string>;
   withCredentials?: boolean;
   splatEncoding?: SplatEncoding;
+  /**
+   * [prec-1] pack the centres relative to the runtime pack origin o_rel (the
+   * rounded per-axis median of the mean codes). Default true; false = o_rel
+   * [0, 0, 0] (the app's `?splatorigin=off` A/B lever). A meta.json kcOrigin
+   * is applied either way.
+   */
+  packOrigin?: boolean;
 };
 
 export type FullDetailStats = {
@@ -108,6 +132,8 @@ export type FullDetailStats = {
   ms: {
     download: number;
     decodeTail: number;
+    /** [prec-1] the mean-code histogram + median (0 with packOrigin false) */
+    origin: number;
     tables: number;
     pack: number;
     total: number;
@@ -116,10 +142,18 @@ export type FullDetailStats = {
 };
 
 export type FullDetailResult = {
+  /** centerOrigin = kcOrigin + packOrigin (null when both are zero) */
   packedSplats: PackedSplats;
   meta: SogMeta;
   numSplats: number;
+  /** FILE frame (kcOrigin added back) - what mesh.matrixWorld maps to world */
   bounds: { min: [number, number, number]; max: [number, number, number] };
+  /**
+   * [prec-1] the RUNTIME part of the centre origin (o_rel: the rounded
+   * per-axis median the tables subtracted), null when zero or disabled.
+   * Diagnostics; the full origin is packedSplats.centerOrigin.
+   */
+  packOrigin: [number, number, number] | null;
   stats: FullDetailStats;
 };
 
@@ -381,6 +415,32 @@ export async function loadFullDetailSog(options: FullDetailOptions): Promise<Ful
     const rule = planeSize(m.count);
     const geometryMatchesRule = rule.width === ref.width && rule.height === ref.height;
 
+    // ---- 2b. [prec-1] the runtime pack origin ----------------------------
+    // o_rel = the rounded per-axis median of the 16-bit mean codes over every
+    // splat (one 65,536-bin histogram per axis). Here, BEFORE step 3, because
+    // step 5 transfers the means bands to the workers. One synchronous pass
+    // (measured in Node: ~2.7 ns per splat for all 3 axes - 5M 15 ms, a 19.9M
+    // scene 54 ms); deliberately NO timer yields between bands: chained
+    // setTimeout(0)s are throttled in a hidden tab (review 2026-10-07).
+    // means_u has means_l's geometry (checked above).
+    const tOrigin0 = performance.now();
+    let oRel: [number, number, number] = [0, 0, 0];
+    if (options.packOrigin !== false) {
+      const meansU = planes.get("means_u") as DecodedPlane;
+      const hist = new SogMeanCodeHistogram();
+      throwIfAborted();
+      for (let k = 0; k < ref.bands.length; ++k) {
+        const offset = ref.rowStart[k] * ref.width;
+        const count = Math.min(ref.rows[k] * ref.width, m.count - offset);
+        if (count <= 0) break;
+        hist.add(ref.bands[k], meansU.bands[k], count);
+      }
+      oRel = sogPackOrigin(m, hist);
+    }
+    // packed + centerOrigin = the original (file-frame) centre
+    const centerOrigin = composeCenterOrigin(m.origin, oRel);
+    const msOrigin = performance.now() - tOrigin0;
+
     // ---- 3. tables on every worker ---------------------------------------
     const tTables0 = performance.now();
     const centroids = wantSh ? (planes.get("shN_centroids") as DecodedPlane) : null;
@@ -389,6 +449,7 @@ export async function loadFullDetailSog(options: FullDetailOptions): Promise<Ful
       centroids: centroids ? { rgba: centroids.bands[0], width: centroids.width, height: centroids.height } : null,
       maxSh: maxShRequested,
       encoding,
+      origin: oRel,
     });
     const maxSh = tableInfo[0]?.maxSh ?? 0;
     const msTables = performance.now() - tTables0;
@@ -466,6 +527,8 @@ export async function loadFullDetailSog(options: FullDetailOptions): Promise<Ful
       numSplats: m.count,
       extra,
       splatEncoding: encoding,
+      // [prec-1] / [prec-2] kcOrigin + o_rel; the mesh transform re-adds it
+      centerOrigin,
     });
 
     const perPlane: FullDetailStats["perPlane"] = {};
@@ -487,6 +550,7 @@ export async function loadFullDetailSog(options: FullDetailOptions): Promise<Ful
       ms: {
         download: Math.round(msDownload),
         decodeTail: Math.round(msDecodeTail),
+        origin: Math.round(msOrigin),
         tables: Math.round(msTables),
         pack: Math.round(msPack),
         total: Math.round(performance.now() - t0),
@@ -494,7 +558,17 @@ export async function loadFullDetailSog(options: FullDetailOptions): Promise<Ful
       perPlane,
     };
     progress("done", 1, 1);
-    return { packedSplats, meta: m, numSplats: m.count, bounds: boundsFromMeta(m), stats };
+    const packOrigin =
+      oRel[0] !== 0 || oRel[1] !== 0 || oRel[2] !== 0 ? oRel : null;
+    // bounds: FILE frame (boundsFromMeta adds kcOrigin back)
+    return {
+      packedSplats,
+      meta: m,
+      numSplats: m.count,
+      bounds: boundsFromMeta(m),
+      packOrigin,
+      stats,
+    };
   } catch (e) {
     if (e instanceof FullDetailError) throw e;
     if (signal?.aborted || (e as Error)?.name === "AbortError") throw new FullDetailError("cancel", "cancelled", e);

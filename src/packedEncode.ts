@@ -11,6 +11,12 @@
 // THREE.Quaternion and normalized via a module-level temp; this port operates
 // on a plain {x,y,z,w} record with the same normalization semantics
 // (THREE.Quaternion.normalize: zero-length → identity), bit-identical output.
+//
+// [prec-1] (kroscloud.48) toHalfJS — the fallback for browsers without
+// Float16Array, e.g. the thumbnail server's Chromium 101 — no longer
+// truncates: it rounds to nearest, ties to even, straight from the float64,
+// exactly what Float16Array / Math.f16round produce (test/packedEncode.test.ts
+// compares it against both). toHalfNative and fromHalf are unchanged.
 
 import { LN_SCALE_MAX, LN_SCALE_MIN, SCALE_ZERO } from "./defines.js";
 import {
@@ -36,50 +42,59 @@ function toHalfNative(f: number): number {
   return u16buffer[0];
 }
 
+// [prec-1] float64 view for toHalfJS: the sign and the exponent come from the
+// double's own high word (index 1 on little-endian platforms).
+const f64buffer = new Float64Array(1);
+const u32of64buffer = new Uint32Array(f64buffer.buffer);
+const f64HighWord =
+  new Uint8Array(new Uint32Array([1]).buffer)[0] === 1 ? 1 : 0;
+// 2^(10 - e) for the normal fp16 exponents e = -14..15, at index e + 14: the
+// scale that puts a value of exponent e in [1024, 2048) fp16 mantissa units.
+const halfMantissaScale = Array.from({ length: 30 }, (_, k) => 2 ** (24 - k));
+
+// m rounded to the nearest integer, ties to even. m - floor(m) is exact for
+// the m this module produces (m < 2^12).
+function roundHalfEven(m: number): number {
+  const fl = Math.floor(m);
+  const d = m - fl;
+  return d > 0.5 || (d === 0.5 && (fl & 1) === 1) ? fl + 1 : fl;
+}
+
 // Encode a number as a float16, stored as a uint16 number.
-function toHalfJS(f: number): number {
-  // Store the value into the shared Float32 array.
-  f32buffer[0] = f;
-  const bits = u32buffer[0];
-
-  // Extract sign (1 bit), exponent (8 bits), and fraction (23 bits)
-  const sign = (bits >> 31) & 0x1;
-  const exp = (bits >> 23) & 0xff;
-  const frac = bits & 0x7fffff;
-  const halfSign = sign << 15;
-
-  // Handle special cases: NaN and Infinity
-  if (exp === 0xff) {
-    // NaN: set all exponent bits to 1 and some nonzero fraction bits.
-    if (frac !== 0) {
-      return halfSign | 0x7fff;
-    }
-    // Infinity
-    return halfSign | 0x7c00;
+// [prec-1] Round to nearest, ties to even, from the float64 directly (no
+// float32 step, which would round twice): subnormals in units of 2^-24, a
+// mantissa that rounds up to 2048 carries into the exponent (at exponent 15
+// that carry IS 0x7c00 = Infinity, so every value >= 65520 overflows), NaN
+// keeps its sign as a quiet NaN (0x7e00 / 0xfe00, what V8's Float16Array
+// stores), and -0 / tiny negatives give 0x8000. The upstream version
+// truncated the mantissa (frac >> 13) after a float32 round trip, so on a
+// browser without Float16Array every centre sat up to one fp16 step below
+// where the native encoder puts it.
+export function toHalfJS(f: number): number {
+  f64buffer[0] = f;
+  const hi = u32of64buffer[f64HighWord];
+  const sign = (hi >>> 16) & 0x8000;
+  const exp64 = (hi >>> 20) & 0x7ff;
+  if (exp64 === 0x7ff) {
+    // NaN or Infinity
+    return sign | (Number.isNaN(f) ? 0x7e00 : 0x7c00);
   }
-
-  // Adjust the exponent from float32 bias (127) to float16 bias (15)
-  const newExp = exp - 127 + 15;
-
-  // Handle overflow: too large to represent in half precision.
-  if (newExp >= 0x1f) {
-    return halfSign | 0x7c00; // Infinity
+  const a = Math.abs(f);
+  // floor(log2(a)) for a normal double; double subnormals land at -1023 and
+  // take the subnormal branch (they round to a signed zero)
+  const e = exp64 - 1023;
+  if (e >= 16) {
+    return sign | 0x7c00; // >= 65536: Infinity
   }
-  if (newExp <= 0) {
-    // Handle subnormals and underflow.
-    if (newExp < -10) {
-      // Too small: underflows to zero.
-      return halfSign;
-    }
-    // Convert to subnormal: add the implicit leading 1 to the fraction,
-    // then shift to align with the half-precision's 10 fraction bits.
-    const subFrac = (frac | 0x800000) >> (1 - newExp + 13);
-    return halfSign | subFrac;
+  if (e < -14) {
+    // fp16 subnormal or zero; a result of 1024 is the smallest normal 0x0400
+    return sign | roundHalfEven(a * 16777216);
   }
-
-  // Normalized half-precision number: shift fraction to fit into 10 bits.
-  const halfFrac = frac >> 13;
-  return halfSign | (newExp << 10) | halfFrac;
+  // normal: the rounded mantissa is in [1024, 2048]; 2048 adds one exponent
+  return (
+    sign |
+    (((e + 15) << 10) + roundHalfEven(a * halfMantissaScale[e + 14]) - 1024)
+  );
 }
 
 // Convert a float16 stored as a uint16 number back to a float32.
@@ -89,7 +104,8 @@ function fromHalfNative(u: number): number {
 }
 
 // Convert a float16 stored as a uint16 number back to a float32.
-function fromHalfJS(h: number): number {
+// [prec-1] exported (unchanged) for test/packedEncode.test.ts.
+export function fromHalfJS(h: number): number {
   // Extract the sign (1 bit), exponent (5 bits), and fraction (10 bits)
   const sign = (h >> 15) & 0x1;
   const exp = (h >> 10) & 0x1f;

@@ -1546,11 +1546,6 @@ export class SparkRenderer extends THREE.Mesh {
     const instances = lodMeshes.reduce(
       (instances, mesh) => {
         uuidToMesh.set(mesh.uuid, mesh);
-        const viewToObject = mesh.matrixWorld
-          .clone()
-          .invert()
-          .multiply(cameraToWorld);
-
         const splats =
           mesh.packedSplats?.lodSplats ??
           mesh.extSplats?.lodSplats ??
@@ -1558,6 +1553,14 @@ export class SparkRenderer extends THREE.Mesh {
         if (!splats) {
           return instances;
         }
+        // Kroscloud fork [prec-1]: the LOD tree's node centres are in the
+        // PACKED frame of its words (c - centerOrigin), so the camera goes
+        // there too: inverse(matrixWorld · T(o)) · cameraToWorld. With no
+        // origin this is matrixWorld's inverse exactly as before.
+        const viewToObject = mesh
+          .packedFrameToWorld(splats)
+          .invert()
+          .multiply(cameraToWorld);
         const record = this.lodIds.get(splats);
         if (!record) {
           return instances;

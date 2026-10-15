@@ -13,10 +13,77 @@
 //   - missing per-leaf levels are resolved AT LOAD to the nearest available
 //     level (tie → coarser), so the runtime never sees -1;
 //   - `tree.bound` root = scene AABB (the GetSplatSceneDimension feed).
+//   - [prec-1] `packOrigin`: the robust content centre the unit decoder packs
+//     centres against (fp16 precision far from the file origin), fixed for
+//     the model's lifetime.
 //
 // This module is three-free and environment-agnostic.
 
 export const SSOG_PAGE_SPLATS = 65536; // SplatPager pageSplats — chunk == one pool page
+
+export interface SsogModelOptions {
+  /**
+   * [prec-1] compute the runtime pack origin (`SsogModel.packOrigin`).
+   * Default true; false = null (centres packed in the file frame, the
+   * kroscloud.47 words - the app's `?splatorigin=off` A/B lever).
+   */
+  packOrigin?: boolean;
+}
+
+/**
+ * [prec-1] The runtime pack origin of a streamed scene: per axis, the median
+ * of the leaf bound CENTRES weighted by each leaf's level-0 row count (the
+ * lower weighted median: the first centre in sorted order at which the
+ * cumulative weight reaches half the total), rounded to the nearest integer.
+ *
+ * Why: Spark packs every centre as 3 x fp16 in the frame it is given, so
+ * content far from the file origin loses precision (18ss stores a real
+ * altitude, z ~ 465, where fp16 steps are 0.25 - visible as horizontal
+ * stripes). The unit decoder packs c - packOrigin instead and the mesh
+ * transform re-adds it. A weighted MEDIAN, not a bounding-box centre: a few
+ * stray splats stretch a box (18ss's lod-meta root bound centre z ~ 122 would
+ * keep the 0.25 step; on w9s7 a box centre would make 2-unit steps).
+ *
+ * `centers` = [x, y, z] per leaf (3 * n), `weights` = n non-negative weights
+ * (non-finite or <= 0 entries are ignored). Returns null when no weight is
+ * positive or the rounded origin is [0, 0, 0].
+ */
+export function ssogPackOrigin(
+  centers: ArrayLike<number>,
+  weights: ArrayLike<number>,
+): [number, number, number] | null {
+  const n = weights.length;
+  const idx: number[] = [];
+  let total = 0;
+  for (let i = 0; i < n; i++) {
+    const w = weights[i];
+    if (Number.isFinite(w) && w > 0) {
+      idx.push(i);
+      total += w;
+    }
+  }
+  if (idx.length === 0 || !(total > 0)) {
+    return null;
+  }
+  const out: [number, number, number] = [0, 0, 0];
+  for (let c = 0; c < 3; c++) {
+    const order = idx
+      .slice()
+      .sort((a, b) => centers[a * 3 + c] - centers[b * 3 + c]);
+    let acc = 0;
+    let median = centers[order[order.length - 1] * 3 + c];
+    for (const i of order) {
+      acc += weights[i];
+      if (acc * 2 >= total) {
+        median = centers[i * 3 + c];
+        break;
+      }
+    }
+    const r = Math.round(median);
+    out[c] = Number.isFinite(r) && r !== 0 ? r : 0; // -0 -> 0
+  }
+  return out[0] === 0 && out[1] === 0 && out[2] === 0 ? null : out;
+}
 
 export interface SsogLodMetaBound {
   min: number[];
@@ -91,7 +158,17 @@ export class SsogModel {
    */
   readonly maxLeafBlockFootprint: number;
 
-  constructor(meta: SsogLodMeta) {
+  /**
+   * [prec-1] runtime pack origin (file frame): `ssogPackOrigin` over the leaf
+   * bound centres weighted by their level-0 rows. SsogUnitCache hands it to
+   * the unit decode (centres packed as fp16(c - packOrigin)) and SsogSplats
+   * exposes it as `centerOrigin`, which the mesh transform folds back in.
+   * null = none (all zero, or `options.packOrigin === false`). Fixed for the
+   * model's lifetime.
+   */
+  readonly packOrigin: [number, number, number] | null;
+
+  constructor(meta: SsogLodMeta, options: SsogModelOptions = {}) {
     if (meta.version !== 1) {
       throw new Error(`lod-meta version ${meta.version} !== 1`);
     }
@@ -390,6 +467,23 @@ export class SsogModel {
       }
     }
 
+    // ---- [prec-1] runtime pack origin --------------------------------------
+    // leaf bound centres from the manifest's own (float64) numbers, weighted
+    // by the leaf's level-0 rows (pre-resolution; a missing L0 weighs 0)
+    let packOrigin: [number, number, number] | null = null;
+    if (options.packOrigin !== false) {
+      const centers = new Float64Array(3 * numLeaves);
+      const weights = new Float64Array(numLeaves);
+      leaves.forEach((leaf, li) => {
+        const b = leaf.bound as SsogLodMetaBound;
+        for (let c = 0; c < 3; c++) {
+          centers[li * 3 + c] = 0.5 * (Number(b.min[c]) + Number(b.max[c]));
+        }
+        weights[li] = Math.max(0, leafLodsPre[li * L * 3 + 2]);
+      });
+      packOrigin = ssogPackOrigin(centers, weights);
+    }
+
     const root = meta.tree.bound;
     this.lodLevels = L;
     this.count = meta.count;
@@ -408,6 +502,7 @@ export class SsogModel {
     this.totalBlocks = blockBase[numUnits];
     this.maxLeafBlockFootprint = maxLeafBlockFootprint;
     this.rootBound = { min: root.min.slice(), max: root.max.slice() };
+    this.packOrigin = packOrigin;
   }
 
   /** unit dir name, e.g. "0_4" */

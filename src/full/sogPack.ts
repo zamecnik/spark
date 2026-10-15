@@ -11,7 +11,10 @@
 // unpackPcSogs, so the output is word-for-word identical by construction —
 // the unit test test/full/sogPack.test.ts checks exactly that against the
 // per-splat reference path on a real SH3 fixture. Nothing here is a
-// re-derivation of the SOG format from its spec.
+// re-derivation of the SOG format from its spec. [prec-1] With a pack origin
+// o the centre words are the reference's setPackedSplatCenter(x - o, ...) -
+// unpackPcSogs with `options.origin` writes the same words
+// (test/full/sogPackOrigin.test.ts); o = [0, 0, 0] is the case above.
 //
 // Why tables: at 19.9M splats the per-splat helper path costs ~21 s single-
 // threaded (measured: quats 2.0 s, means 1.3 s, scales 2.0 s, sh0 0.9 s,
@@ -38,7 +41,11 @@ const SQRT2 = Math.sqrt(2);
 export type SogPlaneRgba = { rgba: Uint8Array; width: number; height: number };
 
 export type PackTables = {
-  /** toHalf(center_c(n)) for every 16-bit mean value n, per axis. */
+  /**
+   * toHalf(center_c(n) - origin[c]) for every 16-bit mean value n, per axis
+   * ([prec-1]: origin = the loader's runtime pack origin o_rel, [0,0,0] =
+   * the stream's words).
+   */
   centerHalf: [Uint16Array, Uint16Array, Uint16Array];
   /** The packed scale byte for every scales-plane byte. */
   scaleByte: Uint8Array;
@@ -60,17 +67,23 @@ export type PackTables = {
 /**
  * Build every lookup the packer needs, once per scene. `centroids` is the
  * decoded shN_centroids plane (required when maxSh > 0 and the file has SH).
+ * [prec-1] `origin` is subtracted from every decoded centre before the fp16
+ * encode (the runtime pack origin; the PackedSplats carries it back as
+ * centerOrigin). The default [0, 0, 0] writes the stream's words exactly.
  */
 export function buildPackTables(
   meta: SogMeta,
   centroids: SogPlaneRgba | null,
   maxShRequested: number,
   encoding: SplatEncoding = DEFAULT_SPLAT_ENCODING,
+  origin: readonly [number, number, number] = [0, 0, 0],
 ): PackTables {
   const maxSh = Math.max(0, Math.min(3, meta.bands, Math.floor(maxShRequested))) as 0 | 1 | 2 | 3;
   const scratch = new Uint32Array(4);
 
   // centers: fx = n / 65535; v = mins + (maxs - mins) * fx; sign(v)(exp|v| - 1)
+  // [prec-1] minus origin[c]; an origin of +0 (-0 is normalised to +0 here)
+  // leaves v bit for bit, so the default tables are the stream's
   const centerHalf: [Uint16Array, Uint16Array, Uint16Array] = [
     new Uint16Array(65536),
     new Uint16Array(65536),
@@ -79,12 +92,13 @@ export function buildPackTables(
   for (let c = 0; c < 3; ++c) {
     const mn = meta.means.mins[c];
     const mx = meta.means.maxs[c];
+    const oc = origin[c] || 0;
     const t = centerHalf[c];
     for (let n = 0; n < 65536; ++n) {
       const f = n / 65535;
       let v = mn + (mx - mn) * f;
       v = Math.sign(v) * (Math.exp(Math.abs(v)) - 1);
-      t[n] = toHalf(v);
+      t[n] = toHalf(v - oc);
     }
   }
 

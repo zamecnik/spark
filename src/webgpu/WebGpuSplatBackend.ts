@@ -34,6 +34,12 @@
 // uniform, NEVER a texel sentinel; P0/S2 verified design). Real slots
 // win 0xFFFF ties by sort stability, so order[0..numSplats) is exactly the
 // real cut.
+//
+// [prec-1] (kroscloud.48) The packed centres may be relative to a source's
+// `centerOrigin` o (words = fp16(c - o)); every packed->world mapping here
+// goes through meshPackedToWorld = mesh.matrixWorld · T(o), composed on the
+// CPU in float64, so mesh.matrixWorld keeps meaning FILE frame -> world. No
+// origin = the matrices of before; the WGSL is the same either way.
 
 import type * as THREE from "three";
 import {
@@ -121,11 +127,16 @@ type SplatEncodingLike = {
   lodOpacity?: boolean;
 };
 
+// [prec-1] PackedSplats / PagedSplats `centerOrigin`: the packed centre words
+// hold fp16(c - o), c in the FILE frame (null / absent = none)
+export type CenterOriginLike = { x: number; y: number; z: number };
+
 type PackedSplatsLike = {
   numSplats: number;
   packedArray: Uint32Array | null;
   lodSplats?: PackedSplatsLike;
   splatEncoding?: SplatEncodingLike;
+  centerOrigin?: CenterOriginLike | null;
   getTexture(): THREE.DataArrayTexture;
   getNumSh(): number;
   ensureShTextures(): {
@@ -149,6 +160,7 @@ type PagedSplatsLike = {
   maxSh: number;
   pager?: SplatPagerLike;
   splatEncoding?: SplatEncodingLike;
+  centerOrigin?: CenterOriginLike | null;
   dynoIndices: { value: THREE.DataTexture };
 };
 
@@ -263,6 +275,64 @@ type MeshState = {
   visDispatchAttr: unknown;
   visCountAttr: THREE.BufferAttribute | null;
 };
+
+/** [prec-1] what meshPackedToWorld reads of a mesh (SplatMeshLike fits). */
+export type PackedFrameMeshLike = {
+  matrixWorld: THREE.Matrix4;
+  packedSplats?: {
+    centerOrigin?: CenterOriginLike | null;
+    lodSplats?: { centerOrigin?: CenterOriginLike | null };
+  };
+  paged?: { centerOrigin?: CenterOriginLike | null };
+};
+
+// [prec-1] The centre origin o of the packed words a state of `kind` reads:
+// static = the mesh's PackedSplats, lodPacked = its LOD tree (falling back to
+// the PackedSplats' own origin when the tree has none - an origin the app
+// sets on the base after a load also describes a tree decoded from the same
+// file), paged = the PagedSplats. null when unset or all zero.
+function packedCenterOrigin(
+  mesh: PackedFrameMeshLike,
+  kind: "static" | "lodPacked" | "paged",
+): CenterOriginLike | null {
+  const o =
+    kind === "paged"
+      ? mesh.paged?.centerOrigin
+      : kind === "lodPacked"
+        ? (mesh.packedSplats?.lodSplats?.centerOrigin ??
+          mesh.packedSplats?.centerOrigin)
+        : mesh.packedSplats?.centerOrigin;
+  return o && (o.x !== 0 || o.y !== 0 || o.z !== 0) ? o : null;
+}
+
+const originTranslation = new Matrix4();
+
+/**
+ * [prec-1] E = mesh.matrixWorld · T(o), written into `out`: maps the PACKED
+ * frame the GPU reads (centre words = fp16(c - o), o = the source's
+ * centerOrigin) to world, composed on the CPU in float64. mesh.matrixWorld
+ * keeps meaning FILE frame -> world for the app; every site in this backend
+ * that maps packed positions to world, or the camera into the packed frame,
+ * uses E: syncUniforms (object->view, the SH view origin) and
+ * updateKeygenUniforms (uMeshToWorld, the bounds corners, the closest point).
+ * The CPU bounds scans stay in the packed frame, which is consistent under
+ * E. With no origin E is a plain copy of matrixWorld - the numbers of before.
+ * E is fixed for a source (the origin is set before the mesh first renders
+ * and never changes), so the backend not re-sorting on a transform-only
+ * change (viewChanged is camera-only) gains no new staleness from it.
+ */
+export function meshPackedToWorld(
+  mesh: PackedFrameMeshLike,
+  kind: "static" | "lodPacked" | "paged",
+  out: Matrix4,
+): Matrix4 {
+  out.copy(mesh.matrixWorld);
+  const o = packedCenterOrigin(mesh, kind);
+  if (o) {
+    out.multiply(originTranslation.makeTranslation(o.x, o.y, o.z));
+  }
+  return out;
+}
 
 // fp16 → f32 (IEEE 754 half), for the CPU-side bounds scans
 function fromHalf(h: number): number {
@@ -1395,10 +1465,17 @@ export class WebGpuSplatBackend {
 
     // object→view = view ← world ← object; SplatTransformer semantics allow
     // uniform scale only, so decompose to quat + pos + scalar scale.
+    // [prec-1] "object" = the PACKED frame: E = matrixWorld · T(centerOrigin)
+    // (float64 here; the GPU only sees the composed camera-relative result).
+    const packedToWorld = meshPackedToWorld(
+      state.mesh,
+      state.kind,
+      new Matrix4(),
+    );
     const objectToView = new Matrix4()
       .copy(camera.matrixWorld)
       .invert()
-      .multiply(state.mesh.matrixWorld);
+      .multiply(packedToWorld);
     const pos = new Vector3();
     const quat = new Quaternion();
     const scl = new Vector3();
@@ -1409,9 +1486,8 @@ export class WebGpuSplatBackend {
 
     // SH viewDir origin: camera position in OBJECT space (stock evaluates SH
     // at read time in object space with viewOrigin = viewToObject.translate)
-    const worldToObject = new Matrix4()
-      .copy(state.mesh.matrixWorld)
-      .invert();
+    // [prec-1] in the packed frame, like the centres it is subtracted from
+    const worldToObject = new Matrix4().copy(packedToWorld).invert();
     const camWorld = camera.getWorldPosition(new Vector3());
     mat.viewOrigin.value.copy(camWorld.applyMatrix4(worldToObject));
   }
@@ -2298,7 +2374,14 @@ export class WebGpuSplatBackend {
 
   private updateKeygenUniforms(state: MeshState, camera: THREE.Camera): void {
     state.mesh.updateWorldMatrix(true, false);
-    (state.uMeshToWorld.value as THREE.Matrix4).copy(state.mesh.matrixWorld);
+    // [prec-1] the keygen and the CPU bounds below are in the PACKED frame:
+    // E = matrixWorld · T(centerOrigin) (== matrixWorld with no origin)
+    const packedToWorld = meshPackedToWorld(
+      state.mesh,
+      state.kind,
+      new Matrix4(),
+    );
+    (state.uMeshToWorld.value as THREE.Matrix4).copy(packedToWorld);
 
     const camPos = camera.getWorldPosition(new Vector3());
     (state.uCameraPos.value as THREE.Vector3).copy(camPos);
@@ -2318,7 +2401,7 @@ export class WebGpuSplatBackend {
         c & 2 ? mx.y : mn.y,
         c & 4 ? mx.z : mn.z,
       );
-      corner.applyMatrix4(state.mesh.matrixWorld);
+      corner.applyMatrix4(packedToWorld);
       const d = this.sortRadial
         ? corner.distanceTo(camPos)
         : corner.sub(camPos).dot(camDir) + 100.0;
@@ -2332,12 +2415,12 @@ export class WebGpuSplatBackend {
       // the object AABB, take the world-space distance to that point.
       const camObj = camPos
         .clone()
-        .applyMatrix4(new Matrix4().copy(state.mesh.matrixWorld).invert());
+        .applyMatrix4(new Matrix4().copy(packedToWorld).invert());
       const closest = new Vector3(
         Math.min(Math.max(camObj.x, mn.x), mx.x),
         Math.min(Math.max(camObj.y, mn.y), mx.y),
         Math.min(Math.max(camObj.z, mn.z), mx.z),
-      ).applyMatrix4(state.mesh.matrixWorld);
+      ).applyMatrix4(packedToWorld);
       minD = Math.max(0, closest.distanceTo(camPos));
     }
     if (this.sortKeyLog) {

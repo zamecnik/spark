@@ -49,6 +49,8 @@ type BuildTablesArgs = {
   centroids: SogPlaneRgba | null;
   maxSh: number;
   encoding?: SplatEncoding;
+  /** [prec-1] the runtime pack origin o_rel the centre tables subtract */
+  origin?: [number, number, number];
 };
 
 type PackBandArgs = {
@@ -128,7 +130,13 @@ async function decodePlane(args: DecodePlaneArgs): Promise<DecodePlaneResult> {
 
 function buildTables(args: BuildTablesArgs): { maxSh: number; paletteEntries: number; ms: number } {
   const t0 = performance.now();
-  tables = buildPackTables(args.meta, args.centroids, args.maxSh, args.encoding);
+  tables = buildPackTables(
+    args.meta,
+    args.centroids,
+    args.maxSh,
+    args.encoding,
+    args.origin,
+  );
   return { maxSh: tables.maxSh, paletteEntries: tables.paletteEntries, ms: performance.now() - t0 };
 }
 

@@ -7,6 +7,10 @@
 // encode helpers from packedEncode.ts. pcsogs.ts re-exports unpackPcSogs, so
 // existing consumers (oldWorker.ts, SplatLoader) are unchanged.
 //
+// [prec-1] (kroscloud.48) `options.origin`: the streamed-SOG unit decode packs
+// centres relative to the model's pack origin (fp16 precision far from the
+// file origin). Every other caller passes no origin and gets the same words.
+//
 // This module must NEVER value-import three or SplatLoader.
 
 import type { PcSogsJson, PcSogsV2Json } from "./SplatLoader";
@@ -34,6 +38,12 @@ export async function unpackPcSogs(
      * carry labels only (`json.shN.palette` set, one file in `shN.files`).
      */
     centroidsImage?: Promise<DecodedImage> | DecodedImage;
+    /**
+     * [prec-1] pack origin o (file frame): every centre is packed as
+     * fp16(c - o) and the consumer re-adds o (SsogSplats.centerOrigin, folded
+     * into the mesh transform). Absent = the words exactly as before.
+     */
+    origin?: readonly [number, number, number];
   },
 ): Promise<{
   packedArray: Uint32Array;
@@ -50,6 +60,12 @@ export async function unpackPcSogs(
   const maxSplats = computeMaxSplats(numSplats);
   const packedArray = new Uint32Array(maxSplats * 4);
   const extra: Record<string, unknown> = {};
+
+  // [prec-1] x - (+0) is x bit for bit (-0 included), so without an origin
+  // every centre word is the one this decoder always wrote.
+  const ox = options?.origin ? options.origin[0] || 0 : 0;
+  const oy = options?.origin ? options.origin[1] || 0 : 0;
+  const oz = options?.origin ? options.origin[2] || 0 : 0;
 
   const meansPromise = Promise.all([
     decodeImageRgba(extraFiles[json.means.files[0]]),
@@ -69,7 +85,7 @@ export async function unpackPcSogs(
       x = Math.sign(x) * (Math.exp(Math.abs(x)) - 1);
       y = Math.sign(y) * (Math.exp(Math.abs(y)) - 1);
       z = Math.sign(z) * (Math.exp(Math.abs(z)) - 1);
-      setPackedSplatCenter(packedArray, i, x, y, z);
+      setPackedSplatCenter(packedArray, i, x - ox, y - oy, z - oz);
     }
   });
 

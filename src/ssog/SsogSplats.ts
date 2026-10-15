@@ -16,7 +16,10 @@
 //     regrow ever (kroscloud.5 doctrine);
 //   - dispose stays DETACH-ONLY (inherited: releases the cut texture, pool
 //     outlives the view — pano roundtrip contract §2.7); `disposePool()` is
-//     the explicit full-teardown for final scene destruction.
+//     the explicit full-teardown for final scene destruction;
+//   - [prec-1] exposes the model's pack origin as `centerOrigin` (the unit
+//     decoder packs centres as fp16(c - packOrigin); the mesh transform folds
+//     it back, so mesh.matrixWorld keeps mapping the FILE frame to world).
 
 import {
   PagedSplats,
@@ -26,6 +29,7 @@ import {
   isMobile,
   workerPool,
 } from "@sparkjsdev/spark";
+import { Vector3 } from "three";
 import type { SplatEncoding } from "../defines";
 import type { SsogModel } from "./SsogModel";
 import { SSOG_PAGE_SPLATS } from "./SsogModel";
@@ -207,6 +211,22 @@ export class SsogSplats extends PagedSplats {
       encoding.sh2Max ?? 1,
       encoding.sh3Max ?? 1,
     );
+
+    // [prec-1] the origin the unit decoder subtracted is the CACHE's model's
+    // (SsogUnitCache passes cache.model.packOrigin) - normally the very same
+    // object as `model`; fixed for the model's lifetime, so it is set once.
+    const origin = cache.model.packOrigin;
+    if (cache.model !== model) {
+      const mine = model.packOrigin;
+      if (String(mine) !== String(origin)) {
+        console.warn(
+          `[ssog] SsogSplats model packOrigin ${String(mine)} != cache model ${String(origin)}; using the cache's (it decodes)`,
+        );
+      }
+    }
+    this.centerOrigin = origin
+      ? new Vector3(origin[0], origin[1], origin[2])
+      : null;
   }
 
   /**

@@ -63,12 +63,18 @@ async function unpackSsogUnit({
   files,
   encoding,
   palette,
+  origin,
 }: {
   json: PcSogsJson | PcSogsV2Json;
   files: Record<string, ArrayBuffer>;
   encoding?: SplatEncoding;
   /** [ssog-22] shared SH palette: key = relative path, bytes = the WebP */
   palette?: { key: string; bytes?: ArrayBuffer };
+  /**
+   * [prec-1] the model's pack origin: centres are packed as fp16(c - origin)
+   * (SsogSplats.centerOrigin re-adds it). Absent = the words as before.
+   */
+  origin?: [number, number, number];
 }) {
   let centroidsImage: Promise<DecodedImage> | undefined;
   if (palette) {
@@ -95,7 +101,7 @@ async function unpackSsogUnit({
     json,
     files,
     encoding ?? DEFAULT_SPLAT_ENCODING,
-    centroidsImage ? { centroidsImage } : undefined,
+    centroidsImage || origin ? { centroidsImage, origin } : undefined,
   );
 }
 

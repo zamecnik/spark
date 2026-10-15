@@ -12,6 +12,8 @@ export {
   SsogModel,
   type SsogLodMeta,
   type SsogLodMetaBound,
+  type SsogModelOptions,
+  ssogPackOrigin,
 } from "./SsogModel";
 export {
   SsogUnitCache,

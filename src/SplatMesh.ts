@@ -1,3 +1,4 @@
+// Modified by Kroscloud, 2026 — see FORK-CHANGES.md [full-2] [prec-1]
 import * as THREE from "three";
 
 import init_wasm, {
@@ -877,8 +878,20 @@ export class SplatMesh extends SplatGenerator {
       this.generatorDirty = true;
     }
 
+    // Kroscloud fork [prec-1]: the generator reads centres in the PACKED frame
+    // of the splats drawn this frame (words = fp16(c - o), o = their
+    // centerOrigin), so every transform below is derived from
+    // E = matrixWorld · T(o), composed here in float64: the object->world
+    // uniforms, and viewToObject (the SH view origin = the camera in the
+    // packed frame). With no origin E IS matrixWorld, so the uniforms are
+    // exactly today's. matrixWorld itself keeps meaning file frame -> world.
+    this.updateMatrixWorld();
+    const objectToWorldPacked = this.packedToWorld(
+      packedCenterOriginOf(this.context.splats, this.packedSplats, lodSplats),
+    );
+
     if (!this.covSplats) {
-      if (this.context.transform.update(this)) {
+      if (this.context.transform.updateFromMatrix(objectToWorldPacked)) {
         updated = true;
       }
 
@@ -911,7 +924,7 @@ export class SplatMesh extends SplatGenerator {
         updated = true;
       }
     } else {
-      if (this.context.covTransform.update(this)) {
+      if (this.context.covTransform.updateFromMatrix(objectToWorldPacked)) {
         updated = true;
       }
 
@@ -929,7 +942,7 @@ export class SplatMesh extends SplatGenerator {
         updated = true;
       }
 
-      const worldToObject = this.matrixWorld.clone().invert();
+      const worldToObject = objectToWorldPacked.clone().invert();
       const viewToObjectMatrix = worldToObject.multiply(viewToWorld);
       if (
         this.context.covViewToObject.updateFromMatrix(viewToObjectMatrix) &&
@@ -1008,6 +1021,43 @@ export class SplatMesh extends SplatGenerator {
     this.onFrame?.({ mesh: this, time, deltaTime });
   }
 
+  // Kroscloud fork [prec-1]: packed frame -> world for packed words whose
+  // centres hold c - origin: matrixWorld · T(origin), composed in float64.
+  // With no origin it returns matrixWorld itself (today's numbers, no copy).
+  // The result may be a scratch matrix: use it before the next call.
+  private packedToWorld(origin: THREE.Vector3 | null): THREE.Matrix4 {
+    if (!origin) {
+      return this.matrixWorld;
+    }
+    return this.packedToWorldScratch
+      .copy(this.matrixWorld)
+      .multiply(
+        SplatMesh.originTranslation.makeTranslation(
+          origin.x,
+          origin.y,
+          origin.z,
+        ),
+      );
+  }
+
+  private packedToWorldScratch = new THREE.Matrix4();
+  private static originTranslation = new THREE.Matrix4();
+
+  // Kroscloud fork [prec-1]: the same packed frame -> world for one of this
+  // mesh's sources (its PackedSplats, their LOD tree or its PagedSplats),
+  // for code outside the mesh that reads packed positions - SparkRenderer's
+  // own LOD traversal. Returns a NEW matrix (matrixWorld's copy when the
+  // source has no origin). Call after updateMatrixWorld.
+  packedFrameToWorld(splats: unknown): THREE.Matrix4 {
+    return this.packedToWorld(
+      packedCenterOriginOf(
+        splats,
+        this.packedSplats,
+        this.packedSplats?.lodSplats,
+      ),
+    ).clone();
+  }
+
   // This method conforms to the standard THREE.Raycaster API, performing object-ray
   // intersections using this method to populate the provided intersects[] array
   // with each intersection point.
@@ -1032,14 +1082,6 @@ export class SplatMesh extends SplatGenerator {
       : this.extSplats != null;
 
     const { near, far, ray } = raycaster;
-    const worldToMesh = this.matrixWorld.clone().invert();
-    const worldToMeshRot = new THREE.Matrix3().setFromMatrix4(worldToMesh);
-    const origin = ray.origin.clone().applyMatrix4(worldToMesh);
-    const direction = ray.direction.clone().applyMatrix3(worldToMeshRot);
-
-    const buffer = get_raycast_buffer();
-    const bufferSize = buffer.length / 4;
-    let intersections = 0;
 
     const numSplats =
       this.raycastIndices?.numSplats ??
@@ -1053,6 +1095,35 @@ export class SplatMesh extends SplatGenerator {
           ? (this.context.lodIndices.value.image.data as Uint32Array)
           : null) ??
       null;
+
+    // Kroscloud fork [prec-1]: the ray goes into the PACKED frame of the
+    // words tested below (the pool, the LOD tree or the base array - the same
+    // choice the packed/ext branches make), i.e. through inverse(E) with
+    // E = matrixWorld · T(o). E has matrixWorld's 3x3, so the hit distances
+    // stay parameters of the world ray and the hit points below are
+    // unchanged; with no origin E is matrixWorld exactly.
+    const raycastSplats = paged
+      ? this.paged
+      : ext
+        ? this.extSplats
+        : indices
+          ? (this.packedSplats?.lodSplats ?? this.packedSplats)
+          : this.packedSplats;
+    const meshToWorld = this.packedToWorld(
+      packedCenterOriginOf(
+        raycastSplats,
+        this.packedSplats,
+        this.packedSplats?.lodSplats,
+      ),
+    );
+    const worldToMesh = meshToWorld.clone().invert();
+    const worldToMeshRot = new THREE.Matrix3().setFromMatrix4(worldToMesh);
+    const origin = ray.origin.clone().applyMatrix4(worldToMesh);
+    const direction = ray.direction.clone().applyMatrix3(worldToMeshRot);
+
+    const buffer = get_raycast_buffer();
+    const bufferSize = buffer.length / 4;
+    let intersections = 0;
 
     if (!ext) {
       const packed = paged
@@ -1208,6 +1279,26 @@ export class SplatMesh extends SplatGenerator {
       await this.extSplats.createLodSplats({ quality, rgbaArray });
     }
   }
+}
+
+// Kroscloud fork [prec-1]: the fold origin of the splat source a SplatMesh
+// reads - its `centerOrigin` (PackedSplats / PagedSplats) when set and not
+// all zero, else null. A LOD tree with no origin of its own takes the base
+// PackedSplats' (an origin the app sets on the base after a load also
+// describes a tree decoded from the same file). ExtSplats carry float32
+// centres and no origin.
+function packedCenterOriginOf(
+  splats: unknown,
+  base: PackedSplats | undefined,
+  lodSplats: unknown,
+): THREE.Vector3 | null {
+  let o =
+    (splats as { centerOrigin?: THREE.Vector3 | null } | null | undefined)
+      ?.centerOrigin ?? null;
+  if (!o && base && splats != null && splats === lodSplats) {
+    o = base.centerOrigin;
+  }
+  return o && (o.x !== 0 || o.y !== 0 || o.z !== 0) ? o : null;
 }
 
 export function maybeLookupIndex(
