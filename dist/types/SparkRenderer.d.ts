@@ -407,7 +407,11 @@ export declare class SparkRenderer extends THREE.Mesh {
     sortTimeoutId: number;
     sortedCenter: THREE.Vector3;
     sortedDir: THREE.Vector3;
+    sortedUp: THREE.Vector3;
+    private cameraUp;
+    private cameraQuat;
     readback32: Uint32Array<ArrayBuffer>;
+    accumFocus: THREE.Vector3 | (() => THREE.Vector3 | null) | null;
     enableLod: boolean;
     enableDriveLod: boolean;
     enableLodFetching: boolean;
@@ -598,6 +602,31 @@ export declare class SparkRenderer extends THREE.Mesh {
         scene: THREE.Scene;
         camera: THREE.Camera;
     }): Promise<void>;
+    /**
+     * Kroscloud fork [fov-3]: the cosine of the view-direction change that counts
+     * as viewChanged (re-sort; WebGL2: re-accumulate). Upstream 0.999 (2.56 deg)
+     * is ~5 % of a normal FOV but 2.5 screen widths of a 1 deg one, and two things
+     * follow the view direction: the WebGPU visible-count compact sort (phones)
+     * culls against the frustum at sort time - a look-around under 2.56 deg left
+     * splats missing at the screen edges - and the [fov-2] accumulator origin.
+     * Now min(2.56 deg, 10 % of the narrower half-FOV) for a perspective camera
+     * (the cull keeps a 40 % margin, clipXY 1.4): 2.5 deg at 50 deg, 0.05 deg at
+     * 1 deg. Other projections keep 0.999.
+     */
+    static coorientThreshold(camera: THREE.Camera): number;
+    /**
+     * Kroscloud fork [fov-2]: the origin the WebGL2 packed accumulator stores
+     * centres relative to (SplatAccumulator.accumOrigin). Upstream: the camera.
+     * With accumFocus set and a perspective camera: the point on the view axis
+     * k*h short of the focus depth D, h = D tan(fovY/2) the half-height of the
+     * view there and k = 2048 / render height (0.5..4), so on-screen content at
+     * the focus depth lies within ~3h of the origin and its fp16 step stays
+     * ~0.5 px whatever the FOV (stored relative to the camera it is ~2^-11 of
+     * the focal length in px: 0.6 at 50 deg, 30 at 1 deg). At a normal FOV the
+     * point stays near the camera (50 deg at 1080 px: 0.07 D), the upstream
+     * behaviour for near content; it moves out only as the FOV narrows.
+     */
+    private accumulatorOrigin;
     private updateInternal;
     private driveSort;
     private ensureLodWorker;

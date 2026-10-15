@@ -6,7 +6,11 @@ export type SogPlaneRgba = {
     height: number;
 };
 export type PackTables = {
-    /** toHalf(center_c(n)) for every 16-bit mean value n, per axis. */
+    /**
+     * toHalf(center_c(n) - origin[c]) for every 16-bit mean value n, per axis
+     * ([prec-1]: origin = the loader's runtime pack origin o_rel, [0,0,0] =
+     * the stream's words).
+     */
     centerHalf: [Uint16Array, Uint16Array, Uint16Array];
     /** The packed scale byte for every scales-plane byte. */
     scaleByte: Uint8Array;
@@ -27,8 +31,11 @@ export type PackTables = {
 /**
  * Build every lookup the packer needs, once per scene. `centroids` is the
  * decoded shN_centroids plane (required when maxSh > 0 and the file has SH).
+ * [prec-1] `origin` is subtracted from every decoded centre before the fp16
+ * encode (the runtime pack origin; the PackedSplats carries it back as
+ * centerOrigin). The default [0, 0, 0] writes the stream's words exactly.
  */
-export declare function buildPackTables(meta: SogMeta, centroids: SogPlaneRgba | null, maxShRequested: number, encoding?: SplatEncoding): PackTables;
+export declare function buildPackTables(meta: SogMeta, centroids: SogPlaneRgba | null, maxShRequested: number, encoding?: SplatEncoding, origin?: readonly [number, number, number]): PackTables;
 /** RGBA pixels of the six per-splat planes for one contiguous splat range. */
 export type PackPlanes = {
     meansL: Uint8Array;

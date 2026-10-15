@@ -31,6 +31,7 @@ export declare class PagedSplats implements SplatSource {
         chunksStart: number;
     }>;
     totalFileSplats: number;
+    centerOrigin: THREE.Vector3 | null;
     dynoNumSplats: dyno.DynoInt<"numSplats">;
     dynoIndices: dyno.DynoUsampler2D<"indices", THREE.DataTexture>;
     rgbMinMaxLnScaleMinMax: dyno.DynoVec4<THREE.Vector4, "rgbMinMaxLnScaleMinMax">;

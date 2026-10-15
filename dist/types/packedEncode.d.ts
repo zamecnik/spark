@@ -1,7 +1,9 @@
 export declare const toHalf: typeof toHalfNative;
 export declare const fromHalf: typeof fromHalfNative;
 declare function toHalfNative(f: number): number;
+export declare function toHalfJS(f: number): number;
 declare function fromHalfNative(u: number): number;
+export declare function fromHalfJS(h: number): number;
 export declare function floatToUint8(v: number): number;
 export type QuatXyzw = {
     x: number;

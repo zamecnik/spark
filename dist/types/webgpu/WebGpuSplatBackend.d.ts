@@ -1,5 +1,7 @@
+import { Matrix4 } from 'three/webgpu';
 import { TslNode } from './packedSplatsTsl';
 import { SplatNodeMaterial } from './SplatNodeMaterial';
+import { RobustKeyMap } from './sortKeyRange';
 import type * as THREE from "three";
 type SplatEncodingLike = {
     rgbMin?: number;
@@ -11,11 +13,17 @@ type SplatEncodingLike = {
     sh3Max?: number;
     lodOpacity?: boolean;
 };
+export type CenterOriginLike = {
+    x: number;
+    y: number;
+    z: number;
+};
 type PackedSplatsLike = {
     numSplats: number;
     packedArray: Uint32Array | null;
     lodSplats?: PackedSplatsLike;
     splatEncoding?: SplatEncodingLike;
+    centerOrigin?: CenterOriginLike | null;
     getTexture(): THREE.DataArrayTexture;
     getNumSh(): number;
     ensureShTextures(): {
@@ -51,6 +59,7 @@ type PagedSplatsLike = {
     maxSh: number;
     pager?: SplatPagerLike;
     splatEncoding?: SplatEncodingLike;
+    centerOrigin?: CenterOriginLike | null;
     dynoIndices: {
         value: THREE.DataTexture;
     };
@@ -102,6 +111,34 @@ type SparkRendererLike = THREE.Mesh & {
     lodInstances?: Map<unknown, LodInstanceLike>;
 };
 type SourceKind = "static" | "lodPacked" | "paged";
+/** [prec-1] what meshPackedToWorld reads of a mesh (SplatMeshLike fits). */
+export type PackedFrameMeshLike = {
+    matrixWorld: THREE.Matrix4;
+    packedSplats?: {
+        centerOrigin?: CenterOriginLike | null;
+        lodSplats?: {
+            centerOrigin?: CenterOriginLike | null;
+        };
+    };
+    paged?: {
+        centerOrigin?: CenterOriginLike | null;
+    };
+};
+/**
+ * [prec-1] E = mesh.matrixWorld · T(o), written into `out`: maps the PACKED
+ * frame the GPU reads (centre words = fp16(c - o), o = the source's
+ * centerOrigin) to world, composed on the CPU in float64. mesh.matrixWorld
+ * keeps meaning FILE frame -> world for the app; every site in this backend
+ * that maps packed positions to world, or the camera into the packed frame,
+ * uses E: syncUniforms (object->view, the SH view origin) and
+ * updateKeygenUniforms (uMeshToWorld, the bounds corners, the closest point).
+ * The CPU bounds scans stay in the packed frame, which is consistent under
+ * E. With no origin E is a plain copy of matrixWorld - the numbers of before.
+ * E is fixed for a source (the origin is set before the mesh first renders
+ * and never changes), so the backend not re-sorting on a transform-only
+ * change (viewChanged is camera-only) gains no new staleness from it.
+ */
+export declare function meshPackedToWorld(mesh: PackedFrameMeshLike, kind: "static" | "lodPacked" | "paged", out: Matrix4): Matrix4;
 /** What prepare() did (telemetry + the harness). */
 export type WebGpuSplatPrepareReport = {
     /** true when every step ran; false = skipped or failed (see reason/error) */
@@ -129,6 +166,8 @@ export declare class WebGpuSplatBackend {
     placeholderMaterial: THREE.Material;
     sortRadial: boolean;
     sortKeyLog: boolean;
+    sortKeyRobust: boolean;
+    lastKeyMap: RobustKeyMap | null;
     freezeOrder: boolean;
     vsMinimal: number;
     parityQuantize: boolean;
@@ -237,6 +276,7 @@ export declare class WebGpuSplatBackend {
     private stateMatches;
     private buildState;
     private updateBounds;
+    private updateRobustBounds;
     private updateKeygenUniforms;
 }
 export {};

@@ -1193,11 +1193,86 @@ class BatchedSplatGeometry extends THREE__namespace.InstancedBufferGeometry {
     this.setIndex(new THREE__namespace.BufferAttribute(idx, 1));
   }
 }
+const ROBUST_Q = 5e-3;
+const ROBUST_PAD = 0.05;
+const ROBUST_SAMPLES = 32768;
+const ROBUST_TAIL_SHARE = 1 / 16;
+function selectKth(a, k, lo0, hi0) {
+  let lo = lo0;
+  let hi = hi0;
+  while (hi > lo) {
+    const mid = lo + hi >>> 1;
+    if (a[mid] < a[lo]) [a[mid], a[lo]] = [a[lo], a[mid]];
+    if (a[hi] < a[lo]) [a[hi], a[lo]] = [a[lo], a[hi]];
+    if (a[hi] < a[mid]) [a[hi], a[mid]] = [a[mid], a[hi]];
+    const pivot = a[mid];
+    let i = lo;
+    let j = hi;
+    while (i <= j) {
+      while (a[i] < pivot) i++;
+      while (a[j] > pivot) j--;
+      if (i <= j) {
+        const t = a[i];
+        a[i] = a[j];
+        a[j] = t;
+        i++;
+        j--;
+      }
+    }
+    if (k <= j) hi = j;
+    else if (k >= i) lo = i;
+    else break;
+  }
+  return a[k];
+}
+function paddedQuantileRange(a, m, q = ROBUST_Q, pad2 = ROBUST_PAD) {
+  const kLo = Math.floor(q * (m - 1));
+  const kHi = Math.ceil((1 - q) * (m - 1));
+  const lo = selectKth(a, kLo, 0, m - 1);
+  const hi = selectKth(a, kHi, kLo, m - 1);
+  const p = pad2 * (hi - lo) + 1e-6;
+  return [lo - p, hi + p];
+}
+function robustKeyMap(c0, m0, robustMin, robustMax) {
+  let c1 = Math.min(Math.max(robustMin, c0), m0);
+  let m1 = Math.min(Math.max(robustMax, c1), m0);
+  if (!(c1 >= c0 * 1.01)) c1 = c0;
+  if (!(m1 <= m0 / 1.01)) m1 = m0;
+  if (m1 < c1 * 1.001) {
+    m1 = Math.min(m0, c1 * 1.001);
+    if (m1 < c1 * 1.001) c1 = Math.max(c0, m1 / 1.001);
+  }
+  const aN = c1 > c0 ? ROBUST_TAIL_SHARE : 0;
+  const aF = m1 < m0 ? ROBUST_TAIL_SHARE : 0;
+  const aM = 1 - aN - aF;
+  const l0 = Math.log(c0 / c1);
+  const l2 = Math.log(m1 / c1);
+  const l3 = Math.log(m0 / c1);
+  return {
+    a: [c0, 1 / c1, l0, l2],
+    g: [aN > 0 ? aN / -l0 : 0, aM / l2, aF > 0 ? aF / (l3 - l2) : 0],
+    cap: [aN, aM, aF]
+  };
+}
 const LN_SCALE_MIN = -12;
 const LN_SCALE_MAX = 9;
 const unpackHalf2x16 = TSL__namespace.unpackHalf2x16;
 const packHalf2x16 = TSL__namespace.packHalf2x16;
 const uvec4 = TSL__namespace.uvec4;
+function packedCenterOrigin(mesh, kind) {
+  var _a, _b, _c, _d, _e;
+  const o = kind === "paged" ? (_a = mesh.paged) == null ? void 0 : _a.centerOrigin : kind === "lodPacked" ? ((_c = (_b = mesh.packedSplats) == null ? void 0 : _b.lodSplats) == null ? void 0 : _c.centerOrigin) ?? ((_d = mesh.packedSplats) == null ? void 0 : _d.centerOrigin) : (_e = mesh.packedSplats) == null ? void 0 : _e.centerOrigin;
+  return o && (o.x !== 0 || o.y !== 0 || o.z !== 0) ? o : null;
+}
+const originTranslation = new webgpu.Matrix4();
+function meshPackedToWorld(mesh, kind, out) {
+  out.copy(mesh.matrixWorld);
+  const o = packedCenterOrigin(mesh, kind);
+  if (o) {
+    out.multiply(originTranslation.makeTranslation(o.x, o.y, o.z));
+  }
+  return out;
+}
 function fromHalf(h) {
   const s = (h & 32768) >> 15;
   const e = (h & 31744) >> 10;
@@ -1287,6 +1362,68 @@ function finishBounds(minXIn, minYIn, minZIn, maxXIn, maxYIn, maxZIn) {
     max: new webgpu.Vector3(maxX + mx, maxY + my, maxZ + mz)
   };
 }
+function robustBounds(words, offsetOf, count, raw) {
+  const n = Math.min(count, ROBUST_SAMPLES);
+  const fallback = { min: raw.min.clone(), max: raw.max.clone() };
+  if (n < 256) return fallback;
+  const half = halfToFloatTable();
+  const xs = new Float32Array(n);
+  const ys = new Float32Array(n);
+  const zs = new Float32Array(n);
+  let m = 0;
+  for (let s = 0; s < n; s++) {
+    const o = offsetOf(Math.floor(s * count / n));
+    const w1 = words[o + 1];
+    const w2 = words[o + 2];
+    const x = half[w1 & 65535];
+    const y = half[w1 >>> 16];
+    const z = half[w2 & 65535];
+    if (!Number.isFinite(x + y + z)) continue;
+    xs[m] = x;
+    ys[m] = y;
+    zs[m] = z;
+    m++;
+  }
+  if (m < 256) return fallback;
+  const out = fallback;
+  const axes = [
+    [xs, "x"],
+    [ys, "y"],
+    [zs, "z"]
+  ];
+  for (const [a, c] of axes) {
+    const [lo, hi] = paddedQuantileRange(a, m);
+    out.min[c] = Math.min(Math.max(lo, raw.min[c]), raw.max[c]);
+    out.max[c] = Math.max(Math.min(hi, raw.max[c]), out.min[c]);
+  }
+  return out;
+}
+function boxDistanceRange(mn, mx, packedToWorld, worldToPacked, camPos, camDir, radial) {
+  let minD = Number.POSITIVE_INFINITY;
+  let maxD = Number.NEGATIVE_INFINITY;
+  const corner = new webgpu.Vector3();
+  for (let c = 0; c < 8; c++) {
+    corner.set(
+      c & 1 ? mx.x : mn.x,
+      c & 2 ? mx.y : mn.y,
+      c & 4 ? mx.z : mn.z
+    );
+    corner.applyMatrix4(packedToWorld);
+    const d = radial ? corner.distanceTo(camPos) : corner.sub(camPos).dot(camDir) + 100;
+    if (d < minD) minD = d;
+    if (d > maxD) maxD = d;
+  }
+  if (radial) {
+    const camObj = camPos.clone().applyMatrix4(worldToPacked);
+    const closest = new webgpu.Vector3(
+      Math.min(Math.max(camObj.x, mn.x), mx.x),
+      Math.min(Math.max(camObj.y, mn.y), mx.y),
+      Math.min(Math.max(camObj.z, mn.z), mx.z)
+    ).applyMatrix4(packedToWorld);
+    minD = Math.max(0, closest.distanceTo(camPos));
+  }
+  return [minD, maxD];
+}
 function dispatch2d(groups) {
   const MAX_PER_DIM = 65535;
   if (groups <= MAX_PER_DIM) return [groups];
@@ -1340,6 +1477,8 @@ class WebGpuSplatBackend {
   constructor() {
     this.sortRadial = true;
     this.sortKeyLog = true;
+    this.sortKeyRobust = true;
+    this.lastKeyMap = null;
     this.freezeOrder = false;
     this.vsMinimal = 0;
     this.parityQuantize = true;
@@ -1734,6 +1873,7 @@ class WebGpuSplatBackend {
     const b = finishBounds(acc[0], acc[1], acc[2], acc[3], acc[4], acc[5]);
     state.boundsMin.copy(b.min);
     state.boundsMax.copy(b.max);
+    this.updateRobustBounds(state, b, arr, (k) => 4 * k, src.numSplats);
   }
   // One compute node through three's real first-dispatch path, with the
   // dispatch disabled and a new pipeline's compile made async. three creates
@@ -1861,7 +2001,12 @@ class WebGpuSplatBackend {
       enc.lnScaleMax ?? 9
     );
     mat.shMax.value.set(enc.sh1Max ?? 1, enc.sh2Max ?? 1, enc.sh3Max ?? 1);
-    const objectToView = new webgpu.Matrix4().copy(camera.matrixWorld).invert().multiply(state.mesh.matrixWorld);
+    const packedToWorld = meshPackedToWorld(
+      state.mesh,
+      state.kind,
+      new webgpu.Matrix4()
+    );
+    const objectToView = new webgpu.Matrix4().copy(camera.matrixWorld).invert().multiply(packedToWorld);
     const pos = new webgpu.Vector3();
     const quat = new webgpu.Quaternion();
     const scl = new webgpu.Vector3();
@@ -1869,7 +2014,7 @@ class WebGpuSplatBackend {
     mat.renderToViewQuat.value.set(quat.x, quat.y, quat.z, quat.w);
     mat.renderToViewPos.value.copy(pos);
     mat.renderToViewScale.value = scl.x;
-    const worldToObject = new webgpu.Matrix4().copy(state.mesh.matrixWorld).invert();
+    const worldToObject = new webgpu.Matrix4().copy(packedToWorld).invert();
     const camWorld = camera.getWorldPosition(new webgpu.Vector3());
     mat.viewOrigin.value.copy(camWorld.applyMatrix4(worldToObject));
   }
@@ -2056,8 +2201,22 @@ class WebGpuSplatBackend {
     const uCameraPos = TSL.uniform(new webgpu.Vector3());
     const uCameraDir = TSL.uniform(new webgpu.Vector3(0, 0, -1));
     const uDistRange = TSL.uniform(new webgpu.Vector3(0, 1, 0));
+    const uKeyA = TSL.uniform(new webgpu.Vector4(0.02, 50, 0, 1));
+    const uKeyG = TSL.uniform(new webgpu.Vector3(0, 1, 0));
+    const uKeyCap = TSL.uniform(new webgpu.Vector3(0, 1, 0));
     const sortRadial = this.sortRadial;
     const sortKeyLog = this.sortKeyLog;
+    const robustKeys = sortKeyLog && this.sortKeyRobust;
+    const keyNorm = (metric) => {
+      if (robustKeys) {
+        const A = uKeyA;
+        const G = uKeyG;
+        const C = uKeyCap;
+        const l = TSL.log(TSL.max(metric, A.x).mul(A.y));
+        return TSL.clamp(l.sub(A.z).mul(G.x), 0, C.x).add(TSL.clamp(l.mul(G.y), 0, C.y)).add(TSL.clamp(l.sub(A.w).mul(G.z), 0, C.z));
+      }
+      return sortKeyLog ? TSL.log(TSL.max(metric, uDistRange.z)).sub(uDistRange.x).div(uDistRange.y) : metric.sub(uDistRange.x).div(uDistRange.y.sub(uDistRange.x));
+    };
     const keygen = TSL.Fn(() => {
       const i = TSL.instanceIndex;
       TSL.If(i.greaterThanEqual(TSL.uint(Math.max(1, capacity))), () => {
@@ -2093,7 +2252,7 @@ class WebGpuSplatBackend {
       const zw = unpackHalf2x16(t.z.bitAnd(TSL.uint(65535)));
       const world = uMeshToWorld.mul(TSL.vec4(TSL.vec3(xy.x, xy.y, zw.x), 1)).xyz.toVar();
       const metric = sortRadial ? world.sub(uCameraPos).length() : world.sub(uCameraPos).dot(uCameraDir).add(100);
-      const norm = sortKeyLog ? TSL.log(TSL.max(metric, uDistRange.z)).sub(uDistRange.x).div(uDistRange.y) : metric.sub(uDistRange.x).div(uDistRange.y.sub(uDistRange.x));
+      const norm = keyNorm(metric);
       const q = TSL.uint(TSL.float(1).sub(TSL.clamp(norm, 0, 1)).mul(quantMax));
       keysNode.element(i).assign(q);
     })().compute(dispatch2d(Math.ceil(Math.max(1, capacity) / 256)), [256]).setName("splatKeygen");
@@ -2372,9 +2531,7 @@ class WebGpuSplatBackend {
         });
         TSL.If(TSL.float(uWK).greaterThan(0.5), () => {
           const metric = sortRadial ? viewCenter.length() : viewCenter.z.negate().add(100);
-          const normK = sortKeyLog ? TSL.log(TSL.max(metric, uDistRange.z)).sub(uDistRange.x).div(uDistRange.y) : metric.sub(uDistRange.x).div(
-            uDistRange.y.sub(uDistRange.x)
-          );
+          const normK = keyNorm(metric);
           const qk = TSL.uint(TSL.float(1).sub(TSL.clamp(normK, 0, 1)).mul(quantMax));
           if (visOn && visCountAtomic && compactVals) {
             TSL.If(rejected.not(), () => {
@@ -2444,8 +2601,14 @@ class WebGpuSplatBackend {
       uCameraPos,
       uCameraDir,
       uDistRange,
+      uKeyA,
+      uKeyG,
+      uKeyCap,
+      robustKeys,
       boundsMin: new webgpu.Vector3(0, 0, 0),
       boundsMax: new webgpu.Vector3(1, 1, 1),
+      robustMin: new webgpu.Vector3(0, 0, 0),
+      robustMax: new webgpu.Vector3(1, 1, 1),
       lastNumSplats: -1,
       lastMappingVersion: -1,
       drawInstances: 0,
@@ -2472,11 +2635,15 @@ class WebGpuSplatBackend {
     var _a, _b, _c, _d, _e, _f, _g;
     const mesh = state.mesh;
     let bounds = null;
+    let words = null;
+    let offsetOf = null;
     if (src.kind === "static") {
       const arr = (_a = mesh.packedSplats) == null ? void 0 : _a.packedArray;
       if (arr) {
         let i = 0;
         bounds = scanBounds(arr, () => 4 * i++, src.numSplats);
+        words = arr;
+        offsetOf = (k) => 4 * k;
       }
     } else if (src.kind === "lodPacked") {
       const arr = (_c = (_b = mesh.packedSplats) == null ? void 0 : _b.lodSplats) == null ? void 0 : _c.packedArray;
@@ -2493,6 +2660,8 @@ class WebGpuSplatBackend {
           },
           Math.floor(src.numSplats / step)
         );
+        words = arr;
+        offsetOf = (k) => 4 * cut[k];
       }
     } else {
       const pool = (_f = (_e = mesh.paged) == null ? void 0 : _e.pager) == null ? void 0 : _f.packedTexture.value.image.data;
@@ -2509,44 +2678,48 @@ class WebGpuSplatBackend {
           },
           Math.floor(src.numSplats / step)
         );
+        words = pool;
+        offsetOf = (k) => {
+          const idx = cut[k];
+          return 4 * ((idx >>> 16) * 65536 + (idx & 65535));
+        };
       }
     }
     if (bounds) {
       state.boundsMin.copy(bounds.min);
       state.boundsMax.copy(bounds.max);
+      this.updateRobustBounds(state, bounds, words, offsetOf, src.numSplats);
     }
+  }
+  // [fov-1] state.robustMin/Max from the source's centres (the raw box when
+  // the robust keys are off or nothing can be sampled).
+  updateRobustBounds(state, raw, words, offsetOf, count) {
+    const r = state.robustKeys && words && offsetOf ? robustBounds(words, offsetOf, count, raw) : raw;
+    state.robustMin.copy(r.min);
+    state.robustMax.copy(r.max);
   }
   updateKeygenUniforms(state, camera) {
     state.mesh.updateWorldMatrix(true, false);
-    state.uMeshToWorld.value.copy(state.mesh.matrixWorld);
+    const packedToWorld = meshPackedToWorld(
+      state.mesh,
+      state.kind,
+      new webgpu.Matrix4()
+    );
+    state.uMeshToWorld.value.copy(packedToWorld);
     const camPos = camera.getWorldPosition(new webgpu.Vector3());
     state.uCameraPos.value.copy(camPos);
     const camDir = camera.getWorldDirection(new webgpu.Vector3());
     state.uCameraDir.value.copy(camDir);
-    const { boundsMin: mn, boundsMax: mx } = state;
-    let minD = Number.POSITIVE_INFINITY;
-    let maxD = Number.NEGATIVE_INFINITY;
-    const corner = new webgpu.Vector3();
-    for (let c = 0; c < 8; c++) {
-      corner.set(
-        c & 1 ? mx.x : mn.x,
-        c & 2 ? mx.y : mn.y,
-        c & 4 ? mx.z : mn.z
-      );
-      corner.applyMatrix4(state.mesh.matrixWorld);
-      const d = this.sortRadial ? corner.distanceTo(camPos) : corner.sub(camPos).dot(camDir) + 100;
-      if (d < minD) minD = d;
-      if (d > maxD) maxD = d;
-    }
-    if (this.sortRadial) {
-      const camObj = camPos.clone().applyMatrix4(new webgpu.Matrix4().copy(state.mesh.matrixWorld).invert());
-      const closest = new webgpu.Vector3(
-        Math.min(Math.max(camObj.x, mn.x), mx.x),
-        Math.min(Math.max(camObj.y, mn.y), mx.y),
-        Math.min(Math.max(camObj.z, mn.z), mx.z)
-      ).applyMatrix4(state.mesh.matrixWorld);
-      minD = Math.max(0, closest.distanceTo(camPos));
-    }
+    const worldToPacked = new webgpu.Matrix4().copy(packedToWorld).invert();
+    let [minD, maxD] = boxDistanceRange(
+      state.boundsMin,
+      state.boundsMax,
+      packedToWorld,
+      worldToPacked,
+      camPos,
+      camDir,
+      this.sortRadial
+    );
     if (this.sortKeyLog) {
       const minClamp = Math.max(minD, 0.02);
       if (maxD <= minClamp * 1.001) maxD = minClamp * 2;
@@ -2556,6 +2729,22 @@ class WebGpuSplatBackend {
         Math.log(maxD) - logMin,
         minClamp
       );
+      if (state.robustKeys) {
+        const [rMin, rMax] = boxDistanceRange(
+          state.robustMin,
+          state.robustMax,
+          packedToWorld,
+          worldToPacked,
+          camPos,
+          camDir,
+          this.sortRadial
+        );
+        const map = robustKeyMap(minClamp, maxD, rMin, rMax);
+        state.uKeyA.value.set(...map.a);
+        state.uKeyG.value.set(...map.g);
+        state.uKeyCap.value.set(...map.cap);
+        this.lastKeyMap = map;
+      }
       return;
     }
     if (maxD <= minD) maxD = minD + 1;

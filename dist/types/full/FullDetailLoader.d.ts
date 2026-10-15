@@ -34,6 +34,13 @@ export type FullDetailOptions = {
     requestHeader?: Record<string, string>;
     withCredentials?: boolean;
     splatEncoding?: SplatEncoding;
+    /**
+     * [prec-1] pack the centres relative to the runtime pack origin o_rel (the
+     * rounded per-axis median of the mean codes). Default true; false = o_rel
+     * [0, 0, 0] (the app's `?splatorigin=off` A/B lever). A meta.json kcOrigin
+     * is applied either way.
+     */
+    packOrigin?: boolean;
 };
 export type FullDetailStats = {
     bytes: number;
@@ -50,6 +57,8 @@ export type FullDetailStats = {
     ms: {
         download: number;
         decodeTail: number;
+        /** [prec-1] the mean-code histogram + median (0 with packOrigin false) */
+        origin: number;
         tables: number;
         pack: number;
         total: number;
@@ -61,13 +70,21 @@ export type FullDetailStats = {
     }>;
 };
 export type FullDetailResult = {
+    /** centerOrigin = kcOrigin + packOrigin (null when both are zero) */
     packedSplats: PackedSplats;
     meta: SogMeta;
     numSplats: number;
+    /** FILE frame (kcOrigin added back) - what mesh.matrixWorld maps to world */
     bounds: {
         min: [number, number, number];
         max: [number, number, number];
     };
+    /**
+     * [prec-1] the RUNTIME part of the centre origin (o_rel: the rounded
+     * per-axis median the tables subtracted), null when zero or disabled.
+     * Diagnostics; the full origin is packedSplats.centerOrigin.
+     */
+    packOrigin: [number, number, number] | null;
     stats: FullDetailStats;
 };
 export declare function loadFullDetailSog(options: FullDetailOptions): Promise<FullDetailResult>;

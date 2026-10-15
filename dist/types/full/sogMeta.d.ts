@@ -16,11 +16,17 @@ export type SogMeta = {
     shNCodebook: Float64Array | null;
     /** File names by role, as written in the manifest (no directory prefix). */
     files: Record<SogPlaneName, string | null>;
+    /**
+     * [prec-2] `kcOrigin`: the vector the build subtracted from every mean
+     * (stored means = original - origin, raw/file frame). null when absent or
+     * [0, 0, 0].
+     */
+    origin: [number, number, number] | null;
     /** The manifest, verbatim (the reference decoder's input shape). */
     json: PcSogsV2Json;
 };
 export declare class SogMetaError extends Error {
-    readonly code: "not-v2" | "count" | "means" | "codebook" | "codebook-null" | "files" | "bands";
+    readonly code: "not-v2" | "count" | "means" | "codebook" | "codebook-null" | "files" | "bands" | "origin";
     constructor(code: SogMetaError["code"], message: string);
 }
 /**
@@ -44,8 +50,11 @@ export declare function planeSize(count: number): {
  * sign(v)·(exp|v|−1) of the stored corners. Exact, and available before a
  * single texel is decoded — the loader hands these to the app so it never
  * has to walk 20M packed centers on the main thread.
+ *
+ * [prec-2] In the FILE frame: a recentred file's `kcOrigin` (meta.origin) is
+ * added back, so the bounds are the original scene's whatever the build did.
  */
-export declare function boundsFromMeta(meta: SogMeta): {
+export declare function boundsFromMeta(meta: Pick<SogMeta, "means"> & Partial<Pick<SogMeta, "origin">>): {
     min: [number, number, number];
     max: [number, number, number];
 };

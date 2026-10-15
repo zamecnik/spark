@@ -24,6 +24,7 @@ export type PackedSplatsOptions = {
     nonLod?: boolean;
     lodAbove?: number;
     lodSplats?: PackedSplats;
+    centerOrigin?: THREE.Vector3 | readonly [number, number, number] | null;
 };
 export declare class PackedSplats implements SplatSource {
     maxSplats: number;
@@ -35,6 +36,7 @@ export declare class PackedSplats implements SplatSource {
     lod?: boolean | "quality";
     nonLod?: boolean;
     lodSplats?: PackedSplats;
+    centerOrigin: THREE.Vector3 | null;
     initialized: Promise<PackedSplats>;
     isInitialized: boolean;
     target: THREE.WebGLArrayRenderTarget | null;

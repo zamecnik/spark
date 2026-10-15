@@ -1,8 +1,8 @@
 "use strict";
 Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 const spark = require("@sparkjsdev/spark");
-const packedEncode = require("./packedEncode-ClYvQIUY.cjs");
-const jsContent = '(function() {\n  "use strict";\n  const LN_SCALE_MIN = -12;\n  const LN_SCALE_MAX = 9;\n  const LN_SCALE_ZERO = -30;\n  const SCALE_ZERO = Math.exp(LN_SCALE_ZERO);\n  const DEFAULT_SPLAT_ENCODING = {\n    rgbMin: 0,\n    rgbMax: 1,\n    lnScaleMin: LN_SCALE_MIN,\n    lnScaleMax: LN_SCALE_MAX,\n    sh1Max: 1,\n    sh2Max: 1,\n    sh3Max: 1,\n    lodOpacity: false\n  };\n  const f32buffer = new Float32Array(1);\n  const u32buffer = new Uint32Array(f32buffer.buffer);\n  const supportsFloat16Array = "Float16Array" in globalThis;\n  const f16buffer = supportsFloat16Array ? new globalThis["Float16Array"](1) : null;\n  const u16buffer = new Uint16Array(f16buffer == null ? void 0 : f16buffer.buffer);\n  const toHalf = supportsFloat16Array ? toHalfNative : toHalfJS;\n  function toHalfNative(f) {\n    f16buffer[0] = f;\n    return u16buffer[0];\n  }\n  function toHalfJS(f) {\n    f32buffer[0] = f;\n    const bits = u32buffer[0];\n    const sign = bits >> 31 & 1;\n    const exp = bits >> 23 & 255;\n    const frac = bits & 8388607;\n    const halfSign = sign << 15;\n    if (exp === 255) {\n      if (frac !== 0) {\n        return halfSign | 32767;\n      }\n      return halfSign | 31744;\n    }\n    const newExp = exp - 127 + 15;\n    if (newExp >= 31) {\n      return halfSign | 31744;\n    }\n    if (newExp <= 0) {\n      if (newExp < -10) {\n        return halfSign;\n      }\n      const subFrac = (frac | 8388608) >> 1 - newExp + 13;\n      return halfSign | subFrac;\n    }\n    const halfFrac = frac >> 13;\n    return halfSign | newExp << 10 | halfFrac;\n  }\n  function floatToUint8(v) {\n    return Math.max(0, Math.min(255, Math.round(v * 255)));\n  }\n  function encodeQuatOctXy88R8(q) {\n    let { x, y, z, w } = q;\n    const len = Math.sqrt(x * x + y * y + z * z + w * w);\n    if (len === 0) {\n      x = 0;\n      y = 0;\n      z = 0;\n      w = 1;\n    } else {\n      const inv = 1 / len;\n      x *= inv;\n      y *= inv;\n      z *= inv;\n      w *= inv;\n    }\n    if (w < 0) {\n      x = -x;\n      y = -y;\n      z = -z;\n      w = -w;\n    }\n    const theta = 2 * Math.acos(w);\n    const xyz_norm = Math.sqrt(x * x + y * y + z * z);\n    let axisX;\n    let axisY;\n    let axisZ;\n    if (xyz_norm < 1e-6) {\n      axisX = 1;\n      axisY = 0;\n      axisZ = 0;\n    } else {\n      axisX = x / xyz_norm;\n      axisY = y / xyz_norm;\n      axisZ = z / xyz_norm;\n    }\n    const sum = Math.abs(axisX) + Math.abs(axisY) + Math.abs(axisZ);\n    let p_x = axisX / sum;\n    let p_y = axisY / sum;\n    if (axisZ < 0) {\n      const tmp = p_x;\n      p_x = (1 - Math.abs(p_y)) * (p_x >= 0 ? 1 : -1);\n      p_y = (1 - Math.abs(tmp)) * (p_y >= 0 ? 1 : -1);\n    }\n    const u_f = p_x * 0.5 + 0.5;\n    const v_f = p_y * 0.5 + 0.5;\n    const quantU = Math.round(u_f * 255);\n    const quantV = Math.round(v_f * 255);\n    const angleInt = Math.round(theta * (255 / Math.PI));\n    return angleInt << 16 | quantV << 8 | quantU;\n  }\n  function setPackedSplatScales(packedSplats, index, scaleX, scaleY, scaleZ, encoding) {\n    const lnScaleMin = (encoding == null ? void 0 : encoding.lnScaleMin) ?? LN_SCALE_MIN;\n    const lnScaleMax = (encoding == null ? void 0 : encoding.lnScaleMax) ?? LN_SCALE_MAX;\n    const lnScaleScale = 254 / (lnScaleMax - lnScaleMin);\n    const uScaleX = scaleX < SCALE_ZERO ? 0 : Math.min(\n      255,\n      Math.max(\n        1,\n        Math.round((Math.log(scaleX) - lnScaleMin) * lnScaleScale) + 1\n      )\n    );\n    const uScaleY = scaleY < SCALE_ZERO ? 0 : Math.min(\n      255,\n      Math.max(\n        1,\n        Math.round((Math.log(scaleY) - lnScaleMin) * lnScaleScale) + 1\n      )\n    );\n    const uScaleZ = scaleZ < SCALE_ZERO ? 0 : Math.min(\n      255,\n      Math.max(\n        1,\n        Math.round((Math.log(scaleZ) - lnScaleMin) * lnScaleScale) + 1\n      )\n    );\n    const i4 = index * 4;\n    packedSplats[i4 + 3] = uScaleX | uScaleY << 8 | uScaleZ << 16 | packedSplats[i4 + 3] & 4278190080;\n  }\n  function setPackedSplatRgba(packedSplats, index, r, g, b, a, encoding) {\n    const rgbMin = (encoding == null ? void 0 : encoding.rgbMin) ?? 0;\n    const rgbMax = (encoding == null ? void 0 : encoding.rgbMax) ?? 1;\n    const rgbRange = rgbMax - rgbMin;\n    const uR = floatToUint8((r - rgbMin) / rgbRange);\n    const uG = floatToUint8((g - rgbMin) / rgbRange);\n    const uB = floatToUint8((b - rgbMin) / rgbRange);\n    const uA = floatToUint8((encoding == null ? void 0 : encoding.lodOpacity) ? 0.5 * a : a);\n    const i4 = index * 4;\n    packedSplats[i4] = uR | uG << 8 | uB << 16 | uA << 24;\n  }\n  function packSint8Bytes(b0, b1, b2, b3) {\n    const clampedB0 = Math.round(Math.max(-127, Math.min(127, b0 * 127)));\n    const clampedB1 = Math.round(Math.max(-127, Math.min(127, b1 * 127)));\n    const clampedB2 = Math.round(Math.max(-127, Math.min(127, b2 * 127)));\n    const clampedB3 = Math.round(Math.max(-127, Math.min(127, b3 * 127)));\n    return clampedB0 & 255 | (clampedB1 & 255) << 8 | (clampedB2 & 255) << 16 | (clampedB3 & 255) << 24;\n  }\n  function encodeSh1Rgb(sh1Array, index, sh1Rgb, encoding) {\n    const sh1Max = (encoding == null ? void 0 : encoding.sh1Max) ?? 1;\n    const sh1Scale = 63 / sh1Max;\n    const base = index * 2;\n    for (let i = 0; i < 9; ++i) {\n      const s = sh1Rgb[i] * sh1Scale;\n      const value = Math.round(Math.max(-63, Math.min(63, s))) & 127;\n      const bitStart = i * 7;\n      const bitEnd = bitStart + 7;\n      const wordStart = Math.floor(bitStart / 32);\n      const bitOffset = bitStart - wordStart * 32;\n      const firstWord = value << bitOffset & 4294967295;\n      sh1Array[base + wordStart] |= firstWord;\n      if (bitEnd > wordStart * 32 + 32) {\n        const secondWord = value >>> 32 - bitOffset & 4294967295;\n        sh1Array[base + wordStart + 1] |= secondWord;\n      }\n    }\n  }\n  function encodeSh2Rgb(sh2Array, index, sh2Rgb, encoding) {\n    const sh2Max = (encoding == null ? void 0 : encoding.sh2Max) ?? 1;\n    const sh2Scale = 1 / sh2Max;\n    sh2Array[index * 4 + 0] = packSint8Bytes(\n      sh2Rgb[0] * sh2Scale,\n      sh2Rgb[1] * sh2Scale,\n      sh2Rgb[2] * sh2Scale,\n      sh2Rgb[3] * sh2Scale\n    );\n    sh2Array[index * 4 + 1] = packSint8Bytes(\n      sh2Rgb[4] * sh2Scale,\n      sh2Rgb[5] * sh2Scale,\n      sh2Rgb[6] * sh2Scale,\n      sh2Rgb[7] * sh2Scale\n    );\n    sh2Array[index * 4 + 2] = packSint8Bytes(\n      sh2Rgb[8] * sh2Scale,\n      sh2Rgb[9] * sh2Scale,\n      sh2Rgb[10] * sh2Scale,\n      sh2Rgb[11] * sh2Scale\n    );\n    sh2Array[index * 4 + 3] = packSint8Bytes(\n      sh2Rgb[12] * sh2Scale,\n      sh2Rgb[13] * sh2Scale,\n      sh2Rgb[14] * sh2Scale,\n      0\n    );\n  }\n  function encodeSh3Rgb(sh3Array, index, sh3Rgb, encoding) {\n    const sh3Max = (encoding == null ? void 0 : encoding.sh3Max) ?? 1;\n    const sh3Scale = 31 / sh3Max;\n    const base = index * 4;\n    for (let i = 0; i < 21; ++i) {\n      const s = sh3Rgb[i] * sh3Scale;\n      const value = Math.round(Math.max(-31, Math.min(31, s))) & 63;\n      const bitStart = i * 6;\n      const bitEnd = bitStart + 6;\n      const wordStart = Math.floor(bitStart / 32);\n      const bitOffset = bitStart - wordStart * 32;\n      const firstWord = value << bitOffset & 4294967295;\n      sh3Array[base + wordStart] |= firstWord;\n      if (bitEnd > wordStart * 32 + 32) {\n        const secondWord = value >>> 32 - bitOffset & 4294967295;\n        sh3Array[base + wordStart + 1] |= secondWord;\n      }\n    }\n  }\n  class SogMetaError extends Error {\n    constructor(code, message) {\n      super(message);\n      this.name = "SogMetaError";\n      this.code = code;\n    }\n  }\n  function centroidStride(width, bands) {\n    const stride = Math.max(1, Math.floor(width / 64));\n    const expected = bands >= 3 ? 15 : bands === 2 ? 8 : 3;\n    if (stride !== expected) {\n      throw new SogMetaError(\n        "bands",\n        `shN_centroids width ${width} implies stride ${stride}, but bands ${bands} needs ${expected}`\n      );\n    }\n    return stride;\n  }\n  const SH_C0 = 0.28209479177387814;\n  const SQRT2 = Math.sqrt(2);\n  function buildPackTables(meta, centroids, maxShRequested, encoding = DEFAULT_SPLAT_ENCODING) {\n    const maxSh = Math.max(0, Math.min(3, meta.bands, Math.floor(maxShRequested)));\n    const scratch = new Uint32Array(4);\n    const centerHalf = [\n      new Uint16Array(65536),\n      new Uint16Array(65536),\n      new Uint16Array(65536)\n    ];\n    for (let c = 0; c < 3; ++c) {\n      const mn = meta.means.mins[c];\n      const mx = meta.means.maxs[c];\n      const t = centerHalf[c];\n      for (let n = 0; n < 65536; ++n) {\n        const f = n / 65535;\n        let v = mn + (mx - mn) * f;\n        v = Math.sign(v) * (Math.exp(Math.abs(v)) - 1);\n        t[n] = toHalf(v);\n      }\n    }\n    const scaleByte = new Uint8Array(256);\n    for (let b = 0; b < 256; ++b) {\n      const s = Math.exp(meta.scalesCodebook[b]);\n      scratch[3] = 0;\n      setPackedSplatScales(scratch, 0, s, s, s, encoding);\n      scaleByte[b] = scratch[3] & 255;\n    }\n    const rgbByte = new Uint8Array(256);\n    const alphaByte = new Uint8Array(256);\n    for (let b = 0; b < 256; ++b) {\n      const r = SH_C0 * meta.sh0Codebook[b] + 0.5;\n      scratch[0] = 0;\n      setPackedSplatRgba(scratch, 0, r, r, r, 0, encoding);\n      rgbByte[b] = scratch[0] & 255;\n      scratch[0] = 0;\n      setPackedSplatRgba(scratch, 0, 0, 0, 0, b / 255, encoding);\n      alphaByte[b] = scratch[0] >>> 24 & 255;\n    }\n    const quatComp = new Float64Array(256);\n    for (let b = 0; b < 256; ++b) quatComp[b] = (b / 255 - 0.5) * SQRT2;\n    let paletteEntries = 0;\n    let paletteSh1 = null;\n    let paletteSh2 = null;\n    let paletteSh3 = null;\n    if (maxSh > 0) {\n      if (!centroids || !meta.shNCodebook) {\n        throw new Error("buildPackTables: SH requested but no centroid plane / codebook");\n      }\n      const stride = centroidStride(centroids.width, meta.bands);\n      const width = centroids.width;\n      paletteEntries = Math.min(65536, centroids.height * 64);\n      const lookup = meta.shNCodebook;\n      const px = centroids.rgba;\n      const sh1 = new Float32Array(9);\n      const sh2 = new Float32Array(15);\n      const sh3 = new Float32Array(21);\n      if (maxSh >= 1) paletteSh1 = new Uint32Array(paletteEntries * 2);\n      if (maxSh >= 2) paletteSh2 = new Uint32Array(paletteEntries * 4);\n      if (maxSh >= 3) paletteSh3 = new Uint32Array(paletteEntries * 4);\n      for (let label = 0; label < paletteEntries; ++label) {\n        const col = (label & 63) * stride;\n        const row = label >>> 6;\n        const offset = row * width + col;\n        for (let d = 0; d < 3; ++d) {\n          if (maxSh >= 1) {\n            for (let k = 0; k < 3; ++k) sh1[k * 3 + d] = lookup[px[(offset + k) * 4 + d]];\n          }\n          if (maxSh >= 2) {\n            for (let k = 0; k < 5; ++k) sh2[k * 3 + d] = lookup[px[(offset + 3 + k) * 4 + d]];\n          }\n          if (maxSh >= 3) {\n            for (let k = 0; k < 7; ++k) sh3[k * 3 + d] = lookup[px[(offset + 8 + k) * 4 + d]];\n          }\n        }\n        if (paletteSh1) encodeSh1Rgb(paletteSh1, label, sh1, encoding);\n        if (paletteSh2) encodeSh2Rgb(paletteSh2, label, sh2, encoding);\n        if (paletteSh3) encodeSh3Rgb(paletteSh3, label, sh3, encoding);\n      }\n    }\n    return {\n      centerHalf,\n      scaleByte,\n      rgbByte,\n      alphaByte,\n      quatComp,\n      maxSh,\n      paletteEntries,\n      paletteSh1,\n      paletteSh2,\n      paletteSh3\n    };\n  }\n  function packRange(planes, count, tables2, out, outIndex) {\n    const { meansL, meansU, quats, scales, sh0 } = planes;\n    const [tx, ty, tz] = tables2.centerHalf;\n    const scaleByte = tables2.scaleByte;\n    const rgbByte = tables2.rgbByte;\n    const alphaByte = tables2.alphaByte;\n    const quatComp = tables2.quatComp;\n    const packed = out.packed;\n    const q = { x: 0, y: 0, z: 0, w: 1 };\n    for (let i = 0; i < count; ++i) {\n      const i4 = i * 4;\n      const o4 = (outIndex + i) * 4;\n      packed[o4] = rgbByte[sh0[i4]] | rgbByte[sh0[i4 + 1]] << 8 | rgbByte[sh0[i4 + 2]] << 16 | alphaByte[sh0[i4 + 3]] << 24;\n      const nx = meansL[i4] | meansU[i4] << 8;\n      const ny = meansL[i4 + 1] | meansU[i4 + 1] << 8;\n      const nz = meansL[i4 + 2] | meansU[i4 + 2] << 8;\n      packed[o4 + 1] = tx[nx] | ty[ny] << 16;\n      const r0 = quatComp[quats[i4]];\n      const r1 = quatComp[quats[i4 + 1]];\n      const r2 = quatComp[quats[i4 + 2]];\n      const rr = Math.sqrt(Math.max(0, 1 - r0 * r0 - r1 * r1 - r2 * r2));\n      const rOrder = quats[i4 + 3] - 252;\n      q.x = rOrder === 0 ? r0 : rOrder === 1 ? rr : r1;\n      q.y = rOrder <= 1 ? r1 : rOrder === 2 ? rr : r2;\n      q.z = rOrder <= 2 ? r2 : rr;\n      q.w = rOrder === 0 ? rr : r0;\n      const uQuat = encodeQuatOctXy88R8(q);\n      const uQuatX = uQuat & 255;\n      const uQuatY = uQuat >>> 8 & 255;\n      const uQuatZ = uQuat >>> 16 & 255;\n      packed[o4 + 2] = tz[nz] | uQuatX << 16 | uQuatY << 24;\n      packed[o4 + 3] = scaleByte[scales[i4]] | scaleByte[scales[i4 + 1]] << 8 | scaleByte[scales[i4 + 2]] << 16 | uQuatZ << 24;\n    }\n    let badLabels = 0;\n    if (tables2.maxSh > 0) {\n      const labels = planes.labels;\n      if (!labels) throw new Error("packRange: labels plane missing");\n      const n = tables2.paletteEntries;\n      const p1 = tables2.paletteSh1;\n      const p2 = tables2.paletteSh2;\n      const p3 = tables2.paletteSh3;\n      const s1 = out.sh1;\n      const s2 = out.sh2;\n      const s3 = out.sh3;\n      for (let i = 0; i < count; ++i) {\n        const i4 = i * 4;\n        const label = labels[i4] | labels[i4 + 1] << 8;\n        const o = outIndex + i;\n        if (label < n) {\n          if (p1 && s1) {\n            s1[o * 2] = p1[label * 2];\n            s1[o * 2 + 1] = p1[label * 2 + 1];\n          }\n          if (p2 && s2) {\n            s2[o * 4] = p2[label * 4];\n            s2[o * 4 + 1] = p2[label * 4 + 1];\n            s2[o * 4 + 2] = p2[label * 4 + 2];\n            s2[o * 4 + 3] = p2[label * 4 + 3];\n          }\n          if (p3 && s3) {\n            s3[o * 4] = p3[label * 4];\n            s3[o * 4 + 1] = p3[label * 4 + 1];\n            s3[o * 4 + 2] = p3[label * 4 + 2];\n            s3[o * 4 + 3] = p3[label * 4 + 3];\n          }\n        } else {\n          badLabels++;\n          if (s1) {\n            s1[o * 2] = 0;\n            s1[o * 2 + 1] = 0;\n          }\n          if (s2) s2.fill(0, o * 4, o * 4 + 4);\n          if (s3) s3.fill(0, o * 4, o * 4 + 4);\n        }\n      }\n    }\n    return { badLabels };\n  }\n  let gl = null;\n  let tables = null;\n  function getGl() {\n    if (!gl) {\n      const canvas = new OffscreenCanvas(1, 1);\n      gl = canvas.getContext("webgl2");\n      if (!gl) throw new Error("full worker: failed to create a WebGL2 context");\n    }\n    return gl;\n  }\n  async function decodePlane(args) {\n    const t0 = performance.now();\n    const bitmap = await createImageBitmap(new Blob([args.bytes]), {\n      premultiplyAlpha: "none"\n    });\n    const width = bitmap.width;\n    const height = bitmap.height;\n    if (args.expectWidth !== void 0 && width !== args.expectWidth || args.expectHeight !== void 0 && height !== args.expectHeight) {\n      bitmap.close();\n      throw new Error(\n        `full worker: plane ${args.name} is ${width}x${height}, manifest implies ${args.expectWidth}x${args.expectHeight}`\n      );\n    }\n    const t1 = performance.now();\n    const g = getGl();\n    const texture = g.createTexture();\n    g.bindTexture(g.TEXTURE_2D, texture);\n    g.pixelStorei(g.UNPACK_FLIP_Y_WEBGL, true);\n    g.texImage2D(g.TEXTURE_2D, 0, g.RGBA, g.RGBA, g.UNSIGNED_BYTE, bitmap);\n    g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.NEAREST);\n    g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.NEAREST);\n    const fb = g.createFramebuffer();\n    g.bindFramebuffer(g.FRAMEBUFFER, fb);\n    g.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, texture, 0);\n    bitmap.close();\n    const nBands = Math.max(1, Math.min(args.bands | 0, height));\n    const rowsPer = Math.ceil(height / nBands);\n    const bands = [];\n    const rowStart = [];\n    const rows = [];\n    for (let k = 0; k < nBands; ++k) {\n      const y0 = k * rowsPer;\n      if (y0 >= height) break;\n      const r = Math.min(rowsPer, height - y0);\n      const out = new Uint8Array(width * r * 4);\n      g.readPixels(0, y0, width, r, g.RGBA, g.UNSIGNED_BYTE, out);\n      bands.push(out);\n      rowStart.push(y0);\n      rows.push(r);\n    }\n    g.bindFramebuffer(g.FRAMEBUFFER, null);\n    g.deleteFramebuffer(fb);\n    g.deleteTexture(texture);\n    const t2 = performance.now();\n    return { name: args.name, width, height, bands, rowStart, rows, decodeMs: t1 - t0, readMs: t2 - t1 };\n  }\n  function buildTables(args) {\n    const t0 = performance.now();\n    tables = buildPackTables(args.meta, args.centroids, args.maxSh, args.encoding);\n    return { maxSh: tables.maxSh, paletteEntries: tables.paletteEntries, ms: performance.now() - t0 };\n  }\n  function packBand(args) {\n    if (!tables) throw new Error("full worker: packBand before buildTables");\n    const t0 = performance.now();\n    const n = args.count;\n    const out = {\n      packed: new Uint32Array(n * 4),\n      sh1: tables.maxSh >= 1 ? new Uint32Array(n * 2) : null,\n      sh2: tables.maxSh >= 2 ? new Uint32Array(n * 4) : null,\n      sh3: tables.maxSh >= 3 ? new Uint32Array(n * 4) : null\n    };\n    const { badLabels } = packRange(args.planes, n, tables, out, 0);\n    return { ...out, badLabels, packMs: performance.now() - t0 };\n  }\n  function cancel() {\n    tables = null;\n    return true;\n  }\n  const handlers = {\n    decodePlane,\n    buildTables,\n    packBand,\n    cancel\n  };\n  function transferables(value) {\n    const out = [];\n    const seen = /* @__PURE__ */ new Set();\n    const walk = (v) => {\n      if (!v || typeof v !== "object" || seen.has(v)) return;\n      seen.add(v);\n      if (v instanceof ArrayBuffer) out.push(v);\n      else if (ArrayBuffer.isView(v)) out.push(v.buffer);\n      else if (Array.isArray(v)) for (const x of v) walk(x);\n      else for (const x of Object.values(v)) walk(x);\n    };\n    walk(value);\n    return out;\n  }\n  self.onmessage = async (event) => {\n    const { id, name, args } = event.data;\n    try {\n      const handler = handlers[name];\n      if (!handler) throw new Error(`full worker: unknown RPC ${name}`);\n      const result = await handler(args);\n      self.postMessage({ id, result }, { transfer: transferables(result) });\n    } catch (error) {\n      self.postMessage({ id, error: String((error == null ? void 0 : error.message) ?? error) });\n    }\n  };\n})();\n//# sourceMappingURL=fullWorker-CmmTkWEa.js.map\n';
+const packedEncode = require("./packedEncode-BaN-asIl.cjs");
+const jsContent = '(function() {\n  "use strict";\n  const LN_SCALE_MIN = -12;\n  const LN_SCALE_MAX = 9;\n  const LN_SCALE_ZERO = -30;\n  const SCALE_ZERO = Math.exp(LN_SCALE_ZERO);\n  const DEFAULT_SPLAT_ENCODING = {\n    rgbMin: 0,\n    rgbMax: 1,\n    lnScaleMin: LN_SCALE_MIN,\n    lnScaleMax: LN_SCALE_MAX,\n    sh1Max: 1,\n    sh2Max: 1,\n    sh3Max: 1,\n    lodOpacity: false\n  };\n  const supportsFloat16Array = "Float16Array" in globalThis;\n  const f16buffer = supportsFloat16Array ? new globalThis["Float16Array"](1) : null;\n  const u16buffer = new Uint16Array(f16buffer == null ? void 0 : f16buffer.buffer);\n  const toHalf = supportsFloat16Array ? toHalfNative : toHalfJS;\n  function toHalfNative(f) {\n    f16buffer[0] = f;\n    return u16buffer[0];\n  }\n  const f64buffer = new Float64Array(1);\n  const u32of64buffer = new Uint32Array(f64buffer.buffer);\n  const f64HighWord = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1 ? 1 : 0;\n  const halfMantissaScale = Array.from({ length: 30 }, (_, k) => 2 ** (24 - k));\n  function roundHalfEven(m) {\n    const fl = Math.floor(m);\n    const d = m - fl;\n    return d > 0.5 || d === 0.5 && (fl & 1) === 1 ? fl + 1 : fl;\n  }\n  function toHalfJS(f) {\n    f64buffer[0] = f;\n    const hi = u32of64buffer[f64HighWord];\n    const sign = hi >>> 16 & 32768;\n    const exp64 = hi >>> 20 & 2047;\n    if (exp64 === 2047) {\n      return sign | (Number.isNaN(f) ? 32256 : 31744);\n    }\n    const a = Math.abs(f);\n    const e = exp64 - 1023;\n    if (e >= 16) {\n      return sign | 31744;\n    }\n    if (e < -14) {\n      return sign | roundHalfEven(a * 16777216);\n    }\n    return sign | (e + 15 << 10) + roundHalfEven(a * halfMantissaScale[e + 14]) - 1024;\n  }\n  function floatToUint8(v) {\n    return Math.max(0, Math.min(255, Math.round(v * 255)));\n  }\n  function encodeQuatOctXy88R8(q) {\n    let { x, y, z, w } = q;\n    const len = Math.sqrt(x * x + y * y + z * z + w * w);\n    if (len === 0) {\n      x = 0;\n      y = 0;\n      z = 0;\n      w = 1;\n    } else {\n      const inv = 1 / len;\n      x *= inv;\n      y *= inv;\n      z *= inv;\n      w *= inv;\n    }\n    if (w < 0) {\n      x = -x;\n      y = -y;\n      z = -z;\n      w = -w;\n    }\n    const theta = 2 * Math.acos(w);\n    const xyz_norm = Math.sqrt(x * x + y * y + z * z);\n    let axisX;\n    let axisY;\n    let axisZ;\n    if (xyz_norm < 1e-6) {\n      axisX = 1;\n      axisY = 0;\n      axisZ = 0;\n    } else {\n      axisX = x / xyz_norm;\n      axisY = y / xyz_norm;\n      axisZ = z / xyz_norm;\n    }\n    const sum = Math.abs(axisX) + Math.abs(axisY) + Math.abs(axisZ);\n    let p_x = axisX / sum;\n    let p_y = axisY / sum;\n    if (axisZ < 0) {\n      const tmp = p_x;\n      p_x = (1 - Math.abs(p_y)) * (p_x >= 0 ? 1 : -1);\n      p_y = (1 - Math.abs(tmp)) * (p_y >= 0 ? 1 : -1);\n    }\n    const u_f = p_x * 0.5 + 0.5;\n    const v_f = p_y * 0.5 + 0.5;\n    const quantU = Math.round(u_f * 255);\n    const quantV = Math.round(v_f * 255);\n    const angleInt = Math.round(theta * (255 / Math.PI));\n    return angleInt << 16 | quantV << 8 | quantU;\n  }\n  function setPackedSplatScales(packedSplats, index, scaleX, scaleY, scaleZ, encoding) {\n    const lnScaleMin = (encoding == null ? void 0 : encoding.lnScaleMin) ?? LN_SCALE_MIN;\n    const lnScaleMax = (encoding == null ? void 0 : encoding.lnScaleMax) ?? LN_SCALE_MAX;\n    const lnScaleScale = 254 / (lnScaleMax - lnScaleMin);\n    const uScaleX = scaleX < SCALE_ZERO ? 0 : Math.min(\n      255,\n      Math.max(\n        1,\n        Math.round((Math.log(scaleX) - lnScaleMin) * lnScaleScale) + 1\n      )\n    );\n    const uScaleY = scaleY < SCALE_ZERO ? 0 : Math.min(\n      255,\n      Math.max(\n        1,\n        Math.round((Math.log(scaleY) - lnScaleMin) * lnScaleScale) + 1\n      )\n    );\n    const uScaleZ = scaleZ < SCALE_ZERO ? 0 : Math.min(\n      255,\n      Math.max(\n        1,\n        Math.round((Math.log(scaleZ) - lnScaleMin) * lnScaleScale) + 1\n      )\n    );\n    const i4 = index * 4;\n    packedSplats[i4 + 3] = uScaleX | uScaleY << 8 | uScaleZ << 16 | packedSplats[i4 + 3] & 4278190080;\n  }\n  function setPackedSplatRgba(packedSplats, index, r, g, b, a, encoding) {\n    const rgbMin = (encoding == null ? void 0 : encoding.rgbMin) ?? 0;\n    const rgbMax = (encoding == null ? void 0 : encoding.rgbMax) ?? 1;\n    const rgbRange = rgbMax - rgbMin;\n    const uR = floatToUint8((r - rgbMin) / rgbRange);\n    const uG = floatToUint8((g - rgbMin) / rgbRange);\n    const uB = floatToUint8((b - rgbMin) / rgbRange);\n    const uA = floatToUint8((encoding == null ? void 0 : encoding.lodOpacity) ? 0.5 * a : a);\n    const i4 = index * 4;\n    packedSplats[i4] = uR | uG << 8 | uB << 16 | uA << 24;\n  }\n  function packSint8Bytes(b0, b1, b2, b3) {\n    const clampedB0 = Math.round(Math.max(-127, Math.min(127, b0 * 127)));\n    const clampedB1 = Math.round(Math.max(-127, Math.min(127, b1 * 127)));\n    const clampedB2 = Math.round(Math.max(-127, Math.min(127, b2 * 127)));\n    const clampedB3 = Math.round(Math.max(-127, Math.min(127, b3 * 127)));\n    return clampedB0 & 255 | (clampedB1 & 255) << 8 | (clampedB2 & 255) << 16 | (clampedB3 & 255) << 24;\n  }\n  function encodeSh1Rgb(sh1Array, index, sh1Rgb, encoding) {\n    const sh1Max = (encoding == null ? void 0 : encoding.sh1Max) ?? 1;\n    const sh1Scale = 63 / sh1Max;\n    const base = index * 2;\n    for (let i = 0; i < 9; ++i) {\n      const s = sh1Rgb[i] * sh1Scale;\n      const value = Math.round(Math.max(-63, Math.min(63, s))) & 127;\n      const bitStart = i * 7;\n      const bitEnd = bitStart + 7;\n      const wordStart = Math.floor(bitStart / 32);\n      const bitOffset = bitStart - wordStart * 32;\n      const firstWord = value << bitOffset & 4294967295;\n      sh1Array[base + wordStart] |= firstWord;\n      if (bitEnd > wordStart * 32 + 32) {\n        const secondWord = value >>> 32 - bitOffset & 4294967295;\n        sh1Array[base + wordStart + 1] |= secondWord;\n      }\n    }\n  }\n  function encodeSh2Rgb(sh2Array, index, sh2Rgb, encoding) {\n    const sh2Max = (encoding == null ? void 0 : encoding.sh2Max) ?? 1;\n    const sh2Scale = 1 / sh2Max;\n    sh2Array[index * 4 + 0] = packSint8Bytes(\n      sh2Rgb[0] * sh2Scale,\n      sh2Rgb[1] * sh2Scale,\n      sh2Rgb[2] * sh2Scale,\n      sh2Rgb[3] * sh2Scale\n    );\n    sh2Array[index * 4 + 1] = packSint8Bytes(\n      sh2Rgb[4] * sh2Scale,\n      sh2Rgb[5] * sh2Scale,\n      sh2Rgb[6] * sh2Scale,\n      sh2Rgb[7] * sh2Scale\n    );\n    sh2Array[index * 4 + 2] = packSint8Bytes(\n      sh2Rgb[8] * sh2Scale,\n      sh2Rgb[9] * sh2Scale,\n      sh2Rgb[10] * sh2Scale,\n      sh2Rgb[11] * sh2Scale\n    );\n    sh2Array[index * 4 + 3] = packSint8Bytes(\n      sh2Rgb[12] * sh2Scale,\n      sh2Rgb[13] * sh2Scale,\n      sh2Rgb[14] * sh2Scale,\n      0\n    );\n  }\n  function encodeSh3Rgb(sh3Array, index, sh3Rgb, encoding) {\n    const sh3Max = (encoding == null ? void 0 : encoding.sh3Max) ?? 1;\n    const sh3Scale = 31 / sh3Max;\n    const base = index * 4;\n    for (let i = 0; i < 21; ++i) {\n      const s = sh3Rgb[i] * sh3Scale;\n      const value = Math.round(Math.max(-31, Math.min(31, s))) & 63;\n      const bitStart = i * 6;\n      const bitEnd = bitStart + 6;\n      const wordStart = Math.floor(bitStart / 32);\n      const bitOffset = bitStart - wordStart * 32;\n      const firstWord = value << bitOffset & 4294967295;\n      sh3Array[base + wordStart] |= firstWord;\n      if (bitEnd > wordStart * 32 + 32) {\n        const secondWord = value >>> 32 - bitOffset & 4294967295;\n        sh3Array[base + wordStart + 1] |= secondWord;\n      }\n    }\n  }\n  class SogMetaError extends Error {\n    constructor(code, message) {\n      super(message);\n      this.name = "SogMetaError";\n      this.code = code;\n    }\n  }\n  function centroidStride(width, bands) {\n    const stride = Math.max(1, Math.floor(width / 64));\n    const expected = bands >= 3 ? 15 : bands === 2 ? 8 : 3;\n    if (stride !== expected) {\n      throw new SogMetaError(\n        "bands",\n        `shN_centroids width ${width} implies stride ${stride}, but bands ${bands} needs ${expected}`\n      );\n    }\n    return stride;\n  }\n  const SH_C0 = 0.28209479177387814;\n  const SQRT2 = Math.sqrt(2);\n  function buildPackTables(meta, centroids, maxShRequested, encoding = DEFAULT_SPLAT_ENCODING, origin = [0, 0, 0]) {\n    const maxSh = Math.max(0, Math.min(3, meta.bands, Math.floor(maxShRequested)));\n    const scratch = new Uint32Array(4);\n    const centerHalf = [\n      new Uint16Array(65536),\n      new Uint16Array(65536),\n      new Uint16Array(65536)\n    ];\n    for (let c = 0; c < 3; ++c) {\n      const mn = meta.means.mins[c];\n      const mx = meta.means.maxs[c];\n      const oc = origin[c] || 0;\n      const t = centerHalf[c];\n      for (let n = 0; n < 65536; ++n) {\n        const f = n / 65535;\n        let v = mn + (mx - mn) * f;\n        v = Math.sign(v) * (Math.exp(Math.abs(v)) - 1);\n        t[n] = toHalf(v - oc);\n      }\n    }\n    const scaleByte = new Uint8Array(256);\n    for (let b = 0; b < 256; ++b) {\n      const s = Math.exp(meta.scalesCodebook[b]);\n      scratch[3] = 0;\n      setPackedSplatScales(scratch, 0, s, s, s, encoding);\n      scaleByte[b] = scratch[3] & 255;\n    }\n    const rgbByte = new Uint8Array(256);\n    const alphaByte = new Uint8Array(256);\n    for (let b = 0; b < 256; ++b) {\n      const r = SH_C0 * meta.sh0Codebook[b] + 0.5;\n      scratch[0] = 0;\n      setPackedSplatRgba(scratch, 0, r, r, r, 0, encoding);\n      rgbByte[b] = scratch[0] & 255;\n      scratch[0] = 0;\n      setPackedSplatRgba(scratch, 0, 0, 0, 0, b / 255, encoding);\n      alphaByte[b] = scratch[0] >>> 24 & 255;\n    }\n    const quatComp = new Float64Array(256);\n    for (let b = 0; b < 256; ++b) quatComp[b] = (b / 255 - 0.5) * SQRT2;\n    let paletteEntries = 0;\n    let paletteSh1 = null;\n    let paletteSh2 = null;\n    let paletteSh3 = null;\n    if (maxSh > 0) {\n      if (!centroids || !meta.shNCodebook) {\n        throw new Error("buildPackTables: SH requested but no centroid plane / codebook");\n      }\n      const stride = centroidStride(centroids.width, meta.bands);\n      const width = centroids.width;\n      paletteEntries = Math.min(65536, centroids.height * 64);\n      const lookup = meta.shNCodebook;\n      const px = centroids.rgba;\n      const sh1 = new Float32Array(9);\n      const sh2 = new Float32Array(15);\n      const sh3 = new Float32Array(21);\n      if (maxSh >= 1) paletteSh1 = new Uint32Array(paletteEntries * 2);\n      if (maxSh >= 2) paletteSh2 = new Uint32Array(paletteEntries * 4);\n      if (maxSh >= 3) paletteSh3 = new Uint32Array(paletteEntries * 4);\n      for (let label = 0; label < paletteEntries; ++label) {\n        const col = (label & 63) * stride;\n        const row = label >>> 6;\n        const offset = row * width + col;\n        for (let d = 0; d < 3; ++d) {\n          if (maxSh >= 1) {\n            for (let k = 0; k < 3; ++k) sh1[k * 3 + d] = lookup[px[(offset + k) * 4 + d]];\n          }\n          if (maxSh >= 2) {\n            for (let k = 0; k < 5; ++k) sh2[k * 3 + d] = lookup[px[(offset + 3 + k) * 4 + d]];\n          }\n          if (maxSh >= 3) {\n            for (let k = 0; k < 7; ++k) sh3[k * 3 + d] = lookup[px[(offset + 8 + k) * 4 + d]];\n          }\n        }\n        if (paletteSh1) encodeSh1Rgb(paletteSh1, label, sh1, encoding);\n        if (paletteSh2) encodeSh2Rgb(paletteSh2, label, sh2, encoding);\n        if (paletteSh3) encodeSh3Rgb(paletteSh3, label, sh3, encoding);\n      }\n    }\n    return {\n      centerHalf,\n      scaleByte,\n      rgbByte,\n      alphaByte,\n      quatComp,\n      maxSh,\n      paletteEntries,\n      paletteSh1,\n      paletteSh2,\n      paletteSh3\n    };\n  }\n  function packRange(planes, count, tables2, out, outIndex) {\n    const { meansL, meansU, quats, scales, sh0 } = planes;\n    const [tx, ty, tz] = tables2.centerHalf;\n    const scaleByte = tables2.scaleByte;\n    const rgbByte = tables2.rgbByte;\n    const alphaByte = tables2.alphaByte;\n    const quatComp = tables2.quatComp;\n    const packed = out.packed;\n    const q = { x: 0, y: 0, z: 0, w: 1 };\n    for (let i = 0; i < count; ++i) {\n      const i4 = i * 4;\n      const o4 = (outIndex + i) * 4;\n      packed[o4] = rgbByte[sh0[i4]] | rgbByte[sh0[i4 + 1]] << 8 | rgbByte[sh0[i4 + 2]] << 16 | alphaByte[sh0[i4 + 3]] << 24;\n      const nx = meansL[i4] | meansU[i4] << 8;\n      const ny = meansL[i4 + 1] | meansU[i4 + 1] << 8;\n      const nz = meansL[i4 + 2] | meansU[i4 + 2] << 8;\n      packed[o4 + 1] = tx[nx] | ty[ny] << 16;\n      const r0 = quatComp[quats[i4]];\n      const r1 = quatComp[quats[i4 + 1]];\n      const r2 = quatComp[quats[i4 + 2]];\n      const rr = Math.sqrt(Math.max(0, 1 - r0 * r0 - r1 * r1 - r2 * r2));\n      const rOrder = quats[i4 + 3] - 252;\n      q.x = rOrder === 0 ? r0 : rOrder === 1 ? rr : r1;\n      q.y = rOrder <= 1 ? r1 : rOrder === 2 ? rr : r2;\n      q.z = rOrder <= 2 ? r2 : rr;\n      q.w = rOrder === 0 ? rr : r0;\n      const uQuat = encodeQuatOctXy88R8(q);\n      const uQuatX = uQuat & 255;\n      const uQuatY = uQuat >>> 8 & 255;\n      const uQuatZ = uQuat >>> 16 & 255;\n      packed[o4 + 2] = tz[nz] | uQuatX << 16 | uQuatY << 24;\n      packed[o4 + 3] = scaleByte[scales[i4]] | scaleByte[scales[i4 + 1]] << 8 | scaleByte[scales[i4 + 2]] << 16 | uQuatZ << 24;\n    }\n    let badLabels = 0;\n    if (tables2.maxSh > 0) {\n      const labels = planes.labels;\n      if (!labels) throw new Error("packRange: labels plane missing");\n      const n = tables2.paletteEntries;\n      const p1 = tables2.paletteSh1;\n      const p2 = tables2.paletteSh2;\n      const p3 = tables2.paletteSh3;\n      const s1 = out.sh1;\n      const s2 = out.sh2;\n      const s3 = out.sh3;\n      for (let i = 0; i < count; ++i) {\n        const i4 = i * 4;\n        const label = labels[i4] | labels[i4 + 1] << 8;\n        const o = outIndex + i;\n        if (label < n) {\n          if (p1 && s1) {\n            s1[o * 2] = p1[label * 2];\n            s1[o * 2 + 1] = p1[label * 2 + 1];\n          }\n          if (p2 && s2) {\n            s2[o * 4] = p2[label * 4];\n            s2[o * 4 + 1] = p2[label * 4 + 1];\n            s2[o * 4 + 2] = p2[label * 4 + 2];\n            s2[o * 4 + 3] = p2[label * 4 + 3];\n          }\n          if (p3 && s3) {\n            s3[o * 4] = p3[label * 4];\n            s3[o * 4 + 1] = p3[label * 4 + 1];\n            s3[o * 4 + 2] = p3[label * 4 + 2];\n            s3[o * 4 + 3] = p3[label * 4 + 3];\n          }\n        } else {\n          badLabels++;\n          if (s1) {\n            s1[o * 2] = 0;\n            s1[o * 2 + 1] = 0;\n          }\n          if (s2) s2.fill(0, o * 4, o * 4 + 4);\n          if (s3) s3.fill(0, o * 4, o * 4 + 4);\n        }\n      }\n    }\n    return { badLabels };\n  }\n  let gl = null;\n  let tables = null;\n  function getGl() {\n    if (!gl) {\n      const canvas = new OffscreenCanvas(1, 1);\n      gl = canvas.getContext("webgl2");\n      if (!gl) throw new Error("full worker: failed to create a WebGL2 context");\n    }\n    return gl;\n  }\n  async function decodePlane(args) {\n    const t0 = performance.now();\n    const bitmap = await createImageBitmap(new Blob([args.bytes]), {\n      premultiplyAlpha: "none"\n    });\n    const width = bitmap.width;\n    const height = bitmap.height;\n    if (args.expectWidth !== void 0 && width !== args.expectWidth || args.expectHeight !== void 0 && height !== args.expectHeight) {\n      bitmap.close();\n      throw new Error(\n        `full worker: plane ${args.name} is ${width}x${height}, manifest implies ${args.expectWidth}x${args.expectHeight}`\n      );\n    }\n    const t1 = performance.now();\n    const g = getGl();\n    const texture = g.createTexture();\n    g.bindTexture(g.TEXTURE_2D, texture);\n    g.pixelStorei(g.UNPACK_FLIP_Y_WEBGL, true);\n    g.texImage2D(g.TEXTURE_2D, 0, g.RGBA, g.RGBA, g.UNSIGNED_BYTE, bitmap);\n    g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.NEAREST);\n    g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.NEAREST);\n    const fb = g.createFramebuffer();\n    g.bindFramebuffer(g.FRAMEBUFFER, fb);\n    g.framebufferTexture2D(g.FRAMEBUFFER, g.COLOR_ATTACHMENT0, g.TEXTURE_2D, texture, 0);\n    bitmap.close();\n    const nBands = Math.max(1, Math.min(args.bands | 0, height));\n    const rowsPer = Math.ceil(height / nBands);\n    const bands = [];\n    const rowStart = [];\n    const rows = [];\n    for (let k = 0; k < nBands; ++k) {\n      const y0 = k * rowsPer;\n      if (y0 >= height) break;\n      const r = Math.min(rowsPer, height - y0);\n      const out = new Uint8Array(width * r * 4);\n      g.readPixels(0, y0, width, r, g.RGBA, g.UNSIGNED_BYTE, out);\n      bands.push(out);\n      rowStart.push(y0);\n      rows.push(r);\n    }\n    g.bindFramebuffer(g.FRAMEBUFFER, null);\n    g.deleteFramebuffer(fb);\n    g.deleteTexture(texture);\n    const t2 = performance.now();\n    return { name: args.name, width, height, bands, rowStart, rows, decodeMs: t1 - t0, readMs: t2 - t1 };\n  }\n  function buildTables(args) {\n    const t0 = performance.now();\n    tables = buildPackTables(\n      args.meta,\n      args.centroids,\n      args.maxSh,\n      args.encoding,\n      args.origin\n    );\n    return { maxSh: tables.maxSh, paletteEntries: tables.paletteEntries, ms: performance.now() - t0 };\n  }\n  function packBand(args) {\n    if (!tables) throw new Error("full worker: packBand before buildTables");\n    const t0 = performance.now();\n    const n = args.count;\n    const out = {\n      packed: new Uint32Array(n * 4),\n      sh1: tables.maxSh >= 1 ? new Uint32Array(n * 2) : null,\n      sh2: tables.maxSh >= 2 ? new Uint32Array(n * 4) : null,\n      sh3: tables.maxSh >= 3 ? new Uint32Array(n * 4) : null\n    };\n    const { badLabels } = packRange(args.planes, n, tables, out, 0);\n    return { ...out, badLabels, packMs: performance.now() - t0 };\n  }\n  function cancel() {\n    tables = null;\n    return true;\n  }\n  const handlers = {\n    decodePlane,\n    buildTables,\n    packBand,\n    cancel\n  };\n  function transferables(value) {\n    const out = [];\n    const seen = /* @__PURE__ */ new Set();\n    const walk = (v) => {\n      if (!v || typeof v !== "object" || seen.has(v)) return;\n      seen.add(v);\n      if (v instanceof ArrayBuffer) out.push(v);\n      else if (ArrayBuffer.isView(v)) out.push(v.buffer);\n      else if (Array.isArray(v)) for (const x of v) walk(x);\n      else for (const x of Object.values(v)) walk(x);\n    };\n    walk(value);\n    return out;\n  }\n  self.onmessage = async (event) => {\n    const { id, name, args } = event.data;\n    try {\n      const handler = handlers[name];\n      if (!handler) throw new Error(`full worker: unknown RPC ${name}`);\n      const result = await handler(args);\n      self.postMessage({ id, result }, { transfer: transferables(result) });\n    } catch (error) {\n      self.postMessage({ id, error: String((error == null ? void 0 : error.message) ?? error) });\n    }\n  };\n})();\n//# sourceMappingURL=fullWorker-CjptXZB3.js.map\n';
 const blob = typeof self !== "undefined" && self.Blob && new Blob([jsContent], { type: "text/javascript;charset=utf-8" });
 function WorkerWrapper(options) {
   let objURL;
@@ -110,6 +110,21 @@ function parseSogMeta(json) {
     files.shN_centroids = j.shN.files[0];
     files.shN_labels = j.shN.files[1];
   }
+  let origin = null;
+  const raw = j.kcOrigin;
+  if (raw !== void 0) {
+    if (!isNumArray(raw, 3)) {
+      throw new SogMetaError(
+        "origin",
+        `kcOrigin must be [x, y, z] of finite numbers (got ${String(
+          JSON.stringify(raw)
+        ).slice(0, 80)})`
+      );
+    }
+    if (raw[0] !== 0 || raw[1] !== 0 || raw[2] !== 0) {
+      origin = [raw[0] || 0, raw[1] || 0, raw[2] || 0];
+    }
+  }
   return {
     count: j.count,
     bands,
@@ -122,6 +137,7 @@ function parseSogMeta(json) {
     sh0Codebook,
     shNCodebook,
     files,
+    origin,
     json: j
   };
 }
@@ -135,11 +151,16 @@ function boundsFromMeta(meta) {
   const un = (v) => Math.sign(v) * (Math.exp(Math.abs(v)) - 1);
   const min = [0, 0, 0];
   const max = [0, 0, 0];
+  const origin = meta.origin ?? null;
   for (let c = 0; c < 3; ++c) {
     const a = un(meta.means.mins[c]);
     const b = un(meta.means.maxs[c]);
     min[c] = Math.min(a, b);
     max[c] = Math.max(a, b);
+    if (origin) {
+      min[c] += origin[c];
+      max[c] += origin[c];
+    }
   }
   return { min, max };
 }
@@ -153,6 +174,89 @@ function centroidStride(width, bands) {
     );
   }
   return stride;
+}
+class SogMeanCodeHistogram {
+  constructor() {
+    this.bins = [
+      new Uint32Array(65536),
+      new Uint32Array(65536),
+      new Uint32Array(65536)
+    ];
+    this.count = 0;
+  }
+  /**
+   * Add `count` splats whose means_l / means_u RGBA pixels start at element 0
+   * of each array (the loader's band layout; padding pixels past the scene's
+   * splat count must not be included).
+   */
+  add(meansL, meansU, count) {
+    if (!Number.isInteger(count) || count < 0 || count * 4 > meansL.length || count * 4 > meansU.length) {
+      throw new RangeError(
+        `SogMeanCodeHistogram.add: ${count} splats do not fit planes of ${meansL.length} / ${meansU.length} bytes`
+      );
+    }
+    const [bx, by, bz] = this.bins;
+    for (let i = 0; i < count; ++i) {
+      const i4 = i * 4;
+      bx[meansL[i4] | meansU[i4] << 8]++;
+      by[meansL[i4 + 1] | meansU[i4 + 1] << 8]++;
+      bz[meansL[i4 + 2] | meansU[i4 + 2] << 8]++;
+    }
+    this.count += count;
+  }
+  /**
+   * Per-axis LOWER median code: the ceil(count / 2)-th smallest code (exact
+   * for an odd count, the lower middle one for an even count). null before
+   * any splat was added.
+   */
+  medianCodes() {
+    if (this.count === 0) {
+      return null;
+    }
+    const rank = Math.ceil(this.count / 2);
+    const out = [0, 0, 0];
+    for (let c = 0; c < 3; ++c) {
+      const b = this.bins[c];
+      let acc = 0;
+      for (let k = 0; k < 65536; ++k) {
+        acc += b[k];
+        if (acc >= rank) {
+          out[c] = k;
+          break;
+        }
+      }
+    }
+    return out;
+  }
+}
+function decodeMeanCode(meta, c, n) {
+  const mn = meta.means.mins[c];
+  const mx = meta.means.maxs[c];
+  const f = n / 65535;
+  const v = mn + (mx - mn) * f;
+  return Math.sign(v) * (Math.exp(Math.abs(v)) - 1);
+}
+function roundOrigin(v) {
+  const r = Math.round(v);
+  return Number.isFinite(r) && r !== 0 ? r : 0;
+}
+function sogPackOrigin(meta, hist) {
+  const codes = hist.medianCodes();
+  if (!codes) {
+    return [0, 0, 0];
+  }
+  return [
+    roundOrigin(decodeMeanCode(meta, 0, codes[0])),
+    roundOrigin(decodeMeanCode(meta, 1, codes[1])),
+    roundOrigin(decodeMeanCode(meta, 2, codes[2]))
+  ];
+}
+function composeCenterOrigin(kcOrigin, oRel) {
+  const k = kcOrigin ?? [0, 0, 0];
+  const x = k[0] + oRel[0];
+  const y = k[1] + oRel[1];
+  const z = k[2] + oRel[2];
+  return x === 0 && y === 0 && z === 0 ? null : [x || 0, y || 0, z || 0];
 }
 class SogZipError extends Error {
   constructor(code, message) {
@@ -812,13 +916,30 @@ async function loadFullDetailSog(options) {
     }
     const rule = planeSize(m.count);
     const geometryMatchesRule = rule.width === ref.width && rule.height === ref.height;
+    const tOrigin0 = performance.now();
+    let oRel = [0, 0, 0];
+    if (options.packOrigin !== false) {
+      const meansU = planes.get("means_u");
+      const hist = new SogMeanCodeHistogram();
+      throwIfAborted();
+      for (let k = 0; k < ref.bands.length; ++k) {
+        const offset = ref.rowStart[k] * ref.width;
+        const count = Math.min(ref.rows[k] * ref.width, m.count - offset);
+        if (count <= 0) break;
+        hist.add(ref.bands[k], meansU.bands[k], count);
+      }
+      oRel = sogPackOrigin(m, hist);
+    }
+    const centerOrigin = composeCenterOrigin(m.origin, oRel);
+    const msOrigin = performance.now() - tOrigin0;
     const tTables0 = performance.now();
     const centroids = wantSh ? planes.get("shN_centroids") : null;
     const tableInfo = await pool.broadcast("buildTables", {
       meta: { ...m, json: void 0 },
       centroids: centroids ? { rgba: centroids.bands[0], width: centroids.width, height: centroids.height } : null,
       maxSh: maxShRequested,
-      encoding
+      encoding,
+      origin: oRel
     });
     const maxSh = ((_a = tableInfo[0]) == null ? void 0 : _a.maxSh) ?? 0;
     const msTables = performance.now() - tTables0;
@@ -885,7 +1006,9 @@ async function loadFullDetailSog(options) {
       packedArray: packed,
       numSplats: m.count,
       extra,
-      splatEncoding: encoding
+      splatEncoding: encoding,
+      // [prec-1] / [prec-2] kcOrigin + o_rel; the mesh transform re-adds it
+      centerOrigin
     });
     const perPlane = {};
     for (const [role, pl] of planes) {
@@ -906,6 +1029,7 @@ async function loadFullDetailSog(options) {
       ms: {
         download: Math.round(msDownload),
         decodeTail: Math.round(msDecodeTail),
+        origin: Math.round(msOrigin),
         tables: Math.round(msTables),
         pack: Math.round(msPack),
         total: Math.round(performance.now() - t0)
@@ -913,7 +1037,15 @@ async function loadFullDetailSog(options) {
       perPlane
     };
     progress("done", 1, 1);
-    return { packedSplats, meta: m, numSplats: m.count, bounds: boundsFromMeta(m), stats };
+    const packOrigin = oRel[0] !== 0 || oRel[1] !== 0 || oRel[2] !== 0 ? oRel : null;
+    return {
+      packedSplats,
+      meta: m,
+      numSplats: m.count,
+      bounds: boundsFromMeta(m),
+      packOrigin,
+      stats
+    };
   } catch (e) {
     if (e instanceof FullDetailError) throw e;
     if ((signal == null ? void 0 : signal.aborted) || (e == null ? void 0 : e.name) === "AbortError") throw new FullDetailError("cancel", "cancelled", e);
@@ -933,7 +1065,7 @@ function createFullDetailMesh(result, options) {
 }
 const SH_C0 = 0.28209479177387814;
 const SQRT2 = Math.sqrt(2);
-function buildPackTables(meta, centroids, maxShRequested, encoding = packedEncode.DEFAULT_SPLAT_ENCODING) {
+function buildPackTables(meta, centroids, maxShRequested, encoding = packedEncode.DEFAULT_SPLAT_ENCODING, origin = [0, 0, 0]) {
   const maxSh = Math.max(0, Math.min(3, meta.bands, Math.floor(maxShRequested)));
   const scratch = new Uint32Array(4);
   const centerHalf = [
@@ -944,12 +1076,13 @@ function buildPackTables(meta, centroids, maxShRequested, encoding = packedEncod
   for (let c = 0; c < 3; ++c) {
     const mn = meta.means.mins[c];
     const mx = meta.means.maxs[c];
+    const oc = origin[c] || 0;
     const t = centerHalf[c];
     for (let n = 0; n < 65536; ++n) {
       const f = n / 65535;
       let v = mn + (mx - mn) * f;
       v = Math.sign(v) * (Math.exp(Math.abs(v)) - 1);
-      t[n] = packedEncode.toHalf(v);
+      t[n] = packedEncode.toHalf(v - oc);
     }
   }
   const scaleByte = new Uint8Array(256);
@@ -1104,17 +1237,21 @@ function packRange(planes, count, tables, out, outIndex) {
 }
 exports.FULL_DETAIL_VERSION = FULL_DETAIL_VERSION;
 exports.FullDetailError = FullDetailError;
+exports.SogMeanCodeHistogram = SogMeanCodeHistogram;
 exports.SogMetaError = SogMetaError;
 exports.SogStreamWalker = SogStreamWalker;
 exports.SogZipError = SogZipError;
 exports.boundsFromMeta = boundsFromMeta;
 exports.buildPackTables = buildPackTables;
 exports.centroidStride = centroidStride;
+exports.composeCenterOrigin = composeCenterOrigin;
 exports.createFullDetailMesh = createFullDetailMesh;
+exports.decodeMeanCode = decodeMeanCode;
 exports.indexSogZip = indexSogZip;
 exports.loadFullDetailSog = loadFullDetailSog;
 exports.packRange = packRange;
 exports.parseSogMeta = parseSogMeta;
 exports.planeSize = planeSize;
 exports.sliceSogEntries = sliceSogEntries;
+exports.sogPackOrigin = sogPackOrigin;
 //# sourceMappingURL=spark-full.cjs.js.map

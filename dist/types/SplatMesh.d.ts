@@ -163,6 +163,10 @@ export declare class SplatMesh extends SplatGenerator {
     constructCovGenerator(context: SplatMeshContext): void;
     updateGenerator(): void;
     update({ renderer, time, deltaTime, viewToWorld, camera, renderSize, globalEdits, lodIndices, }: FrameUpdateContext): void;
+    private packedToWorld;
+    private packedToWorldScratch;
+    private static originTranslation;
+    packedFrameToWorld(splats: unknown): THREE.Matrix4;
     raycast(raycaster: THREE.Raycaster, intersects: {
         distance: number;
         point: THREE.Vector3;

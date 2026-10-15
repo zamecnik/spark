@@ -11,6 +11,12 @@ export declare function unpackPcSogs(json: PcSogsJson | PcSogsV2Json, extraFiles
      * carry labels only (`json.shN.palette` set, one file in `shN.files`).
      */
     centroidsImage?: Promise<DecodedImage> | DecodedImage;
+    /**
+     * [prec-1] pack origin o (file frame): every centre is packed as
+     * fp16(c - o) and the consumer re-adds o (SsogSplats.centerOrigin, folded
+     * into the mesh transform). Absent = the words exactly as before.
+     */
+    origin?: readonly [number, number, number];
 }): Promise<{
     packedArray: Uint32Array;
     numSplats: number;

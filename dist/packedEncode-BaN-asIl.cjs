@@ -74,32 +74,32 @@ function toHalfNative(f) {
   f16buffer[0] = f;
   return u16buffer[0];
 }
+const f64buffer = new Float64Array(1);
+const u32of64buffer = new Uint32Array(f64buffer.buffer);
+const f64HighWord = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1 ? 1 : 0;
+const halfMantissaScale = Array.from({ length: 30 }, (_, k) => 2 ** (24 - k));
+function roundHalfEven(m) {
+  const fl = Math.floor(m);
+  const d = m - fl;
+  return d > 0.5 || d === 0.5 && (fl & 1) === 1 ? fl + 1 : fl;
+}
 function toHalfJS(f) {
-  f32buffer[0] = f;
-  const bits = u32buffer[0];
-  const sign = bits >> 31 & 1;
-  const exp = bits >> 23 & 255;
-  const frac = bits & 8388607;
-  const halfSign = sign << 15;
-  if (exp === 255) {
-    if (frac !== 0) {
-      return halfSign | 32767;
-    }
-    return halfSign | 31744;
+  f64buffer[0] = f;
+  const hi = u32of64buffer[f64HighWord];
+  const sign = hi >>> 16 & 32768;
+  const exp64 = hi >>> 20 & 2047;
+  if (exp64 === 2047) {
+    return sign | (Number.isNaN(f) ? 32256 : 31744);
   }
-  const newExp = exp - 127 + 15;
-  if (newExp >= 31) {
-    return halfSign | 31744;
+  const a = Math.abs(f);
+  const e = exp64 - 1023;
+  if (e >= 16) {
+    return sign | 31744;
   }
-  if (newExp <= 0) {
-    if (newExp < -10) {
-      return halfSign;
-    }
-    const subFrac = (frac | 8388608) >> 1 - newExp + 13;
-    return halfSign | subFrac;
+  if (e < -14) {
+    return sign | roundHalfEven(a * 16777216);
   }
-  const halfFrac = frac >> 13;
-  return halfSign | newExp << 10 | halfFrac;
+  return sign | (e + 15 << 10) + roundHalfEven(a * halfMantissaScale[e + 14]) - 1024;
 }
 function fromHalfNative(u) {
   u16buffer[0] = u;
@@ -356,4 +356,4 @@ exports.setPackedSplatQuat = setPackedSplatQuat;
 exports.setPackedSplatRgba = setPackedSplatRgba;
 exports.setPackedSplatScales = setPackedSplatScales;
 exports.toHalf = toHalf;
-//# sourceMappingURL=packedEncode-ClYvQIUY.cjs.map
+//# sourceMappingURL=packedEncode-BaN-asIl.cjs.map

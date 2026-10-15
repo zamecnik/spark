@@ -19,7 +19,9 @@ export declare class SplatAccumulator {
     viewToWorld: THREE.Matrix4;
     viewOrigin: THREE.Vector3;
     viewDirection: THREE.Vector3;
+    accumOrigin: THREE.Vector3;
     static viewCenterUniform: DynoVec3<THREE.Vector3, "value">;
+    static accumOriginUniform: DynoVec3<THREE.Vector3, "value">;
     static viewDirUniform: DynoVec3<THREE.Vector3, "value">;
     static sortRadialUniform: DynoBool<string>;
     maxSplats: number;
@@ -69,7 +71,7 @@ export declare class SplatAccumulator {
     }): {
         nextBase: number;
     };
-    prepareGenerate({ renderer, scene, time, camera, sortRadial, renderSize, previous, lodInstances, }: {
+    prepareGenerate({ renderer, scene, time, camera, sortRadial, renderSize, previous, lodInstances, accumOrigin, }: {
         renderer: THREE.WebGLRenderer;
         scene: THREE.Scene;
         time: number;
@@ -81,6 +83,7 @@ export declare class SplatAccumulator {
             numSplats: number;
             texture: THREE.DataTexture;
         }>;
+        accumOrigin?: THREE.Vector3;
     }): {
         sameMapping: boolean;
         version: number;

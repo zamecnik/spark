@@ -1,4 +1,31 @@
 export declare const SSOG_PAGE_SPLATS = 65536;
+export interface SsogModelOptions {
+    /**
+     * [prec-1] compute the runtime pack origin (`SsogModel.packOrigin`).
+     * Default true; false = null (centres packed in the file frame, the
+     * kroscloud.47 words - the app's `?splatorigin=off` A/B lever).
+     */
+    packOrigin?: boolean;
+}
+/**
+ * [prec-1] The runtime pack origin of a streamed scene: per axis, the median
+ * of the leaf bound CENTRES weighted by each leaf's level-0 row count (the
+ * lower weighted median: the first centre in sorted order at which the
+ * cumulative weight reaches half the total), rounded to the nearest integer.
+ *
+ * Why: Spark packs every centre as 3 x fp16 in the frame it is given, so
+ * content far from the file origin loses precision (18ss stores a real
+ * altitude, z ~ 465, where fp16 steps are 0.25 - visible as horizontal
+ * stripes). The unit decoder packs c - packOrigin instead and the mesh
+ * transform re-adds it. A weighted MEDIAN, not a bounding-box centre: a few
+ * stray splats stretch a box (18ss's lod-meta root bound centre z ~ 122 would
+ * keep the 0.25 step; on w9s7 a box centre would make 2-unit steps).
+ *
+ * `centers` = [x, y, z] per leaf (3 * n), `weights` = n non-negative weights
+ * (non-finite or <= 0 entries are ignored). Returns null when no weight is
+ * positive or the rounded origin is [0, 0, 0].
+ */
+export declare function ssogPackOrigin(centers: ArrayLike<number>, weights: ArrayLike<number>): [number, number, number] | null;
 export interface SsogLodMetaBound {
     min: number[];
     max: number[];
@@ -73,7 +100,16 @@ export declare class SsogModel {
      * number of pool blocks that leaf's rows span at that level.
      */
     readonly maxLeafBlockFootprint: number;
-    constructor(meta: SsogLodMeta);
+    /**
+     * [prec-1] runtime pack origin (file frame): `ssogPackOrigin` over the leaf
+     * bound centres weighted by their level-0 rows. SsogUnitCache hands it to
+     * the unit decode (centres packed as fp16(c - packOrigin)) and SsogSplats
+     * exposes it as `centerOrigin`, which the mesh transform folds back in.
+     * null = none (all zero, or `options.packOrigin === false`). Fixed for the
+     * model's lifetime.
+     */
+    readonly packOrigin: [number, number, number] | null;
+    constructor(meta: SsogLodMeta, options?: SsogModelOptions);
     /** unit dir name, e.g. "0_4" */
     unitDirName(unit: number): string;
     /** global pager chunk id + slot for (unit file index, row-in-unit) */

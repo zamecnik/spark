@@ -21,8 +21,39 @@ function _interopNamespaceDefault(e) {
 }
 const THREE__namespace = /* @__PURE__ */ _interopNamespaceDefault(THREE);
 const SSOG_PAGE_SPLATS = 65536;
+function ssogPackOrigin(centers, weights) {
+  const n = weights.length;
+  const idx = [];
+  let total = 0;
+  for (let i = 0; i < n; i++) {
+    const w = weights[i];
+    if (Number.isFinite(w) && w > 0) {
+      idx.push(i);
+      total += w;
+    }
+  }
+  if (idx.length === 0 || !(total > 0)) {
+    return null;
+  }
+  const out = [0, 0, 0];
+  for (let c = 0; c < 3; c++) {
+    const order = idx.slice().sort((a, b) => centers[a * 3 + c] - centers[b * 3 + c]);
+    let acc = 0;
+    let median = centers[order[order.length - 1] * 3 + c];
+    for (const i of order) {
+      acc += weights[i];
+      if (acc * 2 >= total) {
+        median = centers[i * 3 + c];
+        break;
+      }
+    }
+    const r = Math.round(median);
+    out[c] = Number.isFinite(r) && r !== 0 ? r : 0;
+  }
+  return out[0] === 0 && out[1] === 0 && out[2] === 0 ? null : out;
+}
 class SsogModel {
-  constructor(meta) {
+  constructor(meta, options = {}) {
     if (meta.version !== 1) {
       throw new Error(`lod-meta version ${meta.version} !== 1`);
     }
@@ -260,6 +291,19 @@ class SsogModel {
         maxLeafBlockFootprint = Math.max(maxLeafBlockFootprint, blocks);
       }
     }
+    let packOrigin = null;
+    if (options.packOrigin !== false) {
+      const centers = new Float64Array(3 * numLeaves);
+      const weights = new Float64Array(numLeaves);
+      leaves.forEach((leaf, li) => {
+        const b = leaf.bound;
+        for (let c = 0; c < 3; c++) {
+          centers[li * 3 + c] = 0.5 * (Number(b.min[c]) + Number(b.max[c]));
+        }
+        weights[li] = Math.max(0, leafLodsPre[li * L * 3 + 2]);
+      });
+      packOrigin = ssogPackOrigin(centers, weights);
+    }
     const root = meta.tree.bound;
     this.lodLevels = L;
     this.count = meta.count;
@@ -278,6 +322,7 @@ class SsogModel {
     this.totalBlocks = blockBase[numUnits];
     this.maxLeafBlockFootprint = maxLeafBlockFootprint;
     this.rootBound = { min: root.min.slice(), max: root.max.slice() };
+    this.packOrigin = packOrigin;
   }
   /** unit dir name, e.g. "0_4" */
   unitDirName(unit) {
@@ -1067,12 +1112,14 @@ class SsogUnitCache {
       throw abortError();
     }
     this.stats.decodes += 1;
+    const origin = this.model.packOrigin;
     const decoded = await spark.workerPool.withWorker(
       async (worker) => worker.call("unpackSsogUnit", {
         json,
         files,
         encoding: this.splatEncoding,
-        palette
+        palette,
+        ...origin ? { origin: [origin[0], origin[1], origin[2]] } : {}
       })
     );
     const expected = this.model.unitSplats[unit];
@@ -1201,6 +1248,16 @@ class SsogSplats extends spark.PagedSplats {
       encoding.sh2Max ?? 1,
       encoding.sh3Max ?? 1
     );
+    const origin = cache.model.packOrigin;
+    if (cache.model !== model) {
+      const mine = model.packOrigin;
+      if (String(mine) !== String(origin)) {
+        console.warn(
+          `[ssog] SsogSplats model packOrigin ${String(mine)} != cache model ${String(origin)}; using the cache's (it decodes)`
+        );
+      }
+    }
+    this.centerOrigin = origin ? new THREE.Vector3(origin[0], origin[1], origin[2]) : null;
   }
   /**
    * Global pager chunk → exact-size block slice of the memoized unit decode.
@@ -3032,4 +3089,5 @@ exports.SsogUnitPackError = SsogUnitPackError;
 exports.parseUnitPack = parseUnitPack;
 exports.planeNames = planeNames;
 exports.readUnitPackMeta = readUnitPackMeta;
+exports.ssogPackOrigin = ssogPackOrigin;
 //# sourceMappingURL=spark-ssog.cjs.js.map
